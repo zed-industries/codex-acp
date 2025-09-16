@@ -1,13 +1,10 @@
-use codex_core::built_in_model_providers;
+use codex_acp::run_main;
+use codex_arg0::arg0_dispatch_or_else;
+use codex_common::CliConfigOverrides;
 
-#[tokio::main]
-async fn main() {
-    println!("Hello from codex-acp!");
-    println!("Successfully imported codex-core");
-
-    // Create a simple demonstration that we can use types from codex-core
-    println!("Built-in model providers available:");
-    for (id, _provider) in built_in_model_providers() {
-        println!("  - Provider ID: {}", id);
-    }
+fn main() -> anyhow::Result<()> {
+    arg0_dispatch_or_else(|codex_linux_sandbox_exe| async move {
+        run_main(codex_linux_sandbox_exe, CliConfigOverrides::default()).await?;
+        Ok(())
+    })
 }

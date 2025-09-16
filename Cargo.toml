@@ -7,8 +7,23 @@ edition = "2024"
 name = "codex-acp"
 path = "src/main.rs"
 
+[lib]
+name = "codex_acp"
+path = "src/lib.rs"
+
 [dependencies]
-tokio = { version = "1", features = ["full"] } # TODO don't use "full" - be more precise
-codex-common = { path = "../codex-rs/common" }
+agent-client-protocol = { path = "../../agent-client-protocol" }
+anyhow = "1"
+codex-arg0 = { path = "../codex-rs/arg0" }
+codex-common = { path = "../codex-rs/common", features = ["cli"] }
 codex-core = { path = "../codex-rs/core" }
+codex-mcp-server = { path = "../codex-rs/mcp-server" }
 codex-protocol = { path = "../codex-rs/protocol" }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
