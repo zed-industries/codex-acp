@@ -3,7 +3,8 @@ use agent_client_protocol::{
     InitializeResponse, LoadSessionRequest, NewSessionRequest, NewSessionResponse,
     PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, SessionId, StopReason,
 };
-use codex_core::config::Config;
+use codex_core::{AuthManager, ConversationManager, auth};
+use codex_core::{CodexAuth, config::Config};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -20,6 +21,9 @@ pub struct CodexAgent {
 
     /// Active sessions mapped by SessionId
     sessions: Arc<Mutex<HashMap<SessionId, SessionState>>>,
+
+    auth_manager: Arc<AuthManager>,
+    conv_manager: Arc<ConversationManager>,
 }
 
 /// State for an individual session
@@ -34,9 +38,14 @@ struct SessionState {
 impl CodexAgent {
     /// Create a new CodexAgent with the given configuration
     pub fn new(config: Arc<Config>) -> Self {
+        let auth_manager = AuthManager::shared(config.codex_home.to_path_buf());
+        let conv_manager = Arc::new(ConversationManager::new(auth_manager.clone()));
+
         Self {
+            auth_manager,
             config,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            conv_manager,
         }
     }
 }
@@ -80,10 +89,10 @@ impl Agent for CodexAgent {
 
     fn authenticate(
         &self,
-        _request: AuthenticateRequest,
+        _request: AuthenticateRequest, // TODO read stuff out of here?
     ) -> impl Future<Output = Result<(), Error>> {
         async move {
-            // We don't currently require authentication
+            // TODO revisit
             Ok(())
         }
     }
