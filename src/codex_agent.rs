@@ -3,12 +3,15 @@ use agent_client_protocol::{
     InitializeResponse, LoadSessionRequest, NewSessionRequest, NewSessionResponse,
     PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, SessionId, StopReason,
 };
+use codex_core::ConversationManager;
 use codex_core::auth::AuthManager;
 use codex_core::config::Config;
-use codex_core::{ConversationManager, protocol::Op};
+use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::mcp_protocol::ConversationId;
+use codex_protocol::protocol::{AskForApproval, InputItem, Op, SandboxPolicy};
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
@@ -38,6 +41,9 @@ struct SessionState {
 
     /// The conversation ID in the conversation manager
     conversation_id: ConversationId,
+
+    /// The model being used for this session
+    model: String,
 }
 
 impl CodexAgent {
@@ -139,6 +145,7 @@ impl Agent for CodexAgent {
             let session_state = SessionState {
                 cwd: request.cwd.to_string_lossy().to_string(),
                 conversation_id: new_conversation.conversation_id,
+                model: config.model.clone(),
             };
 
             let mut sessions = sessions.lock().await;
@@ -156,13 +163,13 @@ impl Agent for CodexAgent {
 
     fn load_session(&self, request: LoadSessionRequest) -> impl Future<Output = Result<(), Error>> {
         let sessions = self.sessions.clone();
-        let conversation_manager = self.conversation_manager.clone();
+        let _conversation_manager = self.conversation_manager.clone();
 
         async move {
             info!("Loading session: {}", request.session_id);
 
             // Check if we have this session already
-            let mut sessions = sessions.lock().await;
+            let sessions = sessions.lock().await;
             if sessions.contains_key(&request.session_id) {
                 // Session already loaded
                 return Ok(());
@@ -186,13 +193,18 @@ impl Agent for CodexAgent {
             info!("Processing prompt for session: {}", request.session_id);
 
             // Get the session state
-            let sessions = sessions.lock().await;
-            let session = sessions
-                .get(&request.session_id)
-                .ok_or_else(Error::invalid_request)?;
+            let (conversation_id, cwd, model) = {
+                let sessions = sessions.lock().await;
+                let session = sessions
+                    .get(&request.session_id)
+                    .ok_or_else(Error::invalid_request)?;
 
-            let conversation_id = session.conversation_id.clone();
-            drop(sessions);
+                (
+                    session.conversation_id.clone(),
+                    session.cwd.clone(),
+                    session.model.clone(),
+                )
+            };
 
             // Get the conversation from the manager
             let conv_manager = conversation_manager.lock().await;
@@ -202,32 +214,65 @@ impl Agent for CodexAgent {
                 .map_err(|_e| Error::invalid_request())?;
 
             // Convert ACP prompt format to codex format
-            // TODO: Properly convert ContentBlocks to codex's input format
-            let codex_prompt = request
-                .prompt
-                .iter()
-                .filter_map(|block| {
-                    // Extract text content for now
-                    use agent_client_protocol::ContentBlock;
-                    match block {
-                        ContentBlock::Text(text_block) => Some(text_block.text.clone()),
-                        _ => None,
+            let mut input_items = Vec::new();
+            for block in &request.prompt {
+                // TODO make this a ::collect() instead of a `for` loop
+                use agent_client_protocol::ContentBlock;
+                match block {
+                    ContentBlock::Text(text_block) => {
+                        input_items.push(InputItem::Text {
+                            text: text_block.text.clone(),
+                        });
                     }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+                    ContentBlock::Image(image_block) => {
+                        // Convert to data URI if needed
+                        if let Some(uri) = &image_block.uri {
+                            input_items.push(InputItem::Image {
+                                image_url: uri.clone(),
+                            });
+                        } else {
+                            // Base64 data
+                            let data_uri = format!(
+                                "data:{};base64,{}",
+                                image_block.mime_type.clone(),
+                                image_block.data.clone()
+                            );
+                            input_items.push(InputItem::Image {
+                                image_url: data_uri,
+                            });
+                        }
+                    }
+                    _ => {
+                        // Skip other content types for now
+                    }
+                }
+            }
 
+            let cwd = PathBuf::from(cwd);
+            let approval_policy = AskForApproval::Never; // TODO get this from outside
+            let sandbox_policy = SandboxPolicy::WorkspaceWrite {
+                // TODO get this from outside
+                writable_roots: vec![],
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            };
+            let effort = None; // TODO get this from outside
+            let summary = ReasoningSummaryConfig::Auto; // TODO get this from outside
             let submission_id = conversation
                 .submit(Op::UserTurn {
-                    items: (),
-                    cwd: (),
-                    approval_policy: (),
-                    sandbox_policy: (),
-                    model: (),
-                    effort: (),
-                    summary: (),
+                    items: input_items,
+                    cwd,
+                    approval_policy,
+                    sandbox_policy,
+                    model,
+                    effort,
+                    summary,
                 })
-                .await?;
+                .await
+                .map_err(|_e| Error::internal_error())?;
+
+            debug!("Submitted prompt with submission_id: {}", submission_id);
 
             // TODO: Stream updates back via session notifications
             // This would involve:
