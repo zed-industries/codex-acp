@@ -1,0 +1,14 @@
+[package]
+name = "codex-acp"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "codex-acp"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] } # TODO don't use "full" - be more precise
+codex-common = { path = "../codex-rs/common" }
+codex-core = { path = "../codex-rs/core" }
+codex-protocol = { path = "../codex-rs/protocol" }
