@@ -14,6 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 agent-client-protocol = { path = "../agent-client-protocol" }
 anyhow = "1"
+async-trait = "0.1"
 codex-arg0 = { path = "../codex/codex-rs/arg0" }
 codex-common = { path = "../codex/codex-rs/common", features = ["cli"] }
 codex-core = { path = "../codex/codex-rs/core" }

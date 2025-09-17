@@ -67,6 +67,7 @@ impl CodexAgent {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl Agent for CodexAgent {
     async fn initialize(&self, request: InitializeRequest) -> Result<InitializeResponse, Error> {
         debug!(
