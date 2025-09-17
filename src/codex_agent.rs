@@ -1,7 +1,8 @@
 use agent_client_protocol::{
-    Agent, AgentCapabilities, AuthenticateRequest, CancelNotification, Error, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, SessionId, StopReason,
+    Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification, Error,
+    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
+    McpCapabilities, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
+    PromptResponse, ProtocolVersion, SessionId, StopReason,
 };
 use codex_core::ConversationManager;
 use codex_core::auth::AuthManager;
@@ -90,7 +91,14 @@ impl Agent for CodexAgent {
                     audio: false,
                     embedded_context: true,
                     image: true,
+                    meta: None,
                 },
+                mcp_capabilities: McpCapabilities {
+                    http: false, // TODO: Revisit
+                    sse: false,
+                    meta: None,
+                },
+                meta: None,
             };
 
             // For now, we don't require authentication
@@ -100,6 +108,7 @@ impl Agent for CodexAgent {
                 protocol_version,
                 agent_capabilities,
                 auth_methods,
+                meta: None,
             })
         }
     }
@@ -107,10 +116,10 @@ impl Agent for CodexAgent {
     fn authenticate(
         &self,
         _request: AuthenticateRequest,
-    ) -> impl Future<Output = Result<(), Error>> {
+    ) -> impl Future<Output = Result<AuthenticateResponse, Error>> {
         async move {
             // We don't currently require authentication
-            Ok(())
+            Ok(AuthenticateResponse { meta: None })
         }
     }
 
@@ -157,11 +166,18 @@ impl Agent for CodexAgent {
                 request.mcp_servers.len()
             );
 
-            Ok(NewSessionResponse { session_id })
+            Ok(NewSessionResponse {
+                session_id,
+                modes: None,
+                meta: None,
+            })
         }
     }
 
-    fn load_session(&self, request: LoadSessionRequest) -> impl Future<Output = Result<(), Error>> {
+    fn load_session(
+        &self,
+        request: LoadSessionRequest,
+    ) -> impl Future<Output = Result<LoadSessionResponse, Error>> {
         let sessions = self.sessions.clone();
         let _conversation_manager = self.conversation_manager.clone();
 
@@ -172,7 +188,10 @@ impl Agent for CodexAgent {
             let sessions = sessions.lock().await;
             if sessions.contains_key(&request.session_id) {
                 // Session already loaded
-                return Ok(());
+                return Ok(LoadSessionResponse {
+                    modes: None,
+                    meta: None,
+                });
             }
 
             // For now, we can't actually load sessions from disk
@@ -284,6 +303,7 @@ impl Agent for CodexAgent {
             // For now, just return a basic completion
             Ok(PromptResponse {
                 stop_reason: StopReason::EndTurn,
+                meta: None,
             })
         }
     }
@@ -316,5 +336,26 @@ impl Agent for CodexAgent {
 
             Ok(())
         }
+    }
+
+    async fn set_session_mode(
+        &self,
+        _args: agent_client_protocol::SetSessionModeRequest,
+    ) -> Result<agent_client_protocol::SetSessionModeResponse, Error> {
+        todo!()
+    }
+
+    async fn ext_method(
+        &self,
+        _args: agent_client_protocol::ExtRequest,
+    ) -> Result<agent_client_protocol::ExtResponse, Error> {
+        todo!()
+    }
+
+    async fn ext_notification(
+        &self,
+        _args: agent_client_protocol::ExtNotification,
+    ) -> Result<(), Error> {
+        todo!()
     }
 }
