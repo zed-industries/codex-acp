@@ -11,7 +11,6 @@ use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::mcp_protocol::ConversationId;
 use codex_protocol::protocol::{AskForApproval, InputItem, Op, SandboxPolicy};
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -69,273 +68,239 @@ impl CodexAgent {
 }
 
 impl Agent for CodexAgent {
-    fn initialize(
-        &self,
-        request: InitializeRequest,
-    ) -> impl Future<Output = Result<InitializeResponse, Error>> {
-        async move {
-            debug!(
-                "Received initialize request with protocol version {:?}",
-                request.protocol_version
-            );
+    async fn initialize(&self, request: InitializeRequest) -> Result<InitializeResponse, Error> {
+        debug!(
+            "Received initialize request with protocol version {:?}",
+            request.protocol_version
+        );
 
-            // For now, we support protocol version 1
-            let protocol_version = ProtocolVersion::default();
+        // For now, we support protocol version 1
+        let protocol_version = ProtocolVersion::default();
 
-            // Build list of available models from codex configuration
+        // Build list of available models from codex configuration
 
-            // Define our agent capabilities
-            let agent_capabilities = AgentCapabilities {
-                load_session: true,
-                prompt_capabilities: PromptCapabilities {
-                    audio: false,
-                    embedded_context: true,
-                    image: true,
-                    meta: None,
-                },
-                mcp_capabilities: McpCapabilities {
-                    http: false, // TODO: Revisit
-                    sse: false,
-                    meta: None,
-                },
+        // Define our agent capabilities
+        let agent_capabilities = AgentCapabilities {
+            load_session: true,
+            prompt_capabilities: PromptCapabilities {
+                audio: false,
+                embedded_context: true,
+                image: true,
                 meta: None,
-            };
-
-            // For now, we don't require authentication
-            let auth_methods = vec![];
-
-            Ok(InitializeResponse {
-                protocol_version,
-                agent_capabilities,
-                auth_methods,
+            },
+            mcp_capabilities: McpCapabilities {
+                http: false, // TODO: Revisit
+                sse: false,
                 meta: None,
-            })
-        }
+            },
+            meta: None,
+        };
+
+        // For now, we don't require authentication
+        let auth_methods = vec![];
+
+        Ok(InitializeResponse {
+            protocol_version,
+            agent_capabilities,
+            auth_methods,
+            meta: None,
+        })
     }
 
-    fn authenticate(
+    async fn authenticate(
         &self,
         _request: AuthenticateRequest,
-    ) -> impl Future<Output = Result<AuthenticateResponse, Error>> {
-        async move {
-            // We don't currently require authentication
-            Ok(AuthenticateResponse { meta: None })
-        }
+    ) -> Result<AuthenticateResponse, Error> {
+        // We don't currently require authentication
+        Ok(AuthenticateResponse { meta: None })
     }
 
-    fn new_session(
-        &self,
-        request: NewSessionRequest,
-    ) -> impl Future<Output = Result<NewSessionResponse, Error>> {
-        let sessions = self.sessions.clone();
-        let conversation_manager = self.conversation_manager.clone();
-        let config = self.config.clone();
+    async fn new_session(&self, request: NewSessionRequest) -> Result<NewSessionResponse, Error> {
+        info!("Creating new session with cwd: {}", request.cwd.display());
 
-        async move {
-            info!("Creating new session with cwd: {}", request.cwd.display());
+        // Generate a unique session ID
+        let session_id = SessionId(Arc::from(format!("sess_{}", uuid::Uuid::new_v4())));
 
-            // Generate a unique session ID
-            let session_id = SessionId(Arc::from(format!("sess_{}", uuid::Uuid::new_v4())));
+        // Create a new conversation in the conversation manager
+        let conv_manager = self.conversation_manager.lock().await;
 
-            // Create a new conversation in the conversation manager
-            let conv_manager = conversation_manager.lock().await;
+        // Create config for the new conversation
+        // TODO: Set working directory and MCP servers in the config
+        let conv_config = (*self.config).clone();
 
-            // Create config for the new conversation
-            // TODO: Set working directory and MCP servers in the config
-            let conv_config = (*config).clone();
+        // Create the conversation and get back the NewConversation struct
+        let new_conversation = conv_manager
+            .new_conversation(conv_config)
+            .await
+            .map_err(|_e| Error::internal_error())?;
 
-            // Create the conversation and get back the NewConversation struct
-            let new_conversation = conv_manager
-                .new_conversation(conv_config)
-                .await
-                .map_err(|_e| Error::internal_error())?;
+        // Store the session state
+        let session_state = SessionState {
+            cwd: request.cwd.to_string_lossy().to_string(),
+            conversation_id: new_conversation.conversation_id,
+            model: self.config.model.clone(),
+        };
 
-            // Store the session state
-            let session_state = SessionState {
-                cwd: request.cwd.to_string_lossy().to_string(),
-                conversation_id: new_conversation.conversation_id,
-                model: config.model.clone(),
-            };
+        let mut sessions = self.sessions.lock().await;
+        sessions.insert(session_id.clone(), session_state);
 
-            let mut sessions = sessions.lock().await;
-            sessions.insert(session_id.clone(), session_state);
+        // The conversation manager will handle connecting to MCP servers
+        debug!(
+            "Created new session with {} MCP servers",
+            request.mcp_servers.len()
+        );
 
-            // The conversation manager will handle connecting to MCP servers
-            debug!(
-                "Created new session with {} MCP servers",
-                request.mcp_servers.len()
-            );
-
-            Ok(NewSessionResponse {
-                session_id,
-                modes: None,
-                meta: None,
-            })
-        }
+        Ok(NewSessionResponse {
+            session_id,
+            modes: None,
+            meta: None,
+        })
     }
 
-    fn load_session(
+    async fn load_session(
         &self,
         request: LoadSessionRequest,
-    ) -> impl Future<Output = Result<LoadSessionResponse, Error>> {
-        let sessions = self.sessions.clone();
-        let _conversation_manager = self.conversation_manager.clone();
+    ) -> Result<LoadSessionResponse, Error> {
+        info!("Loading session: {}", request.session_id);
 
-        async move {
-            info!("Loading session: {}", request.session_id);
-
-            // Check if we have this session already
-            let sessions = sessions.lock().await;
-            if sessions.contains_key(&request.session_id) {
-                // Session already loaded
-                return Ok(LoadSessionResponse {
-                    modes: None,
-                    meta: None,
-                });
-            }
-
-            // For now, we can't actually load sessions from disk
-            // The conversation manager doesn't have a direct load method
-            // We would need to use resume_conversation_from_rollout with a rollout path
-            return Err(Error::invalid_request());
-        }
-    }
-
-    fn prompt(
-        &self,
-        request: PromptRequest,
-    ) -> impl Future<Output = Result<PromptResponse, Error>> {
-        let sessions = self.sessions.clone();
-        let conversation_manager = self.conversation_manager.clone();
-
-        async move {
-            info!("Processing prompt for session: {}", request.session_id);
-
-            // Get the session state
-            let (conversation_id, cwd, model) = {
-                let sessions = sessions.lock().await;
-                let session = sessions
-                    .get(&request.session_id)
-                    .ok_or_else(Error::invalid_request)?;
-
-                (
-                    session.conversation_id.clone(),
-                    session.cwd.clone(),
-                    session.model.clone(),
-                )
-            };
-
-            // Get the conversation from the manager
-            let conv_manager = conversation_manager.lock().await;
-            let conversation = conv_manager
-                .get_conversation(conversation_id)
-                .await
-                .map_err(|_e| Error::invalid_request())?;
-
-            // Convert ACP prompt format to codex format
-            let mut input_items = Vec::new();
-            for block in &request.prompt {
-                // TODO make this a ::collect() instead of a `for` loop
-                use agent_client_protocol::ContentBlock;
-                match block {
-                    ContentBlock::Text(text_block) => {
-                        input_items.push(InputItem::Text {
-                            text: text_block.text.clone(),
-                        });
-                    }
-                    ContentBlock::Image(image_block) => {
-                        // Convert to data URI if needed
-                        if let Some(uri) = &image_block.uri {
-                            input_items.push(InputItem::Image {
-                                image_url: uri.clone(),
-                            });
-                        } else {
-                            // Base64 data
-                            let data_uri = format!(
-                                "data:{};base64,{}",
-                                image_block.mime_type.clone(),
-                                image_block.data.clone()
-                            );
-                            input_items.push(InputItem::Image {
-                                image_url: data_uri,
-                            });
-                        }
-                    }
-                    _ => {
-                        // Skip other content types for now
-                    }
-                }
-            }
-
-            let cwd = PathBuf::from(cwd);
-            let approval_policy = AskForApproval::Never; // TODO get this from outside
-            let sandbox_policy = SandboxPolicy::WorkspaceWrite {
-                // TODO get this from outside
-                writable_roots: vec![],
-                network_access: false,
-                exclude_tmpdir_env_var: false,
-                exclude_slash_tmp: false,
-            };
-            let effort = None; // TODO get this from outside
-            let summary = ReasoningSummaryConfig::Auto; // TODO get this from outside
-            let submission_id = conversation
-                .submit(Op::UserTurn {
-                    items: input_items,
-                    cwd,
-                    approval_policy,
-                    sandbox_policy,
-                    model,
-                    effort,
-                    summary,
-                })
-                .await
-                .map_err(|_e| Error::internal_error())?;
-
-            debug!("Submitted prompt with submission_id: {}", submission_id);
-
-            // TODO: Stream updates back via session notifications
-            // This would involve:
-            // 1. Setting up a stream from the conversation manager
-            // 2. Converting events to SessionNotification messages
-            // 3. Sending them via the Client handle
-            // 4. Handling tool calls through MCP
-
-            // For now, just return a basic completion
-            Ok(PromptResponse {
-                stop_reason: StopReason::EndTurn,
+        // Check if we have this session already
+        let sessions = self.sessions.lock().await;
+        if sessions.contains_key(&request.session_id) {
+            // Session already loaded
+            return Ok(LoadSessionResponse {
+                modes: None,
                 meta: None,
-            })
+            });
         }
+
+        // For now, we can't actually load sessions from disk
+        // The conversation manager doesn't have a direct load method
+        // We would need to use resume_conversation_from_rollout with a rollout path
+        return Err(Error::invalid_request());
     }
 
-    fn cancel(&self, notification: CancelNotification) -> impl Future<Output = Result<(), Error>> {
-        let sessions = self.sessions.clone();
-        let conversation_manager = self.conversation_manager.clone();
+    async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {
+        info!("Processing prompt for session: {}", request.session_id);
 
-        async move {
-            info!(
-                "Cancelling operations for session: {}",
-                notification.session_id
-            );
-
-            // Get the session to find the conversation ID
-            let sessions = sessions.lock().await;
+        // Get the session state
+        let (conversation_id, cwd, model) = {
+            let sessions = self.sessions.lock().await;
             let session = sessions
-                .get(&notification.session_id)
+                .get(&request.session_id)
                 .ok_or_else(Error::invalid_request)?;
 
-            let conversation_id = session.conversation_id.clone();
-            drop(sessions);
+            (
+                session.conversation_id.clone(),
+                session.cwd.clone(),
+                session.model.clone(),
+            )
+        };
 
-            // Get the conversation and cancel it
-            let conv_manager = conversation_manager.lock().await;
-            if let Ok(_conversation) = conv_manager.get_conversation(conversation_id).await {
-                // TODO: Call conversation.cancel() or similar method
-                debug!("Would cancel conversation");
+        // Get the conversation from the manager
+        let conv_manager = self.conversation_manager.lock().await;
+        let conversation = conv_manager
+            .get_conversation(conversation_id)
+            .await
+            .map_err(|_e| Error::invalid_request())?;
+
+        // Convert ACP prompt format to codex format
+        let mut input_items = Vec::new();
+        for block in &request.prompt {
+            // TODO make this a ::collect() instead of a `for` loop
+            use agent_client_protocol::ContentBlock;
+            match block {
+                ContentBlock::Text(text_block) => {
+                    input_items.push(InputItem::Text {
+                        text: text_block.text.clone(),
+                    });
+                }
+                ContentBlock::Image(image_block) => {
+                    // Convert to data URI if needed
+                    if let Some(uri) = &image_block.uri {
+                        input_items.push(InputItem::Image {
+                            image_url: uri.clone(),
+                        });
+                    } else {
+                        // Base64 data
+                        let data_uri = format!(
+                            "data:{};base64,{}",
+                            image_block.mime_type.clone(),
+                            image_block.data.clone()
+                        );
+                        input_items.push(InputItem::Image {
+                            image_url: data_uri,
+                        });
+                    }
+                }
+                _ => {
+                    // Skip other content types for now
+                }
             }
-
-            Ok(())
         }
+
+        let cwd = PathBuf::from(cwd);
+        let approval_policy = AskForApproval::Never; // TODO get this from outside
+        let sandbox_policy = SandboxPolicy::WorkspaceWrite {
+            // TODO get this from outside
+            writable_roots: vec![],
+            network_access: false,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+        };
+        let effort = None; // TODO get this from outside
+        let summary = ReasoningSummaryConfig::Auto; // TODO get this from outside
+        let submission_id = conversation
+            .submit(Op::UserTurn {
+                items: input_items,
+                cwd,
+                approval_policy,
+                sandbox_policy,
+                model,
+                effort,
+                summary,
+            })
+            .await
+            .map_err(|_e| Error::internal_error())?;
+
+        debug!("Submitted prompt with submission_id: {}", submission_id);
+
+        // TODO: Stream updates back via session notifications
+        // This would involve:
+        // 1. Setting up a stream from the conversation manager
+        // 2. Converting events to SessionNotification messages
+        // 3. Sending them via the Client handle
+        // 4. Handling tool calls through MCP
+
+        // For now, just return a basic completion
+        Ok(PromptResponse {
+            stop_reason: StopReason::EndTurn,
+            meta: None,
+        })
+    }
+
+    async fn cancel(&self, notification: CancelNotification) -> Result<(), Error> {
+        info!(
+            "Cancelling operations for session: {}",
+            notification.session_id
+        );
+
+        // Get the session to find the conversation ID
+        let sessions = self.sessions.lock().await;
+        let session = sessions
+            .get(&notification.session_id)
+            .ok_or_else(Error::invalid_request)?;
+
+        let conversation_id = session.conversation_id.clone();
+        drop(sessions);
+
+        // Get the conversation and cancel it
+        let conv_manager = self.conversation_manager.lock().await;
+        if let Ok(_conversation) = conv_manager.get_conversation(conversation_id).await {
+            // TODO: Call conversation.cancel() or similar method
+            debug!("Would cancel conversation");
+        }
+
+        Ok(())
     }
 
     async fn set_session_mode(
