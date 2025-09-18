@@ -218,7 +218,7 @@ impl Agent for CodexAgent {
         // Get the conversation from the manager
         let conv_manager = self.conversation_manager.lock().await;
         let conversation = conv_manager
-            .get_conversation(conversation_id)
+            .get_conversation(conversation_id.clone())
             .await
             .map_err(|_e| Error::invalid_request())?;
 
@@ -270,11 +270,11 @@ impl Agent for CodexAgent {
         let summary = ReasoningSummaryConfig::Auto; // TODO get this from outside
         let submission_id = conversation
             .submit(Op::UserTurn {
-                items: input_items,
-                cwd,
+                items: input_items.clone(),
+                cwd: cwd.clone(),
                 approval_policy,
                 sandbox_policy,
-                model,
+                model: model.clone(),
                 effort,
                 summary,
             })
