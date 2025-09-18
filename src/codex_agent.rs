@@ -11,6 +11,10 @@ use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::auth::{AuthManager, CodexAuth, read_openai_api_key_from_env};
 use codex_core::config::Config;
 use codex_core::config_types::McpServerConfig;
+use codex_core::protocol::{
+    AgentMessageDeltaEvent, AgentMessageEvent, AgentReasoningDeltaEvent, AgentReasoningEvent,
+    AgentReasoningRawContentDeltaEvent, AgentReasoningRawContentEvent,
+};
 use codex_core::{CodexConversation, ConversationManager};
 use codex_protocol::mcp_protocol::ConversationId;
 use codex_protocol::protocol::EventMsg;
@@ -349,15 +353,38 @@ impl Agent for CodexAgent {
                     );
 
                     match event.msg {
-                        EventMsg::AgentMessage(msg_event) => {
+                        EventMsg::AgentMessage(AgentMessageEvent { message })
+                        | EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta: message }) => {
                             // Send this to the client via session/update notification
-                            info!("Agent message received: {:?}", msg_event.message);
+                            info!("Agent message received: {:?}", message);
 
                             self.send_notification(
                                 request.session_id.clone(),
                                 SessionUpdate::AgentMessageChunk {
                                     content: ContentBlock::Text(TextContent {
-                                        text: msg_event.message.clone(),
+                                        text: message,
+                                        annotations: None,
+                                        meta: None,
+                                    }),
+                                },
+                            );
+                        }
+                        EventMsg::AgentReasoning(AgentReasoningEvent { text })
+                        | EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent { delta: text })
+                        | EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent {
+                            text,
+                        })
+                        | EventMsg::AgentReasoningRawContentDelta(
+                            AgentReasoningRawContentDeltaEvent { delta: text },
+                        ) => {
+                            // Send this to the client via session/update notification
+                            info!("Agent reasoning message received: {:?}", text);
+
+                            self.send_notification(
+                                request.session_id.clone(),
+                                SessionUpdate::AgentThoughtChunk {
+                                    content: ContentBlock::Text(TextContent {
+                                        text,
                                         annotations: None,
                                         meta: None,
                                     }),
@@ -434,12 +461,8 @@ impl Agent for CodexAgent {
                             stop_reason = StopReason::EndTurn;
                             break;
                         }
-                        EventMsg::AgentMessageDelta(..)
-                        | EventMsg::AgentReasoning(..)
-                        | EventMsg::AgentReasoningDelta(..)
-                        | EventMsg::AgentReasoningRawContent(..)
-                        | EventMsg::AgentReasoningRawContentDelta(..)
-                        | EventMsg::AgentReasoningSectionBreak(..)
+
+                        EventMsg::AgentReasoningSectionBreak(..)
                         | EventMsg::ApplyPatchApprovalRequest(..)
                         | EventMsg::BackgroundEvent(..)
                         | EventMsg::ConversationPath(..)
