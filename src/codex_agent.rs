@@ -14,6 +14,7 @@ use codex_core::config_types::McpServerConfig;
 use codex_core::protocol::{
     AgentMessageDeltaEvent, AgentMessageEvent, AgentReasoningDeltaEvent, AgentReasoningEvent,
     AgentReasoningRawContentDeltaEvent, AgentReasoningRawContentEvent,
+    AgentReasoningSectionBreakEvent,
 };
 use codex_core::{CodexConversation, ConversationManager};
 use codex_protocol::mcp_protocol::ConversationId;
@@ -353,8 +354,13 @@ impl Agent for CodexAgent {
                     );
 
                     match event.msg {
-                        EventMsg::AgentMessage(AgentMessageEvent { message })
-                        | EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta: message }) => {
+                        // Since we are getting the deltas, we can ignore these events
+                        EventMsg::AgentReasoning(AgentReasoningEvent { .. })
+                        | EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent {
+                            ..
+                        })
+                        | EventMsg::AgentMessage(AgentMessageEvent { .. }) => {}
+                        EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta: message }) => {
                             // Send this to the client via session/update notification
                             info!("Agent message received: {:?}", message);
 
@@ -369,11 +375,7 @@ impl Agent for CodexAgent {
                                 },
                             );
                         }
-                        EventMsg::AgentReasoning(AgentReasoningEvent { text })
-                        | EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent { delta: text })
-                        | EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent {
-                            text,
-                        })
+                        EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent { delta: text })
                         | EventMsg::AgentReasoningRawContentDelta(
                             AgentReasoningRawContentDeltaEvent { delta: text },
                         ) => {
@@ -385,6 +387,21 @@ impl Agent for CodexAgent {
                                 SessionUpdate::AgentThoughtChunk {
                                     content: ContentBlock::Text(TextContent {
                                         text,
+                                        annotations: None,
+                                        meta: None,
+                                    }),
+                                },
+                            );
+                        }
+                        EventMsg::AgentReasoningSectionBreak(
+                            AgentReasoningSectionBreakEvent {},
+                        ) => {
+                            // Make sure the section heading actually get spacing
+                            self.send_notification(
+                                request.session_id.clone(),
+                                SessionUpdate::AgentThoughtChunk {
+                                    content: ContentBlock::Text(TextContent {
+                                        text: "\n\n".to_owned(),
                                         annotations: None,
                                         meta: None,
                                     }),
@@ -462,8 +479,7 @@ impl Agent for CodexAgent {
                             break;
                         }
 
-                        EventMsg::AgentReasoningSectionBreak(..)
-                        | EventMsg::ApplyPatchApprovalRequest(..)
+                        EventMsg::ApplyPatchApprovalRequest(..)
                         | EventMsg::BackgroundEvent(..)
                         | EventMsg::ConversationPath(..)
                         | EventMsg::EnteredReviewMode(..)
