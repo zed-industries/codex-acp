@@ -10,6 +10,7 @@ use codex_core::auth::{AuthManager, CodexAuth, read_openai_api_key_from_env};
 use codex_core::config::Config;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::mcp_protocol::ConversationId;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::{AskForApproval, InputItem, Op, SandboxPolicy};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -279,9 +280,89 @@ impl Agent for CodexAgent {
                 summary,
             })
             .await
-            .map_err(|_e| Error::internal_error())?;
+            .map_err(|e| {
+                error!("Failed to submit prompt: {:?}", e);
+                Error::internal_error()
+            })?;
 
-        debug!("Submitted prompt with submission_id: {}", submission_id);
+        info!(
+            "Submitted prompt with submission_id: {}, model: {}, {} input items",
+            submission_id,
+            model,
+            input_items.len()
+        );
+
+        // Wait for the conversation to complete (TaskComplete or TurnAborted)
+        let stop_reason;
+
+        info!(
+            "Starting to wait for conversation events for submission_id: {}",
+            submission_id
+        );
+
+        let mut event_count = 0;
+        loop {
+            event_count += 1;
+            match conversation.next_event().await {
+                Ok(event) => {
+                    info!(
+                        "Received event #{}: {:?} (id: {})",
+                        event_count, event.msg, event.id
+                    );
+
+                    match event.msg {
+                        EventMsg::TaskComplete(complete_event) => {
+                            info!(
+                                "Task completed successfully after {} events. Last agent message: {:?}",
+                                event_count, complete_event.last_agent_message
+                            );
+                            stop_reason = StopReason::EndTurn;
+                            break;
+                        }
+                        EventMsg::TurnAborted(abort_event) => {
+                            info!("Turn aborted: {:?}", abort_event.reason);
+                            stop_reason = StopReason::Cancelled;
+                            break;
+                        }
+                        EventMsg::Error(error_event) => {
+                            error!("Error during turn: {}", error_event.message);
+                            return Err(Error::internal_error());
+                        }
+                        EventMsg::AgentMessage(msg_event) => {
+                            // Send this to the client via session/update notification
+                            info!("Agent message received: {:?}", msg_event.message);
+
+                            let notification = SessionNotification {
+                                session_id: request.session_id.clone(),
+                                update: SessionUpdate::AgentMessageChunk {
+                                    content: ContentBlock::Text(TextContent {
+                                        text: msg_event.message.clone(),
+                                        annotations: None,
+                                        meta: None,
+                                    }),
+                                },
+                                meta: None,
+                            };
+
+                            if let Err(e) = self.notification_tx.send(notification) {
+                                error!("Failed to send session notification: {:?}", e);
+                            }
+                        }
+                        EventMsg::UserMessage(msg_event) => {
+                            info!("User message echoed: {:?}", msg_event.message);
+                        }
+                        _ => {
+                            // TODO: handle others, many of which should become
+                            // session/update notifications sent to the client
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Error getting next event: {:?}", e);
+                    return Err(Error::internal_error());
+                }
+            }
+        }
 
         // TODO: Stream updates back via session notifications
         // This would involve:
@@ -290,9 +371,8 @@ impl Agent for CodexAgent {
         // 3. Sending them via the Client handle
         // 4. Handling tool calls through MCP
 
-        // For now, just return a basic completion
         Ok(PromptResponse {
-            stop_reason: StopReason::EndTurn,
+            stop_reason,
             meta: None,
         })
     }

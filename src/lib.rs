@@ -46,8 +46,11 @@ pub async fn run_main(
 
     local
         .run_until(async move {
-            // Create our Agent implementation
-            let agent = codex_agent::CodexAgent::new(Arc::new(config));
+            // Create a channel for notifications
+            let (notification_tx, mut notification_rx) = tokio::sync::mpsc::unbounded_channel();
+
+            // Create our Agent implementation with notification channel
+            let agent = codex_agent::CodexAgent::new(Arc::new(config), notification_tx);
 
             // Use tokio-util to adapt between tokio and futures traits
             use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -69,9 +72,16 @@ pub async fn run_main(
                 },
             );
 
-            // Store the client handle for future use
-            // TODO: Pass client_handle to the agent implementation so it can make requests back to the client
-            let _ = client_handle;
+            // Spawn a task to forward notifications from the channel to the client
+            let client = std::sync::Arc::new(client_handle);
+            tokio::task::spawn_local(async move {
+                while let Some(notification) = notification_rx.recv().await {
+                    use agent_client_protocol::Client;
+                    if let Err(e) = client.session_notification(notification).await {
+                        tracing::error!("Failed to send session notification: {:?}", e);
+                    }
+                }
+            });
 
             // Run the I/O task to handle the actual communication
             io_task.await.map_err(|e| {
