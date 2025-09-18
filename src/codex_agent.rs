@@ -1,11 +1,11 @@
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ContentBlock, Error, InitializeRequest, InitializeResponse, LoadSessionRequest,
-    LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, SessionId, SessionMode, SessionModeId,
-    SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, TextContent, ToolCall, ToolCallId, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
+    ContentBlock, Error, ExtNotification, ExtRequest, ExtResponse, InitializeRequest,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
+    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
+    SessionId, SessionMode, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent, ToolCall, ToolCallId,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
 };
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::auth::{AuthManager, CodexAuth, read_openai_api_key_from_env};
@@ -204,9 +204,8 @@ impl Agent for CodexAgent {
         for mcp_server in mcp_servers {
             match mcp_server {
                 // Not supported in codex yet
-                agent_client_protocol::McpServer::Http { .. }
-                | agent_client_protocol::McpServer::Sse { .. } => {}
-                agent_client_protocol::McpServer::Stdio {
+                McpServer::Http { .. } | McpServer::Sse { .. } => {}
+                McpServer::Stdio {
                     name,
                     command,
                     args,
@@ -286,7 +285,6 @@ impl Agent for CodexAgent {
         let mut input_items = Vec::new();
         for block in &request.prompt {
             // TODO make this a ::collect() instead of a `for` loop
-            use agent_client_protocol::ContentBlock;
             match block {
                 ContentBlock::Text(text_block) => {
                     input_items.push(InputItem::Text {
@@ -564,17 +562,11 @@ impl Agent for CodexAgent {
         Ok(SetSessionModeResponse::default())
     }
 
-    async fn ext_method(
-        &self,
-        _args: agent_client_protocol::ExtRequest,
-    ) -> Result<agent_client_protocol::ExtResponse, Error> {
+    async fn ext_method(&self, _args: ExtRequest) -> Result<ExtResponse, Error> {
         Err(Error::method_not_found())
     }
 
-    async fn ext_notification(
-        &self,
-        _args: agent_client_protocol::ExtNotification,
-    ) -> Result<(), Error> {
+    async fn ext_notification(&self, _args: ExtNotification) -> Result<(), Error> {
         Err(Error::method_not_found())
     }
 }
