@@ -94,8 +94,7 @@ impl Agent for CodexAgent {
             request.protocol_version
         );
 
-        // For now, we support protocol version 1
-        let protocol_version = ProtocolVersion::default();
+        let protocol_version = V1;
 
         // Build list of available models from codex configuration
 
