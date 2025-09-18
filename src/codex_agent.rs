@@ -8,6 +8,7 @@ use agent_client_protocol::{
 use codex_core::ConversationManager;
 use codex_core::auth::{AuthManager, CodexAuth, read_openai_api_key_from_env};
 use codex_core::config::Config;
+use codex_core::config_types::McpServerConfig;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::mcp_protocol::ConversationId;
 use codex_protocol::protocol::EventMsg;
@@ -51,9 +52,7 @@ impl CodexAgent {
         config: Config,
         notification_tx: mpsc::UnboundedSender<SessionNotification>, // TODO maybe make it bounded
     ) -> Self {
-        // Initialize AuthManager - it needs a path, not config
-        let codex_home = config.codex_home.clone();
-        let auth_manager = AuthManager::shared(codex_home.clone());
+        let auth_manager = AuthManager::shared(config.codex_home.clone());
 
         let auth_manager = if auth_manager.auth().is_none() {
             // No auth.json found, try environment variable
@@ -71,7 +70,6 @@ impl CodexAgent {
             auth_manager
         };
 
-        // Initialize ConversationManager with auth manager
         let conversation_manager = ConversationManager::new(auth_manager.clone());
 
         Self {
@@ -105,7 +103,7 @@ impl Agent for CodexAgent {
                 meta: None,
             },
             mcp_capabilities: McpCapabilities {
-                http: false, // TODO: Revisit
+                http: false,
                 sse: false,
                 meta: None,
             },
@@ -132,25 +130,57 @@ impl Agent for CodexAgent {
     }
 
     async fn new_session(&self, request: NewSessionRequest) -> Result<NewSessionResponse, Error> {
-        info!("Creating new session with cwd: {}", request.cwd.display());
+        let NewSessionRequest {
+            cwd,
+            mcp_servers,
+            meta: _meta,
+        } = request;
+        info!("Creating new session with cwd: {}", cwd.display());
 
         // Generate a unique session ID
         let session_id = SessionId(Arc::from(format!("sess_{}", uuid::Uuid::new_v4())));
 
         // Create config for the new conversation
         // TODO: Set working directory and MCP servers in the config
-        let conv_config = self.config.clone();
+        let mut config = self.config.clone();
+        config.cwd = cwd.clone();
+        for mcp_server in mcp_servers {
+            match mcp_server {
+                // Not supported in codex yet
+                agent_client_protocol::McpServer::Http { .. }
+                | agent_client_protocol::McpServer::Sse { .. } => {}
+                agent_client_protocol::McpServer::Stdio {
+                    name,
+                    command,
+                    args,
+                    env,
+                } => {
+                    config.mcp_servers.insert(
+                        name.clone(),
+                        McpServerConfig {
+                            command: command.display().to_string(),
+                            args,
+                            env: if env.is_empty() {
+                                None
+                            } else {
+                                Some(env.into_iter().map(|env| (env.name, env.value)).collect())
+                            },
+                            startup_timeout_ms: None,
+                        },
+                    );
+                }
+            }
+        }
+        let num_mcp_servers = config.mcp_servers.len();
 
-        // Create the conversation and get back the NewConversation struct
         let new_conversation = self
             .conversation_manager
-            .new_conversation(conv_config)
+            .new_conversation(config)
             .await
             .map_err(|_e| Error::internal_error())?;
 
-        // Store the session state
         let session_state = SessionState {
-            cwd: request.cwd.to_string_lossy().to_string(),
+            cwd: cwd.to_string_lossy().to_string(),
             conversation_id: new_conversation.conversation_id,
             model: self.config.model.clone(),
         };
@@ -159,11 +189,7 @@ impl Agent for CodexAgent {
             .borrow_mut()
             .insert(session_id.clone(), session_state);
 
-        // The conversation manager will handle connecting to MCP servers
-        debug!(
-            "Created new session with {} MCP servers",
-            request.mcp_servers.len()
-        );
+        debug!("Created new session with {} MCP servers", num_mcp_servers);
 
         Ok(NewSessionResponse {
             session_id,
