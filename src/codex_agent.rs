@@ -11,13 +11,11 @@ use codex_core::auth::{AuthManager, CodexAuth, read_openai_api_key_from_env};
 use codex_core::config::Config;
 use codex_core::config_types::McpServerConfig;
 use codex_core::{CodexConversation, ConversationManager};
-use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::mcp_protocol::ConversationId;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::{AskForApproval, InputItem, Op, SandboxPolicy};
+use codex_protocol::protocol::{InputItem, Op};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
@@ -42,12 +40,8 @@ pub struct CodexAgent {
 
 /// State for an individual session
 struct SessionState {
-    /// The working directory for this session
-    cwd: String,
     /// The conversation ID in the conversation manager
     conversation_id: ConversationId,
-    /// The model being used for this session
-    model: String,
 }
 
 impl CodexAgent {
@@ -227,9 +221,7 @@ impl Agent for CodexAgent {
             .map_err(|_e| Error::internal_error())?;
 
         let session_state = SessionState {
-            cwd: cwd.to_string_lossy().to_string(),
             conversation_id: new_conversation.conversation_id,
-            model: self.config.model.clone(),
         };
 
         self.sessions
@@ -270,25 +262,7 @@ impl Agent for CodexAgent {
         info!("Processing prompt for session: {}", request.session_id);
 
         // Get the session state
-        let (conversation_id, cwd, model) = {
-            let sessions = self.sessions.borrow();
-            let session = sessions
-                .get(&request.session_id)
-                .ok_or_else(Error::invalid_request)?;
-
-            (
-                session.conversation_id,
-                session.cwd.clone(),
-                session.model.clone(),
-            )
-        };
-
-        // Get the conversation from the manager
-        let conversation = self
-            .conversation_manager
-            .get_conversation(conversation_id)
-            .await
-            .map_err(|_e| Error::invalid_request())?;
+        let conversation = self.get_conversation(&request.session_id).await?;
 
         // Convert ACP prompt format to codex format
         let mut input_items = Vec::new();
@@ -325,26 +299,9 @@ impl Agent for CodexAgent {
             }
         }
 
-        let cwd = PathBuf::from(cwd);
-        let approval_policy = AskForApproval::Never; // TODO get this from outside
-        let sandbox_policy = SandboxPolicy::WorkspaceWrite {
-            // TODO get this from outside
-            writable_roots: vec![],
-            network_access: false,
-            exclude_tmpdir_env_var: false,
-            exclude_slash_tmp: false,
-        };
-        let effort = None; // TODO get this from outside
-        let summary = ReasoningSummaryConfig::Auto; // TODO get this from outside
         let submission_id = conversation
-            .submit(Op::UserTurn {
+            .submit(Op::UserInput {
                 items: input_items.clone(),
-                cwd: cwd.clone(),
-                approval_policy,
-                sandbox_policy,
-                model: model.clone(),
-                effort,
-                summary,
             })
             .await
             .map_err(|e| {
@@ -353,9 +310,8 @@ impl Agent for CodexAgent {
             })?;
 
         info!(
-            "Submitted prompt with submission_id: {}, model: {}, {} input items",
+            "Submitted prompt with submission_id: {}, {} input items",
             submission_id,
-            model,
             input_items.len()
         );
 
