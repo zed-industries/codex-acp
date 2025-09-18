@@ -135,7 +135,7 @@ impl Agent for CodexAgent {
 
         // Define our agent capabilities
         let agent_capabilities = AgentCapabilities {
-            load_session: true,
+            load_session: false, // Currently only able to do in-memory... which doens't help us at the moment
             prompt_capabilities: PromptCapabilities {
                 audio: false,
                 embedded_context: true,
@@ -294,7 +294,9 @@ impl Agent for CodexAgent {
                         });
                     }
                 }
-                _ => {
+                ContentBlock::Audio(..)
+                | ContentBlock::Resource(..)
+                | ContentBlock::ResourceLink(..) => {
                     // Skip other content types for now
                 }
             }
@@ -335,23 +337,6 @@ impl Agent for CodexAgent {
                     );
 
                     match event.msg {
-                        EventMsg::TaskComplete(complete_event) => {
-                            info!(
-                                "Task completed successfully after {} events. Last agent message: {:?}",
-                                event_count, complete_event.last_agent_message
-                            );
-                            stop_reason = StopReason::EndTurn;
-                            break;
-                        }
-                        EventMsg::TurnAborted(abort_event) => {
-                            info!("Turn aborted: {:?}", abort_event.reason);
-                            stop_reason = StopReason::Cancelled;
-                            break;
-                        }
-                        EventMsg::Error(error_event) => {
-                            error!("Error during turn: {}", error_event.message);
-                            return Err(Error::internal_error());
-                        }
                         EventMsg::AgentMessage(msg_event) => {
                             // Send this to the client via session/update notification
                             info!("Agent message received: {:?}", msg_event.message);
@@ -371,6 +356,24 @@ impl Agent for CodexAgent {
                             if let Err(e) = self.notification_tx.send(notification) {
                                 error!("Failed to send session notification: {:?}", e);
                             }
+                        }
+                        EventMsg::Error(error_event) => {
+                            error!("Error during turn: {}", error_event.message);
+                            return Err(Error::internal_error());
+                        }
+                        // TODO: This is a pair with TaskStarted, not the end
+                        EventMsg::TaskComplete(complete_event) => {
+                            info!(
+                                "Task completed successfully after {} events. Last agent message: {:?}",
+                                event_count, complete_event.last_agent_message
+                            );
+                            stop_reason = StopReason::EndTurn;
+                            break;
+                        }
+                        EventMsg::TurnAborted(abort_event) => {
+                            info!("Turn aborted: {:?}", abort_event.reason);
+                            stop_reason = StopReason::Cancelled;
+                            break;
                         }
                         EventMsg::UserMessage(msg_event) => {
                             info!("User message echoed: {:?}", msg_event.message);
@@ -434,10 +437,35 @@ impl Agent for CodexAgent {
                             // The actual search results will come through AgentMessage events
                             // We don't mark as completed here since the search is still running!
                         }
-                        _ => {
-                            // TODO: handle others, many of which should become
-                            // session/update notifications sent to the client
-                        }
+                        EventMsg::AgentMessageDelta(..)
+                        | EventMsg::AgentReasoning(..)
+                        | EventMsg::AgentReasoningDelta(..)
+                        | EventMsg::AgentReasoningRawContent(..)
+                        | EventMsg::AgentReasoningRawContentDelta(..)
+                        | EventMsg::AgentReasoningSectionBreak(..)
+                        | EventMsg::ApplyPatchApprovalRequest(..)
+                        | EventMsg::BackgroundEvent(..)
+                        | EventMsg::ConversationPath(..)
+                        | EventMsg::EnteredReviewMode(..)
+                        | EventMsg::ExecApprovalRequest(..)
+                        | EventMsg::ExecCommandBegin(..)
+                        | EventMsg::ExecCommandEnd(..)
+                        | EventMsg::ExecCommandOutputDelta(..)
+                        | EventMsg::ExitedReviewMode(..)
+                        | EventMsg::GetHistoryEntryResponse(..)
+                        | EventMsg::ListCustomPromptsResponse(..)
+                        | EventMsg::McpListToolsResponse(..)
+                        | EventMsg::McpToolCallBegin(..)
+                        | EventMsg::McpToolCallEnd(..)
+                        | EventMsg::PatchApplyBegin(..)
+                        | EventMsg::PatchApplyEnd(..)
+                        | EventMsg::PlanUpdate(..)
+                        | EventMsg::SessionConfigured(..)
+                        | EventMsg::ShutdownComplete
+                        | EventMsg::StreamError(..)
+                        | EventMsg::TaskStarted(..)
+                        | EventMsg::TokenCount(..)
+                        | EventMsg::TurnDiff(..) => {}
                     }
                 }
                 Err(e) => {
@@ -503,13 +531,13 @@ impl Agent for CodexAgent {
         &self,
         _args: agent_client_protocol::ExtRequest,
     ) -> Result<agent_client_protocol::ExtResponse, Error> {
-        todo!()
+        Err(Error::method_not_found())
     }
 
     async fn ext_notification(
         &self,
         _args: agent_client_protocol::ExtNotification,
     ) -> Result<(), Error> {
-        todo!()
+        Err(Error::method_not_found())
     }
 }
