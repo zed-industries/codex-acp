@@ -2,15 +2,17 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     ContentBlock, Error, ExtNotification, ExtRequest, ExtResponse, InitializeRequest,
     InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    SessionId, SessionMode, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent, ToolCall, ToolCallId,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
+    NewSessionRequest, NewSessionResponse, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    PromptCapabilities, PromptRequest, PromptResponse, SessionId, SessionMode, SessionModeId,
+    SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, TextContent, ToolCall, ToolCallId, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
 };
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::auth::{AuthManager, CodexAuth, read_openai_api_key_from_env};
 use codex_core::config::Config;
 use codex_core::config_types::McpServerConfig;
+use codex_core::plan_tool::{StepStatus, UpdatePlanArgs};
 use codex_core::protocol::{
     AgentMessageDeltaEvent, AgentMessageEvent, AgentReasoningDeltaEvent, AgentReasoningEvent,
     AgentReasoningRawContentDeltaEvent, AgentReasoningRawContentEvent,
@@ -352,6 +354,9 @@ impl Agent for CodexAgent {
                     );
 
                     match event.msg {
+                        EventMsg::UserMessage(msg_event) => {
+                            info!("User message echoed: {:?}", msg_event.message);
+                        }
                         // Since we are getting the deltas, we can ignore these events
                         EventMsg::AgentReasoning(AgentReasoningEvent { .. })
                         | EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent {
@@ -406,18 +411,31 @@ impl Agent for CodexAgent {
                                 },
                             );
                         }
-                        EventMsg::Error(ErrorEvent { message })
-                        | EventMsg::StreamError(StreamErrorEvent { message }) => {
-                            error!("Error during turn: {}", message);
-                            return Err(Error::internal_error().with_data(message));
-                        }
-                        EventMsg::TurnAborted(abort_event) => {
-                            info!("Turn aborted: {:?}", abort_event.reason);
-                            stop_reason = StopReason::Cancelled;
-                            break;
-                        }
-                        EventMsg::UserMessage(msg_event) => {
-                            info!("User message echoed: {:?}", msg_event.message);
+                        EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
+                            // Send this to the client via session/update notification
+                            info!("Agent plan updated. Explanation: {:?}", explanation);
+
+                            self.send_notification(
+                                request.session_id.clone(),
+                                SessionUpdate::Plan(Plan {
+                                    entries: plan
+                                        .into_iter()
+                                        .map(|entry| PlanEntry {
+                                            content: entry.step,
+                                            priority: PlanEntryPriority::Medium,
+                                            status: match entry.status {
+                                                StepStatus::Pending => PlanEntryStatus::Pending,
+                                                StepStatus::InProgress => {
+                                                    PlanEntryStatus::InProgress
+                                                }
+                                                StepStatus::Completed => PlanEntryStatus::Completed,
+                                            },
+                                            meta: None,
+                                        })
+                                        .collect(),
+                                    meta: None,
+                                }),
+                            );
                         }
                         EventMsg::WebSearchBegin(search_event) => {
                             info!("Web search started: call_id={}", search_event.call_id);
@@ -477,6 +495,16 @@ impl Agent for CodexAgent {
                             stop_reason = StopReason::EndTurn;
                             break;
                         }
+                        EventMsg::Error(ErrorEvent { message })
+                        | EventMsg::StreamError(StreamErrorEvent { message }) => {
+                            error!("Error during turn: {}", message);
+                            return Err(Error::internal_error().with_data(message));
+                        }
+                        EventMsg::TurnAborted(abort_event) => {
+                            info!("Turn aborted: {:?}", abort_event.reason);
+                            stop_reason = StopReason::Cancelled;
+                            break;
+                        }
 
                         EventMsg::ApplyPatchApprovalRequest(..)
                         | EventMsg::BackgroundEvent(..)
@@ -494,7 +522,6 @@ impl Agent for CodexAgent {
                         | EventMsg::McpToolCallEnd(..)
                         | EventMsg::PatchApplyBegin(..)
                         | EventMsg::PatchApplyEnd(..)
-                        | EventMsg::PlanUpdate(..)
                         | EventMsg::SessionConfigured(..)
                         | EventMsg::ShutdownComplete
                         | EventMsg::TaskStarted(..)
