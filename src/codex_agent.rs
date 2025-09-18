@@ -210,7 +210,7 @@ impl Agent for CodexAgent {
                 .ok_or_else(Error::invalid_request)?;
 
             (
-                session.conversation_id.clone(),
+                session.conversation_id,
                 session.cwd.clone(),
                 session.model.clone(),
             )
@@ -219,7 +219,7 @@ impl Agent for CodexAgent {
         // Get the conversation from the manager
         let conv_manager = self.conversation_manager.lock().await;
         let conversation = conv_manager
-            .get_conversation(conversation_id.clone())
+            .get_conversation(conversation_id)
             .await
             .map_err(|_e| Error::invalid_request())?;
 
@@ -389,7 +389,7 @@ impl Agent for CodexAgent {
             .get(&notification.session_id)
             .ok_or_else(Error::invalid_request)?;
 
-        let conversation_id = session.conversation_id.clone();
+        let conversation_id = session.conversation_id;
         drop(sessions);
 
         // Get the conversation and cancel it

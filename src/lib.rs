@@ -84,9 +84,9 @@ pub async fn run_main(
             });
 
             // Run the I/O task to handle the actual communication
-            io_task.await.map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("ACP I/O error: {e}"))
-            })
+            io_task
+                .await
+                .map_err(|e| std::io::Error::other(format!("ACP I/O error: {e}")))
         })
         .await?;
 
