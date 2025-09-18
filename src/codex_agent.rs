@@ -491,10 +491,11 @@ impl Agent for CodexAgent {
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
         info!("Cancelling operations for session: {}", args.session_id);
 
-        // Get the session to find the conversation ID
-        let _conversation_id = self.get_conversation(&args.session_id).await?;
-        // TODO: Call conversation.cancel() or similar method
-        debug!("Would cancel conversation");
+        self.get_conversation(&args.session_id)
+            .await?
+            .submit(Op::Interrupt)
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
         Ok(())
     }
