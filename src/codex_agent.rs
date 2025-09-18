@@ -444,29 +444,13 @@ impl Agent for CodexAgent {
         })
     }
 
-    async fn cancel(&self, notification: CancelNotification) -> Result<(), Error> {
-        info!(
-            "Cancelling operations for session: {}",
-            notification.session_id
-        );
+    async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
+        info!("Cancelling operations for session: {}", args.session_id);
 
         // Get the session to find the conversation ID
-        let conversation_id = self
-            .sessions
-            .borrow()
-            .get(&notification.session_id)
-            .ok_or_else(Error::invalid_request)?
-            .conversation_id;
-
-        // Get the conversation and cancel it
-        if let Ok(_conversation) = self
-            .conversation_manager
-            .get_conversation(conversation_id)
-            .await
-        {
-            // TODO: Call conversation.cancel() or similar method
-            debug!("Would cancel conversation");
-        }
+        let _conversation_id = self.get_conversation(&args.session_id).await?;
+        // TODO: Call conversation.cancel() or similar method
+        debug!("Would cancel conversation");
 
         Ok(())
     }
