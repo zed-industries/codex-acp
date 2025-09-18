@@ -33,7 +33,7 @@ pub struct CodexAgent {
     config: Config,
     /// Conversation manager for handling sessions
     conversation_manager: ConversationManager,
-    /// Active sessions mapped by SessionId
+    /// Active sessions mapped by `SessionId`
     sessions: Rc<RefCell<HashMap<SessionId, SessionState>>>,
     /// Channel for sending notifications back to the client
     notification_tx: mpsc::UnboundedSender<SessionNotification>,
@@ -46,7 +46,7 @@ struct SessionState {
 }
 
 impl CodexAgent {
-    /// Create a new CodexAgent with the given configuration
+    /// Create a new `CodexAgent` with the given configuration
     pub fn new(
         config: Config,
         notification_tx: mpsc::UnboundedSender<SessionNotification>, // TODO maybe make it bounded
@@ -183,7 +183,7 @@ impl Agent for CodexAgent {
         // Create config for the new conversation
         // TODO: Set working directory and MCP servers in the config
         let mut config = self.config.clone();
-        config.cwd = cwd.clone();
+        config.cwd.clone_from(&cwd);
         for mcp_server in mcp_servers {
             match mcp_server {
                 // Not supported in codex yet

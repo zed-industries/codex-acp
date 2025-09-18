@@ -45,21 +45,20 @@ pub async fn run_main(
 
     local
         .run_until(async move {
+            use agent_client_protocol::AgentSideConnection;
+            use futures::future::LocalBoxFuture;
+            use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
             // Create a channel for notifications
             let (notification_tx, mut notification_rx) = tokio::sync::mpsc::unbounded_channel();
 
             // Create our Agent implementation with notification channel
             let agent = codex_agent::CodexAgent::new(config, notification_tx);
 
-            // Use tokio-util to adapt between tokio and futures traits
-            use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-
             let stdin = tokio::io::stdin().compat();
             let stdout = tokio::io::stdout().compat_write();
 
             // Create the ACP connection
-            use agent_client_protocol::AgentSideConnection;
-            use futures::future::LocalBoxFuture;
 
             let (client_handle, io_task) = AgentSideConnection::new(
                 agent,
