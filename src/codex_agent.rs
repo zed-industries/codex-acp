@@ -4,7 +4,8 @@ use agent_client_protocol::{
     LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse,
     PromptCapabilities, PromptRequest, PromptResponse, SessionId, SessionMode, SessionModeId,
     SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, TextContent, V1,
+    SetSessionModeResponse, StopReason, TextContent, ToolCall, ToolCallId, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
 };
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::auth::{AuthManager, CodexAuth, read_openai_api_key_from_env};
@@ -373,6 +374,80 @@ impl Agent for CodexAgent {
                         }
                         EventMsg::UserMessage(msg_event) => {
                             info!("User message echoed: {:?}", msg_event.message);
+                        }
+                        EventMsg::WebSearchBegin(search_event) => {
+                            info!("Web search started: call_id={}", search_event.call_id);
+
+                            // Create a ToolCall notification for the search beginning
+                            let notification = SessionNotification {
+                                session_id: request.session_id.clone(),
+                                update: SessionUpdate::ToolCall(ToolCall {
+                                    id: ToolCallId(search_event.call_id.clone().into()),
+                                    title: "Searching the Web".to_string(),
+                                    kind: ToolKind::Fetch,
+                                    status: ToolCallStatus::Pending,
+                                    content: vec![],
+                                    locations: vec![],
+                                    raw_input: None,
+                                    raw_output: None,
+                                    meta: None,
+                                }),
+                                meta: None,
+                            };
+
+                            if let Err(e) = self.notification_tx.send(notification) {
+                                error!("Failed to send web search begin notification: {:?}", e);
+                            }
+                        }
+                        EventMsg::WebSearchEnd(search_event) => {
+                            info!(
+                                "Web search completed: call_id={}, query={}",
+                                search_event.call_id, search_event.query
+                            );
+
+                            // Send update that the search is in progress with the query
+                            let notification = SessionNotification {
+                                session_id: request.session_id.clone(),
+                                update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                                    id: ToolCallId(search_event.call_id.clone().into()),
+                                    fields: ToolCallUpdateFields {
+                                        status: Some(ToolCallStatus::InProgress),
+                                        title: Some(format!("Web Search: {}", search_event.query)),
+                                        raw_input: Some(serde_json::json!({
+                                            "query": search_event.query.clone()
+                                        })),
+                                        ..Default::default()
+                                    },
+                                    meta: None,
+                                }),
+                                meta: None,
+                            };
+
+                            if let Err(e) = self.notification_tx.send(notification) {
+                                error!("Failed to send web search end notification: {:?}", e);
+                            }
+
+                            // Also send a completed status since we don't get explicit completion events
+                            // for web search (the results come through other message types)
+                            let completion_notification = SessionNotification {
+                                session_id: request.session_id.clone(),
+                                update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                                    id: ToolCallId(search_event.call_id.clone().into()),
+                                    fields: ToolCallUpdateFields {
+                                        status: Some(ToolCallStatus::Completed),
+                                        ..Default::default()
+                                    },
+                                    meta: None,
+                                }),
+                                meta: None,
+                            };
+
+                            if let Err(e) = self.notification_tx.send(completion_notification) {
+                                error!(
+                                    "Failed to send web search completion notification: {:?}",
+                                    e
+                                );
+                            }
                         }
                         _ => {
                             // TODO: handle others, many of which should become
