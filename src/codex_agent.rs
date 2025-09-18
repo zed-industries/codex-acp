@@ -1,11 +1,12 @@
 use agent_client_protocol::{
-    Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification, Error,
-    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
-    McpCapabilities, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
-    PromptResponse, ProtocolVersion, SessionId, StopReason,
+    Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
+    ContentBlock, Error, InitializeRequest, InitializeResponse, LoadSessionRequest,
+    LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse,
+    PromptCapabilities, PromptRequest, PromptResponse, SessionId, SessionNotification,
+    SessionUpdate, StopReason, TextContent, V1,
 };
 use codex_core::ConversationManager;
-use codex_core::auth::AuthManager;
+use codex_core::auth::{AuthManager, CodexAuth, read_openai_api_key_from_env};
 use codex_core::config::Config;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::mcp_protocol::ConversationId;
@@ -13,8 +14,8 @@ use codex_protocol::protocol::{AskForApproval, InputItem, Op, SandboxPolicy};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tokio::sync::{Mutex, mpsc};
+use tracing::{debug, error, info, warn};
 
 /// The Codex implementation of the ACP Agent trait.
 ///
@@ -24,14 +25,14 @@ pub struct CodexAgent {
     /// The underlying codex configuration
     config: Arc<Config>,
 
-    /// Authentication manager for handling credentials
-    auth_manager: Arc<AuthManager>,
-
     /// Conversation manager for handling sessions
     conversation_manager: Arc<Mutex<ConversationManager>>,
 
     /// Active sessions mapped by SessionId
     sessions: Arc<Mutex<HashMap<SessionId, SessionState>>>,
+
+    /// Channel for sending notifications back to the client
+    notification_tx: mpsc::UnboundedSender<SessionNotification>,
 }
 
 /// State for an individual session
@@ -48,11 +49,29 @@ struct SessionState {
 
 impl CodexAgent {
     /// Create a new CodexAgent with the given configuration
-    pub fn new(config: Arc<Config>) -> Self {
-        // Initialize AuthManager
+    pub fn new(
+        config: Arc<Config>,
+        notification_tx: mpsc::UnboundedSender<SessionNotification>, // TODO maybe make it bounded
+    ) -> Self {
         // Initialize AuthManager - it needs a path, not config
         let codex_home = config.codex_home.clone();
-        let auth_manager = AuthManager::shared(codex_home);
+        let auth_manager = AuthManager::shared(codex_home.clone());
+
+        let auth_manager = if auth_manager.auth().is_none() {
+            // No auth.json found, try environment variable
+            if let Some(api_key) = read_openai_api_key_from_env() {
+                // TODO obviously this is "for testing" - let's try to find a more robust way!
+                AuthManager::from_auth_for_testing(CodexAuth::from_api_key(&api_key))
+            } else {
+                // TODO report this to end user
+                warn!(
+                    "No authentication configured: neither auth.json nor OPENAI_API_KEY environment variable found"
+                );
+                auth_manager
+            }
+        } else {
+            auth_manager
+        };
 
         // Initialize ConversationManager with auth manager
         let conversation_manager =
@@ -60,9 +79,9 @@ impl CodexAgent {
 
         Self {
             config,
-            auth_manager,
             conversation_manager,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            notification_tx,
         }
     }
 }
