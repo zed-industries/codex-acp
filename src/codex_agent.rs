@@ -401,18 +401,22 @@ impl Agent for CodexAgent {
                         }
                         EventMsg::WebSearchEnd(search_event) => {
                             info!(
-                                "Web search completed: call_id={}, query={}",
+                                "Web search query received: call_id={}, query={}",
                                 search_event.call_id, search_event.query
                             );
 
                             // Send update that the search is in progress with the query
+                            // (WebSearchEnd just means we have the query, not that results are ready)
                             let notification = SessionNotification {
                                 session_id: request.session_id.clone(),
                                 update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
                                     id: ToolCallId(search_event.call_id.clone().into()),
                                     fields: ToolCallUpdateFields {
                                         status: Some(ToolCallStatus::InProgress),
-                                        title: Some(format!("Web Search: {}", search_event.query)),
+                                        title: Some(format!(
+                                            "Searching for: {}",
+                                            search_event.query
+                                        )),
                                         raw_input: Some(serde_json::json!({
                                             "query": search_event.query.clone()
                                         })),
@@ -424,30 +428,11 @@ impl Agent for CodexAgent {
                             };
 
                             if let Err(e) = self.notification_tx.send(notification) {
-                                error!("Failed to send web search end notification: {:?}", e);
+                                error!("Failed to send web search query notification: {:?}", e);
                             }
 
-                            // Also send a completed status since we don't get explicit completion events
-                            // for web search (the results come through other message types)
-                            let completion_notification = SessionNotification {
-                                session_id: request.session_id.clone(),
-                                update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                                    id: ToolCallId(search_event.call_id.clone().into()),
-                                    fields: ToolCallUpdateFields {
-                                        status: Some(ToolCallStatus::Completed),
-                                        ..Default::default()
-                                    },
-                                    meta: None,
-                                }),
-                                meta: None,
-                            };
-
-                            if let Err(e) = self.notification_tx.send(completion_notification) {
-                                error!(
-                                    "Failed to send web search completion notification: {:?}",
-                                    e
-                                );
-                            }
+                            // The actual search results will come through AgentMessage events
+                            // We don't mark as completed here since the search is still running!
                         }
                         _ => {
                             // TODO: handle others, many of which should become
