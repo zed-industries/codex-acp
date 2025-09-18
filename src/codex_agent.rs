@@ -12,10 +12,12 @@ use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::mcp_protocol::ConversationId;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::{AskForApproval, InputItem, Op, SandboxPolicy};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 /// The Codex implementation of the ACP Agent trait.
@@ -24,14 +26,11 @@ use tracing::{debug, error, info, warn};
 /// allowing codex to be used as an ACP agent.
 pub struct CodexAgent {
     /// The underlying codex configuration
-    config: Arc<Config>,
-
+    config: Config,
     /// Conversation manager for handling sessions
-    conversation_manager: Arc<Mutex<ConversationManager>>,
-
+    conversation_manager: ConversationManager,
     /// Active sessions mapped by SessionId
-    sessions: Arc<Mutex<HashMap<SessionId, SessionState>>>,
-
+    sessions: Rc<RefCell<HashMap<SessionId, SessionState>>>,
     /// Channel for sending notifications back to the client
     notification_tx: mpsc::UnboundedSender<SessionNotification>,
 }
@@ -40,10 +39,8 @@ pub struct CodexAgent {
 struct SessionState {
     /// The working directory for this session
     cwd: String,
-
     /// The conversation ID in the conversation manager
     conversation_id: ConversationId,
-
     /// The model being used for this session
     model: String,
 }
@@ -51,7 +48,7 @@ struct SessionState {
 impl CodexAgent {
     /// Create a new CodexAgent with the given configuration
     pub fn new(
-        config: Arc<Config>,
+        config: Config,
         notification_tx: mpsc::UnboundedSender<SessionNotification>, // TODO maybe make it bounded
     ) -> Self {
         // Initialize AuthManager - it needs a path, not config
@@ -75,13 +72,12 @@ impl CodexAgent {
         };
 
         // Initialize ConversationManager with auth manager
-        let conversation_manager =
-            Arc::new(Mutex::new(ConversationManager::new(auth_manager.clone())));
+        let conversation_manager = ConversationManager::new(auth_manager.clone());
 
         Self {
             config,
             conversation_manager,
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Rc::new(RefCell::new(HashMap::new())),
             notification_tx,
         }
     }
@@ -141,15 +137,13 @@ impl Agent for CodexAgent {
         // Generate a unique session ID
         let session_id = SessionId(Arc::from(format!("sess_{}", uuid::Uuid::new_v4())));
 
-        // Create a new conversation in the conversation manager
-        let conv_manager = self.conversation_manager.lock().await;
-
         // Create config for the new conversation
         // TODO: Set working directory and MCP servers in the config
-        let conv_config = (*self.config).clone();
+        let conv_config = self.config.clone();
 
         // Create the conversation and get back the NewConversation struct
-        let new_conversation = conv_manager
+        let new_conversation = self
+            .conversation_manager
             .new_conversation(conv_config)
             .await
             .map_err(|_e| Error::internal_error())?;
@@ -161,8 +155,9 @@ impl Agent for CodexAgent {
             model: self.config.model.clone(),
         };
 
-        let mut sessions = self.sessions.lock().await;
-        sessions.insert(session_id.clone(), session_state);
+        self.sessions
+            .borrow_mut()
+            .insert(session_id.clone(), session_state);
 
         // The conversation manager will handle connecting to MCP servers
         debug!(
@@ -184,8 +179,7 @@ impl Agent for CodexAgent {
         info!("Loading session: {}", request.session_id);
 
         // Check if we have this session already
-        let sessions = self.sessions.lock().await;
-        if sessions.contains_key(&request.session_id) {
+        if self.sessions.borrow().contains_key(&request.session_id) {
             // Session already loaded
             return Ok(LoadSessionResponse {
                 modes: None,
@@ -204,7 +198,7 @@ impl Agent for CodexAgent {
 
         // Get the session state
         let (conversation_id, cwd, model) = {
-            let sessions = self.sessions.lock().await;
+            let sessions = self.sessions.borrow();
             let session = sessions
                 .get(&request.session_id)
                 .ok_or_else(Error::invalid_request)?;
@@ -217,8 +211,8 @@ impl Agent for CodexAgent {
         };
 
         // Get the conversation from the manager
-        let conv_manager = self.conversation_manager.lock().await;
-        let conversation = conv_manager
+        let conversation = self
+            .conversation_manager
             .get_conversation(conversation_id)
             .await
             .map_err(|_e| Error::invalid_request())?;
@@ -384,17 +378,19 @@ impl Agent for CodexAgent {
         );
 
         // Get the session to find the conversation ID
-        let sessions = self.sessions.lock().await;
-        let session = sessions
+        let conversation_id = self
+            .sessions
+            .borrow()
             .get(&notification.session_id)
-            .ok_or_else(Error::invalid_request)?;
-
-        let conversation_id = session.conversation_id;
-        drop(sessions);
+            .ok_or_else(Error::invalid_request)?
+            .conversation_id;
 
         // Get the conversation and cancel it
-        let conv_manager = self.conversation_manager.lock().await;
-        if let Ok(_conversation) = conv_manager.get_conversation(conversation_id).await {
+        if let Ok(_conversation) = self
+            .conversation_manager
+            .get_conversation(conversation_id)
+            .await
+        {
             // TODO: Call conversation.cancel() or similar method
             debug!("Would cancel conversation");
         }

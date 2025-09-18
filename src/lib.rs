@@ -5,7 +5,6 @@ use codex_common::CliConfigOverrides;
 use codex_core::config::{Config, ConfigOverrides};
 use std::io::Result as IoResult;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
@@ -50,7 +49,7 @@ pub async fn run_main(
             let (notification_tx, mut notification_rx) = tokio::sync::mpsc::unbounded_channel();
 
             // Create our Agent implementation with notification channel
-            let agent = codex_agent::CodexAgent::new(Arc::new(config), notification_tx);
+            let agent = codex_agent::CodexAgent::new(config, notification_tx);
 
             // Use tokio-util to adapt between tokio and futures traits
             use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
