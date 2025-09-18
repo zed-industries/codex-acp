@@ -119,6 +119,18 @@ impl CodexAgent {
             .await
             .map_err(|e| anyhow::anyhow!(e).into())
     }
+
+    fn send_notification(&self, session_id: SessionId, update: SessionUpdate) {
+        let notification = SessionNotification {
+            session_id,
+            update,
+            meta: None,
+        };
+
+        if let Err(e) = self.notification_tx.send(notification) {
+            error!("Failed to send session notification: {:?}", e);
+        }
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -341,34 +353,20 @@ impl Agent for CodexAgent {
                             // Send this to the client via session/update notification
                             info!("Agent message received: {:?}", msg_event.message);
 
-                            let notification = SessionNotification {
-                                session_id: request.session_id.clone(),
-                                update: SessionUpdate::AgentMessageChunk {
+                            self.send_notification(
+                                request.session_id.clone(),
+                                SessionUpdate::AgentMessageChunk {
                                     content: ContentBlock::Text(TextContent {
                                         text: msg_event.message.clone(),
                                         annotations: None,
                                         meta: None,
                                     }),
                                 },
-                                meta: None,
-                            };
-
-                            if let Err(e) = self.notification_tx.send(notification) {
-                                error!("Failed to send session notification: {:?}", e);
-                            }
+                            );
                         }
                         EventMsg::Error(error_event) => {
                             error!("Error during turn: {}", error_event.message);
                             return Err(Error::internal_error());
-                        }
-                        // TODO: This is a pair with TaskStarted, not the end
-                        EventMsg::TaskComplete(complete_event) => {
-                            info!(
-                                "Task completed successfully after {} events. Last agent message: {:?}",
-                                event_count, complete_event.last_agent_message
-                            );
-                            stop_reason = StopReason::EndTurn;
-                            break;
                         }
                         EventMsg::TurnAborted(abort_event) => {
                             info!("Turn aborted: {:?}", abort_event.reason);
@@ -382,9 +380,9 @@ impl Agent for CodexAgent {
                             info!("Web search started: call_id={}", search_event.call_id);
 
                             // Create a ToolCall notification for the search beginning
-                            let notification = SessionNotification {
-                                session_id: request.session_id.clone(),
-                                update: SessionUpdate::ToolCall(ToolCall {
+                            self.send_notification(
+                                request.session_id.clone(),
+                                SessionUpdate::ToolCall(ToolCall {
                                     id: ToolCallId(search_event.call_id.clone().into()),
                                     title: "Searching the Web".to_string(),
                                     kind: ToolKind::Fetch,
@@ -395,12 +393,7 @@ impl Agent for CodexAgent {
                                     raw_output: None,
                                     meta: None,
                                 }),
-                                meta: None,
-                            };
-
-                            if let Err(e) = self.notification_tx.send(notification) {
-                                error!("Failed to send web search begin notification: {:?}", e);
-                            }
+                            );
                         }
                         EventMsg::WebSearchEnd(search_event) => {
                             info!(
@@ -410,9 +403,9 @@ impl Agent for CodexAgent {
 
                             // Send update that the search is in progress with the query
                             // (WebSearchEnd just means we have the query, not that results are ready)
-                            let notification = SessionNotification {
-                                session_id: request.session_id.clone(),
-                                update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                            self.send_notification(
+                                request.session_id.clone(),
+                                SessionUpdate::ToolCallUpdate(ToolCallUpdate {
                                     id: ToolCallId(search_event.call_id.clone().into()),
                                     fields: ToolCallUpdateFields {
                                         status: Some(ToolCallStatus::InProgress),
@@ -427,15 +420,19 @@ impl Agent for CodexAgent {
                                     },
                                     meta: None,
                                 }),
-                                meta: None,
-                            };
-
-                            if let Err(e) = self.notification_tx.send(notification) {
-                                error!("Failed to send web search query notification: {:?}", e);
-                            }
+                            );
 
                             // The actual search results will come through AgentMessage events
                             // We don't mark as completed here since the search is still running!
+                        }
+                        // TODO: This is a pair with TaskStarted, not the end
+                        EventMsg::TaskComplete(complete_event) => {
+                            info!(
+                                "Task completed successfully after {} events. Last agent message: {:?}",
+                                event_count, complete_event.last_agent_message
+                            );
+                            stop_reason = StopReason::EndTurn;
+                            break;
                         }
                         EventMsg::AgentMessageDelta(..)
                         | EventMsg::AgentReasoning(..)
