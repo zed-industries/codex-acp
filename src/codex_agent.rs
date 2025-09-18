@@ -2,13 +2,15 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     ContentBlock, Error, InitializeRequest, InitializeResponse, LoadSessionRequest,
     LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, SessionId, SessionNotification,
-    SessionUpdate, StopReason, TextContent, V1,
+    PromptCapabilities, PromptRequest, PromptResponse, SessionId, SessionMode, SessionModeId,
+    SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, TextContent, V1,
 };
-use codex_core::ConversationManager;
+use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::auth::{AuthManager, CodexAuth, read_openai_api_key_from_env};
 use codex_core::config::Config;
 use codex_core::config_types::McpServerConfig;
+use codex_core::{CodexConversation, ConversationManager};
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::mcp_protocol::ConversationId;
 use codex_protocol::protocol::EventMsg;
@@ -17,9 +19,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 
 /// The Codex implementation of the ACP Agent trait.
 ///
@@ -78,6 +82,47 @@ impl CodexAgent {
             sessions: Rc::new(RefCell::new(HashMap::new())),
             notification_tx,
         }
+    }
+
+    fn modes(config: &Config) -> Option<SessionModeState> {
+        let current_mode_id = APPROVAL_PRESETS
+            .iter()
+            .find(|preset| {
+                preset.approval == config.approval_policy && preset.sandbox == config.sandbox_policy
+            })
+            .map(|preset| SessionModeId(preset.id.into()))?;
+
+        Some(SessionModeState {
+            current_mode_id,
+            available_modes: APPROVAL_PRESETS
+                .iter()
+                .map(|preset| SessionMode {
+                    id: SessionModeId(preset.id.into()),
+                    name: preset.label.to_owned(),
+                    description: Some(preset.description.to_owned()),
+                    meta: None,
+                })
+                .collect(),
+            meta: None,
+        })
+    }
+
+    async fn get_conversation(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Arc<CodexConversation>, Error> {
+        // Get the session to find the conversation ID
+        let conversation_id = self
+            .sessions
+            .borrow()
+            .get(session_id)
+            .ok_or_else(Error::invalid_request)?
+            .conversation_id;
+
+        self.conversation_manager
+            .get_conversation(conversation_id)
+            .await
+            .map_err(|e| anyhow::anyhow!(e).into())
     }
 }
 
@@ -173,6 +218,8 @@ impl Agent for CodexAgent {
         }
         let num_mcp_servers = config.mcp_servers.len();
 
+        let modes = Self::modes(&config);
+
         let new_conversation = self
             .conversation_manager
             .new_conversation(config)
@@ -193,7 +240,7 @@ impl Agent for CodexAgent {
 
         Ok(NewSessionResponse {
             session_id,
-            modes: None,
+            modes,
             meta: None,
         })
     }
@@ -426,9 +473,30 @@ impl Agent for CodexAgent {
 
     async fn set_session_mode(
         &self,
-        _args: agent_client_protocol::SetSessionModeRequest,
-    ) -> Result<agent_client_protocol::SetSessionModeResponse, Error> {
-        todo!()
+        args: SetSessionModeRequest,
+    ) -> Result<SetSessionModeResponse, Error> {
+        info!("Setting session mode for session: {}", args.session_id);
+
+        let preset = APPROVAL_PRESETS
+            .iter()
+            .find(|preset| args.mode_id.0.as_ref() == preset.id)
+            .ok_or_else(Error::invalid_params)?;
+
+        let conversation = self.get_conversation(&args.session_id).await?;
+
+        conversation
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: Some(preset.approval),
+                sandbox_policy: Some(preset.sandbox.clone()),
+                model: None,
+                effort: None,
+                summary: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        Ok(SetSessionModeResponse::default())
     }
 
     async fn ext_method(
