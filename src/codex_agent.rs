@@ -14,7 +14,7 @@ use codex_core::config_types::McpServerConfig;
 use codex_core::protocol::{
     AgentMessageDeltaEvent, AgentMessageEvent, AgentReasoningDeltaEvent, AgentReasoningEvent,
     AgentReasoningRawContentDeltaEvent, AgentReasoningRawContentEvent,
-    AgentReasoningSectionBreakEvent,
+    AgentReasoningSectionBreakEvent, ErrorEvent, StreamErrorEvent,
 };
 use codex_core::{CodexConversation, ConversationManager};
 use codex_protocol::mcp_protocol::ConversationId;
@@ -408,9 +408,10 @@ impl Agent for CodexAgent {
                                 },
                             );
                         }
-                        EventMsg::Error(error_event) => {
-                            error!("Error during turn: {}", error_event.message);
-                            return Err(Error::internal_error());
+                        EventMsg::Error(ErrorEvent { message })
+                        | EventMsg::StreamError(StreamErrorEvent { message }) => {
+                            error!("Error during turn: {}", message);
+                            return Err(Error::internal_error().with_data(message));
                         }
                         EventMsg::TurnAborted(abort_event) => {
                             info!("Turn aborted: {:?}", abort_event.reason);
@@ -498,7 +499,6 @@ impl Agent for CodexAgent {
                         | EventMsg::PlanUpdate(..)
                         | EventMsg::SessionConfigured(..)
                         | EventMsg::ShutdownComplete
-                        | EventMsg::StreamError(..)
                         | EventMsg::TaskStarted(..)
                         | EventMsg::TokenCount(..)
                         | EventMsg::TurnDiff(..) => {}
