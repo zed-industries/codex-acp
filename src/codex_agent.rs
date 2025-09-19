@@ -138,6 +138,27 @@ impl CodexAgent {
             error!("Failed to send session notification: {:?}", e);
         }
     }
+
+    /// Complete an active web search by sending a completion notification
+    fn complete_web_search(&self, session_id: SessionId, active_web_search: &mut Option<String>) {
+        if let Some(call_id) = active_web_search.take() {
+            let notification = SessionNotification {
+                session_id,
+                update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                    id: ToolCallId(call_id.into()),
+                    fields: ToolCallUpdateFields {
+                        status: Some(ToolCallStatus::Completed),
+                        ..Default::default()
+                    },
+                    meta: None,
+                }),
+                meta: None,
+            };
+            if let Err(e) = self.notification_tx.send(notification) {
+                error!("Failed to send web search completion notification: {:?}", e);
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -442,26 +463,12 @@ impl Agent for CodexAgent {
                         EventMsg::WebSearchBegin(search_event) => {
                             info!("Web search started: call_id={}", search_event.call_id);
 
-                            // Complete any previous web search
-                            if let Some(previous_call_id) =
-                                active_web_search.replace(search_event.call_id.clone())
-                            {
-                                let completion_notification = SessionNotification {
-                                    session_id: request.session_id.clone(),
-                                    update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                                        id: ToolCallId(previous_call_id.into()),
-                                        fields: ToolCallUpdateFields {
-                                            status: Some(ToolCallStatus::Completed),
-                                            ..Default::default()
-                                        },
-                                        meta: None,
-                                    }),
-                                    meta: None,
-                                };
-                                if let Err(e) = self.notification_tx.send(completion_notification) {
-                                    error!("Failed to send previous search completion: {:?}", e);
-                                }
-                            }
+                            // Complete any previous web search before starting a new one
+                            self.complete_web_search(
+                                request.session_id.clone(),
+                                &mut active_web_search,
+                            );
+                            active_web_search = Some(search_event.call_id.clone());
 
                             // Create a ToolCall notification for the search beginning
                             let notification = SessionNotification {
@@ -521,23 +528,10 @@ impl Agent for CodexAgent {
                             );
 
                             // Complete any active web search when a command starts
-                            if let Some(call_id) = active_web_search.take() {
-                                let completion_notification = SessionNotification {
-                                    session_id: request.session_id.clone(),
-                                    update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                                        id: ToolCallId(call_id.into()),
-                                        fields: ToolCallUpdateFields {
-                                            status: Some(ToolCallStatus::Completed),
-                                            ..Default::default()
-                                        },
-                                        meta: None,
-                                    }),
-                                    meta: None,
-                                };
-                                if let Err(e) = self.notification_tx.send(completion_notification) {
-                                    error!("Failed to send search completion: {:?}", e);
-                                }
-                            }
+                            self.complete_web_search(
+                                request.session_id.clone(),
+                                &mut active_web_search,
+                            );
 
                             // Create a new tool call for the command execution
                             let tool_call_id = ToolCallId(exec_event.call_id.clone().into());
@@ -678,23 +672,10 @@ impl Agent for CodexAgent {
                         }
                         EventMsg::McpToolCallBegin(_) | EventMsg::PatchApplyBegin(_) => {
                             // Complete any active web search when other tools start
-                            if let Some(call_id) = active_web_search.take() {
-                                let completion_notification = SessionNotification {
-                                    session_id: request.session_id.clone(),
-                                    update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                                        id: ToolCallId(call_id.into()),
-                                        fields: ToolCallUpdateFields {
-                                            status: Some(ToolCallStatus::Completed),
-                                            ..Default::default()
-                                        },
-                                        meta: None,
-                                    }),
-                                    meta: None,
-                                };
-                                if let Err(e) = self.notification_tx.send(completion_notification) {
-                                    error!("Failed to send search completion: {:?}", e);
-                                }
-                            }
+                            self.complete_web_search(
+                                request.session_id.clone(),
+                                &mut active_web_search,
+                            );
                             // TODO: handle these tool call events properly
                         }
                         // TODO: This is a pair with TaskStarted, not the end
@@ -705,23 +686,10 @@ impl Agent for CodexAgent {
                             );
 
                             // Complete any remaining active web search
-                            if let Some(call_id) = active_web_search.take() {
-                                let completion_notification = SessionNotification {
-                                    session_id: request.session_id.clone(),
-                                    update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                                        id: ToolCallId(call_id.into()),
-                                        fields: ToolCallUpdateFields {
-                                            status: Some(ToolCallStatus::Completed),
-                                            ..Default::default()
-                                        },
-                                        meta: None,
-                                    }),
-                                    meta: None,
-                                };
-                                if let Err(e) = self.notification_tx.send(completion_notification) {
-                                    error!("Failed to send final search completion: {:?}", e);
-                                }
-                            }
+                            self.complete_web_search(
+                                request.session_id.clone(),
+                                &mut active_web_search,
+                            );
 
                             stop_reason = StopReason::EndTurn;
                             break;
