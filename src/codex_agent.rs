@@ -538,7 +538,6 @@ impl Agent for CodexAgent {
                             let tool_call_id = ToolCallId(exec_event.call_id.clone().into());
                             active_command =
                                 Some((exec_event.call_id.clone(), tool_call_id.clone()));
-                            command_output.clear(); // Clear any previous command output
 
                             let notification = SessionNotification {
                                 session_id: request.session_id.clone(),
