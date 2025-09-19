@@ -367,6 +367,7 @@ impl Agent for CodexAgent {
         let mut event_count = 0;
         let mut active_web_search: Option<String> = None;
         let mut active_command: Option<(String, ToolCallId)> = None;
+        let mut command_output: Vec<String> = Vec::new();
         loop {
             event_count += 1;
             match conversation.next_event().await {
@@ -537,6 +538,7 @@ impl Agent for CodexAgent {
                             let tool_call_id = ToolCallId(exec_event.call_id.clone().into());
                             active_command =
                                 Some((exec_event.call_id.clone(), tool_call_id.clone()));
+                            command_output.clear(); // Clear any previous command output
 
                             let notification = SessionNotification {
                                 session_id: request.session_id.clone(),
@@ -570,28 +572,31 @@ impl Agent for CodexAgent {
                             }
                         }
                         EventMsg::ExecCommandOutputDelta(delta_event) => {
-                            // Stream command output to the client
+                            // Accumulate command output and send the full content
                             if let Some((ref call_id, ref tool_call_id)) = active_command {
                                 if call_id == &delta_event.call_id {
                                     // Convert the output chunk to a string (best effort)
                                     let output_text = String::from_utf8_lossy(&delta_event.chunk);
+
+                                    // Accumulate the output
+                                    command_output.push(output_text.to_string());
+
+                                    // Send the full accumulated output (content is replaced, not appended)
+                                    let accumulated_output = command_output.join("");
 
                                     let update = SessionNotification {
                                         session_id: request.session_id.clone(),
                                         update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
                                             id: tool_call_id.clone(),
                                             fields: ToolCallUpdateFields {
-                                                // Append to content by sending a new content block
-                                                // Note: In ACP, content is replaced not appended, so we'd need
-                                                // to track all content. For now, we'll send individual updates
-                                                // and let the client handle accumulation.
+                                                // Send the full accumulated content
                                                 content: Some(vec![ToolCallContent::Content {
                                                     content: ContentBlock::Text(TextContent {
-                                                        text: output_text.to_string(),
+                                                        text: accumulated_output,
                                                         annotations: None,
                                                         meta: Some(serde_json::json!({
                                                             "stream": format!("{:?}", delta_event.stream),
-                                                            "delta": true,
+                                                            "streaming": true,
                                                         })),
                                                     }),
                                                 }]),
@@ -663,6 +668,9 @@ impl Agent for CodexAgent {
                                         }),
                                         meta: None,
                                     };
+
+                                    // Clear accumulated output since we're done
+                                    command_output.clear();
 
                                     if let Err(e) = self.notification_tx.send(completion_update) {
                                         error!("Failed to send exec end notification: {:?}", e);
