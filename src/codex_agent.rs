@@ -40,7 +40,7 @@ pub struct CodexAgent {
     config: Config,
     /// Conversation manager for handling sessions
     conversation_manager: ConversationManager,
-    /// Active sessions mapped by `SessionId`
+    /// Active sessions mapped by SessionId
     sessions: Rc<RefCell<HashMap<SessionId, SessionState>>>,
     /// Channel for sending notifications back to the client
     notification_tx: mpsc::UnboundedSender<SessionNotification>,
