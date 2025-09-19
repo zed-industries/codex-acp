@@ -5,8 +5,8 @@ use agent_client_protocol::{
     NewSessionRequest, NewSessionResponse, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
     PromptCapabilities, PromptRequest, PromptResponse, SessionId, SessionMode, SessionModeId,
     SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, TextContent, ToolCall, ToolCallId, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
+    SetSessionModeResponse, StopReason, TextContent, ToolCall, ToolCallContent, ToolCallId,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
 };
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::auth::{AuthManager, CodexAuth, read_openai_api_key_from_env};
@@ -345,6 +345,7 @@ impl Agent for CodexAgent {
 
         let mut event_count = 0;
         let mut active_web_search: Option<String> = None;
+        let mut active_commands: HashMap<String, ToolCallId> = HashMap::new();
         loop {
             event_count += 1;
             match conversation.next_event().await {
@@ -513,9 +514,163 @@ impl Agent for CodexAgent {
                             // The actual search results will come through AgentMessage events
                             // We mark as completed when a new tool call begins
                         }
-                        EventMsg::McpToolCallBegin(_)
-                        | EventMsg::ExecCommandBegin(_)
-                        | EventMsg::PatchApplyBegin(_) => {
+                        EventMsg::ExecCommandBegin(exec_event) => {
+                            info!(
+                                "Command execution started: call_id={}, command={:?}",
+                                exec_event.call_id, exec_event.command
+                            );
+
+                            // Complete any active web search when a command starts
+                            if let Some(call_id) = active_web_search.take() {
+                                let completion_notification = SessionNotification {
+                                    session_id: request.session_id.clone(),
+                                    update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                                        id: ToolCallId(call_id.into()),
+                                        fields: ToolCallUpdateFields {
+                                            status: Some(ToolCallStatus::Completed),
+                                            ..Default::default()
+                                        },
+                                        meta: None,
+                                    }),
+                                    meta: None,
+                                };
+                                if let Err(e) = self.notification_tx.send(completion_notification) {
+                                    error!("Failed to send search completion: {:?}", e);
+                                }
+                            }
+
+                            // Create a new tool call for the command execution
+                            let tool_call_id = ToolCallId(exec_event.call_id.clone().into());
+                            active_commands
+                                .insert(exec_event.call_id.clone(), tool_call_id.clone());
+
+                            let notification = SessionNotification {
+                                session_id: request.session_id.clone(),
+                                update: SessionUpdate::ToolCall(ToolCall {
+                                    id: tool_call_id,
+                                    title: format!("Running: {}", exec_event.command.join(" ")),
+                                    kind: ToolKind::Execute,
+                                    status: ToolCallStatus::InProgress,
+                                    content: vec![],
+                                    locations: if exec_event.cwd != std::path::PathBuf::from(".") {
+                                        vec![ToolCallLocation {
+                                            path: exec_event.cwd.clone(),
+                                            line: None,
+                                            meta: None,
+                                        }]
+                                    } else {
+                                        vec![]
+                                    },
+                                    raw_input: Some(serde_json::json!({
+                                        "command": exec_event.command,
+                                        "cwd": exec_event.cwd,
+                                    })),
+                                    raw_output: None,
+                                    meta: None,
+                                }),
+                                meta: None,
+                            };
+
+                            if let Err(e) = self.notification_tx.send(notification) {
+                                error!("Failed to send exec begin notification: {:?}", e);
+                            }
+                        }
+                        EventMsg::ExecCommandOutputDelta(delta_event) => {
+                            // Stream command output to the client
+                            if let Some(tool_call_id) = active_commands.get(&delta_event.call_id) {
+                                // Convert the output chunk to a string (best effort)
+                                let output_text = String::from_utf8_lossy(&delta_event.chunk);
+
+                                let update = SessionNotification {
+                                    session_id: request.session_id.clone(),
+                                    update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                                        id: tool_call_id.clone(),
+                                        fields: ToolCallUpdateFields {
+                                            // Append to content by sending a new content block
+                                            // Note: In ACP, content is replaced not appended, so we'd need
+                                            // to track all content. For now, we'll send individual updates
+                                            // and let the client handle accumulation.
+                                            content: Some(vec![ToolCallContent::Content {
+                                                content: ContentBlock::Text(TextContent {
+                                                    text: output_text.to_string(),
+                                                    annotations: None,
+                                                    meta: Some(serde_json::json!({
+                                                        "stream": format!("{:?}", delta_event.stream),
+                                                        "delta": true,
+                                                    })),
+                                                }),
+                                            }]),
+                                            ..Default::default()
+                                        },
+                                        meta: None,
+                                    }),
+                                    meta: None,
+                                };
+
+                                if let Err(e) = self.notification_tx.send(update) {
+                                    error!("Failed to send exec output delta: {:?}", e);
+                                }
+                            }
+                        }
+                        EventMsg::ExecCommandEnd(end_event) => {
+                            info!(
+                                "Command execution ended: call_id={}, exit_code={}",
+                                end_event.call_id, end_event.exit_code
+                            );
+
+                            if let Some(tool_call_id) = active_commands.remove(&end_event.call_id) {
+                                let is_success = end_event.exit_code == 0;
+
+                                let completion_update = SessionNotification {
+                                    session_id: request.session_id.clone(),
+                                    update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                                        id: tool_call_id,
+                                        fields: ToolCallUpdateFields {
+                                            status: Some(if is_success {
+                                                ToolCallStatus::Completed
+                                            } else {
+                                                ToolCallStatus::Failed
+                                            }),
+                                            // Send final aggregated output
+                                            content: Some(vec![ToolCallContent::Content {
+                                                content: ContentBlock::Text(TextContent {
+                                                    text: if !end_event.formatted_output.is_empty()
+                                                    {
+                                                        end_event.formatted_output.clone()
+                                                    } else if !end_event
+                                                        .aggregated_output
+                                                        .is_empty()
+                                                    {
+                                                        end_event.aggregated_output.clone()
+                                                    } else {
+                                                        format!(
+                                                            "stdout:\n{}\n\nstderr:\n{}",
+                                                            end_event.stdout, end_event.stderr
+                                                        )
+                                                    },
+                                                    annotations: None,
+                                                    meta: None,
+                                                }),
+                                            }]),
+                                            raw_output: Some(serde_json::json!({
+                                                "exit_code": end_event.exit_code,
+                                                "stdout": end_event.stdout,
+                                                "stderr": end_event.stderr,
+                                                "duration": end_event.duration.as_secs_f64(),
+                                            })),
+                                            ..Default::default()
+                                        },
+                                        meta: None,
+                                    }),
+                                    meta: None,
+                                };
+
+                                if let Err(e) = self.notification_tx.send(completion_update) {
+                                    error!("Failed to send exec end notification: {:?}", e);
+                                }
+                            }
+                        }
+                        EventMsg::McpToolCallBegin(_) | EventMsg::PatchApplyBegin(_) => {
                             // Complete any active web search when other tools start
                             if let Some(call_id) = active_web_search.take() {
                                 let completion_notification = SessionNotification {
@@ -581,8 +736,6 @@ impl Agent for CodexAgent {
                         | EventMsg::ConversationPath(..)
                         | EventMsg::EnteredReviewMode(..)
                         | EventMsg::ExecApprovalRequest(..)
-                        | EventMsg::ExecCommandEnd(..)
-                        | EventMsg::ExecCommandOutputDelta(..)
                         | EventMsg::ExitedReviewMode(..)
                         | EventMsg::GetHistoryEntryResponse(..)
                         | EventMsg::ListCustomPromptsResponse(..)
