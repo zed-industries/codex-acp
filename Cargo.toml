@@ -12,7 +12,7 @@ name = "codex_acp"
 path = "src/lib.rs"
 
 [dependencies]
-agent-client-protocol = { path = "../agent-client-protocol" }
+agent-client-protocol = { path = "../agent-client-protocol", features = ["unstable"] }
 anyhow = "1"
 async-trait = "0.1"
 codex-arg0 = { path = "../codex/codex-rs/arg0" }

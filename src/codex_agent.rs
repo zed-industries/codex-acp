@@ -2,13 +2,15 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     ContentBlock, Error, ExtNotification, ExtRequest, ExtResponse, InitializeRequest,
     InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
-    NewSessionRequest, NewSessionResponse, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    PromptCapabilities, PromptRequest, PromptResponse, SessionId, SessionMode, SessionModeId,
-    SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, TextContent, ToolCall, ToolCallContent, ToolCallId,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
+    ModelId, ModelInfo, NewSessionRequest, NewSessionResponse, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, SessionId, SessionMode,
+    SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate,
+    SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
+    StopReason, TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
 };
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
+use codex_common::model_presets::{ModelPreset, builtin_model_presets};
 use codex_core::auth::{AuthManager, CodexAuth, read_openai_api_key_from_env};
 use codex_core::config::Config;
 use codex_core::config_types::McpServerConfig;
@@ -19,6 +21,7 @@ use codex_core::protocol::{
     AgentReasoningSectionBreakEvent, ErrorEvent, StreamErrorEvent,
 };
 use codex_core::{CodexConversation, ConversationManager};
+use codex_protocol::config_types::ReasoningEffort;
 use codex_protocol::mcp_protocol::ConversationId;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::{InputItem, Op};
@@ -42,6 +45,8 @@ pub struct CodexAgent {
     conversation_manager: ConversationManager,
     /// Active sessions mapped by SessionId
     sessions: Rc<RefCell<HashMap<SessionId, SessionState>>>,
+    /// Default model presets for a given auth mode
+    model_presets: Vec<ModelPreset>,
     /// Channel for sending notifications back to the client
     notification_tx: mpsc::UnboundedSender<SessionNotification>,
 }
@@ -50,6 +55,8 @@ pub struct CodexAgent {
 struct SessionState {
     /// The conversation ID in the conversation manager
     conversation_id: ConversationId,
+    /// The config used for this session
+    config: Config,
 }
 
 impl CodexAgent {
@@ -76,12 +83,13 @@ impl CodexAgent {
             auth_manager
         };
 
-        let conversation_manager = ConversationManager::new(auth_manager.clone());
+        let model_presets = builtin_model_presets(auth_manager.auth().map(|auth| auth.mode));
 
         Self {
             config,
-            conversation_manager,
+            conversation_manager: ConversationManager::new(auth_manager),
             sessions: Rc::new(RefCell::new(HashMap::new())),
+            model_presets,
             notification_tx,
         }
     }
@@ -105,6 +113,55 @@ impl CodexAgent {
                     meta: None,
                 })
                 .collect(),
+            meta: None,
+        })
+    }
+
+    fn find_model_preset(&self, config: &Config) -> Option<&ModelPreset> {
+        if let Some(preset) = self.model_presets.iter().find(|preset| {
+            preset.model == config.model && preset.effort == config.model_reasoning_effort
+        }) {
+            return Some(preset);
+        }
+
+        // If we didn't find it, and it is set to none, see if we can find one with the default value
+        if config.model_reasoning_effort.is_none()
+            && let Some(preset) = self.model_presets.iter().find(|preset| {
+                preset.model == config.model && preset.effort == Some(ReasoningEffort::default())
+            })
+        {
+            return Some(preset);
+        }
+
+        None
+    }
+
+    fn models(&self, config: &Config) -> Result<SessionModelState, Error> {
+        let current_model_id = self
+            .find_model_preset(config)
+            .map(|preset| ModelId(preset.id.into()))
+            .ok_or_else(|| anyhow::anyhow!("No valid model preset for model {}", config.model))?;
+
+        let available_models = self
+            .model_presets
+            .iter()
+            .map(|preset| ModelInfo {
+                model_id: ModelId(preset.id.into()),
+                name: preset.label.into(),
+                description: Some(
+                    preset
+                        .description
+                        .strip_prefix("— ")
+                        .unwrap_or(preset.description)
+                        .into(),
+                ),
+                meta: None,
+            })
+            .collect();
+
+        Ok(SessionModelState {
+            current_model_id,
+            available_models,
             meta: None,
         })
     }
@@ -253,15 +310,17 @@ impl Agent for CodexAgent {
         let num_mcp_servers = config.mcp_servers.len();
 
         let modes = Self::modes(&config);
+        let models = self.models(&config)?;
 
         let new_conversation = self
             .conversation_manager
-            .new_conversation(config)
+            .new_conversation(config.clone())
             .await
             .map_err(|_e| Error::internal_error())?;
 
         let session_state = SessionState {
             conversation_id: new_conversation.conversation_id,
+            config,
         };
 
         self.sessions
@@ -273,6 +332,7 @@ impl Agent for CodexAgent {
         Ok(NewSessionResponse {
             session_id,
             modes,
+            models: Some(models),
             meta: None,
         })
     }
@@ -284,10 +344,11 @@ impl Agent for CodexAgent {
         info!("Loading session: {}", request.session_id);
 
         // Check if we have this session already
-        if self.sessions.borrow().contains_key(&request.session_id) {
+        if let Some(session_state) = self.sessions.borrow().get(&request.session_id) {
             // Session already loaded
             return Ok(LoadSessionResponse {
-                modes: None,
+                modes: Self::modes(&session_state.config),
+                models: Some(self.models(&session_state.config)?),
                 meta: None,
             });
         }
@@ -785,7 +846,46 @@ impl Agent for CodexAgent {
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
+        if let Some(session_state) = self.sessions.borrow_mut().get_mut(&args.session_id) {
+            session_state.config.approval_policy = preset.approval;
+            session_state.config.sandbox_policy = preset.sandbox.clone();
+        }
+
         Ok(SetSessionModeResponse::default())
+    }
+
+    async fn set_session_model(
+        &self,
+        args: SetSessionModelRequest,
+    ) -> Result<SetSessionModelResponse, Error> {
+        info!("Setting session model for session: {}", args.session_id);
+
+        let conversation = self.get_conversation(&args.session_id).await?;
+
+        let preset = self
+            .model_presets
+            .iter()
+            .find(|p| p.id == args.model_id.0.as_ref())
+            .ok_or_else(|| Error::invalid_params().with_data("Model not found"))?;
+
+        conversation
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                model: Some(preset.model.into()),
+                effort: Some(preset.effort),
+                summary: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        if let Some(session_state) = self.sessions.borrow_mut().get_mut(&args.session_id) {
+            session_state.config.model = preset.model.into();
+            session_state.config.model_reasoning_effort = preset.effort;
+        }
+
+        Ok(SetSessionModelResponse::default())
     }
 
     async fn ext_method(&self, _args: ExtRequest) -> Result<ExtResponse, Error> {
