@@ -572,43 +572,43 @@ impl Agent for CodexAgent {
                         }
                         EventMsg::ExecCommandOutputDelta(delta_event) => {
                             // Accumulate command output and send the full content
-                            if let Some((ref call_id, ref tool_call_id)) = active_command {
-                                if call_id == &delta_event.call_id {
-                                    // Convert the output chunk to a string (best effort)
-                                    let output_text = String::from_utf8_lossy(&delta_event.chunk);
+                            if let Some((ref call_id, ref tool_call_id)) = active_command
+                                && call_id == &delta_event.call_id
+                            {
+                                // Convert the output chunk to a string (best effort)
+                                let output_text = String::from_utf8_lossy(&delta_event.chunk);
 
-                                    // Accumulate the output
-                                    command_output.push(output_text.to_string());
+                                // Accumulate the output
+                                command_output.push(output_text.to_string());
 
-                                    // Send the full accumulated output (content is replaced, not appended)
-                                    let accumulated_output = command_output.join("");
+                                // Send the full accumulated output (content is replaced, not appended)
+                                let accumulated_output = command_output.join("");
 
-                                    let update = SessionNotification {
-                                        session_id: request.session_id.clone(),
-                                        update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                                            id: tool_call_id.clone(),
-                                            fields: ToolCallUpdateFields {
-                                                // Send the full accumulated content
-                                                content: Some(vec![ToolCallContent::Content {
-                                                    content: ContentBlock::Text(TextContent {
-                                                        text: accumulated_output,
-                                                        annotations: None,
-                                                        meta: Some(serde_json::json!({
-                                                            "stream": format!("{:?}", delta_event.stream),
-                                                            "streaming": true,
-                                                        })),
-                                                    }),
-                                                }]),
-                                                ..Default::default()
-                                            },
-                                            meta: None,
-                                        }),
+                                let update = SessionNotification {
+                                    session_id: request.session_id.clone(),
+                                    update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                                        id: tool_call_id.clone(),
+                                        fields: ToolCallUpdateFields {
+                                            // Send the full accumulated content
+                                            content: Some(vec![ToolCallContent::Content {
+                                                content: ContentBlock::Text(TextContent {
+                                                    text: accumulated_output,
+                                                    annotations: None,
+                                                    meta: Some(serde_json::json!({
+                                                        "stream": format!("{:?}", delta_event.stream),
+                                                        "streaming": true,
+                                                    })),
+                                                }),
+                                            }]),
+                                            ..Default::default()
+                                        },
                                         meta: None,
-                                    };
+                                    }),
+                                    meta: None,
+                                };
 
-                                    if let Err(e) = self.notification_tx.send(update) {
-                                        error!("Failed to send exec output delta: {:?}", e);
-                                    }
+                                if let Err(e) = self.notification_tx.send(update) {
+                                    error!("Failed to send exec output delta: {:?}", e);
                                 }
                             }
                         }
@@ -618,62 +618,60 @@ impl Agent for CodexAgent {
                                 end_event.call_id, end_event.exit_code
                             );
 
-                            if let Some((call_id, tool_call_id)) = active_command.take() {
-                                if call_id == end_event.call_id {
-                                    let is_success = end_event.exit_code == 0;
+                            if let Some((call_id, tool_call_id)) = active_command.take()
+                                && call_id == end_event.call_id
+                            {
+                                let is_success = end_event.exit_code == 0;
 
-                                    let completion_update = SessionNotification {
-                                        session_id: request.session_id.clone(),
-                                        update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                                            id: tool_call_id,
-                                            fields: ToolCallUpdateFields {
-                                                status: Some(if is_success {
-                                                    ToolCallStatus::Completed
-                                                } else {
-                                                    ToolCallStatus::Failed
+                                let completion_update = SessionNotification {
+                                    session_id: request.session_id.clone(),
+                                    update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                                        id: tool_call_id,
+                                        fields: ToolCallUpdateFields {
+                                            status: Some(if is_success {
+                                                ToolCallStatus::Completed
+                                            } else {
+                                                ToolCallStatus::Failed
+                                            }),
+                                            // Send final aggregated output
+                                            content: Some(vec![ToolCallContent::Content {
+                                                content: ContentBlock::Text(TextContent {
+                                                    text: if !end_event.formatted_output.is_empty()
+                                                    {
+                                                        end_event.formatted_output.clone()
+                                                    } else if !end_event
+                                                        .aggregated_output
+                                                        .is_empty()
+                                                    {
+                                                        end_event.aggregated_output.clone()
+                                                    } else {
+                                                        format!(
+                                                            "stdout:\n{}\n\nstderr:\n{}",
+                                                            end_event.stdout, end_event.stderr
+                                                        )
+                                                    },
+                                                    annotations: None,
+                                                    meta: None,
                                                 }),
-                                                // Send final aggregated output
-                                                content: Some(vec![ToolCallContent::Content {
-                                                    content: ContentBlock::Text(TextContent {
-                                                        text: if !end_event
-                                                            .formatted_output
-                                                            .is_empty()
-                                                        {
-                                                            end_event.formatted_output.clone()
-                                                        } else if !end_event
-                                                            .aggregated_output
-                                                            .is_empty()
-                                                        {
-                                                            end_event.aggregated_output.clone()
-                                                        } else {
-                                                            format!(
-                                                                "stdout:\n{}\n\nstderr:\n{}",
-                                                                end_event.stdout, end_event.stderr
-                                                            )
-                                                        },
-                                                        annotations: None,
-                                                        meta: None,
-                                                    }),
-                                                }]),
-                                                raw_output: Some(serde_json::json!({
-                                                    "exit_code": end_event.exit_code,
-                                                    "stdout": end_event.stdout,
-                                                    "stderr": end_event.stderr,
-                                                    "duration": end_event.duration.as_secs_f64(),
-                                                })),
-                                                ..Default::default()
-                                            },
-                                            meta: None,
-                                        }),
+                                            }]),
+                                            raw_output: Some(serde_json::json!({
+                                                "exit_code": end_event.exit_code,
+                                                "stdout": end_event.stdout,
+                                                "stderr": end_event.stderr,
+                                                "duration": end_event.duration.as_secs_f64(),
+                                            })),
+                                            ..Default::default()
+                                        },
                                         meta: None,
-                                    };
+                                    }),
+                                    meta: None,
+                                };
 
-                                    // Clear accumulated output since we're done
-                                    command_output.clear();
+                                // Clear accumulated output since we're done
+                                command_output.clear();
 
-                                    if let Err(e) = self.notification_tx.send(completion_update) {
-                                        error!("Failed to send exec end notification: {:?}", e);
-                                    }
+                                if let Err(e) = self.notification_tx.send(completion_update) {
+                                    error!("Failed to send exec end notification: {:?}", e);
                                 }
                             }
                         }
