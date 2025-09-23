@@ -1,13 +1,14 @@
 use agent_client_protocol::{
-    Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ContentBlock, Error, ExtNotification, ExtRequest, ExtResponse, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
-    ModelId, ModelInfo, NewSessionRequest, NewSessionResponse, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, SessionId, SessionMode,
-    SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate,
-    SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
-    StopReason, TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
+    Agent, AgentCapabilities, AgentSideConnection, AuthenticateRequest, AuthenticateResponse,
+    CancelNotification, Client, ContentBlock, Error, ExtNotification, ExtRequest, ExtResponse,
+    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
+    McpCapabilities, McpServer, ModelId, ModelInfo, NewSessionRequest, NewSessionResponse, Plan,
+    PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest,
+    PromptResponse, SessionId, SessionMode, SessionModeId, SessionModeState, SessionModelState,
+    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse,
+    SetSessionModelRequest, SetSessionModelResponse, StopReason, TextContent, ToolCall,
+    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, V1,
 };
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_common::model_presets::{ModelPreset, builtin_model_presets};
@@ -29,7 +30,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
@@ -47,8 +47,8 @@ pub struct CodexAgent {
     sessions: Rc<RefCell<HashMap<SessionId, SessionState>>>,
     /// Default model presets for a given auth mode
     model_presets: Vec<ModelPreset>,
-    /// Channel for sending notifications back to the client
-    notification_tx: mpsc::UnboundedSender<SessionNotification>,
+    /// Channel for communication with the client
+    client: Rc<AgentSideConnection>,
 }
 
 /// State for an individual session
@@ -61,10 +61,7 @@ struct SessionState {
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
-    pub fn new(
-        config: Config,
-        notification_tx: mpsc::UnboundedSender<SessionNotification>, // TODO maybe make it bounded
-    ) -> Self {
+    pub fn new(config: Config, client: Rc<AgentSideConnection>) -> Self {
         let auth_manager = AuthManager::shared(config.codex_home.clone());
 
         let auth_manager = if auth_manager.auth().is_none() {
@@ -90,7 +87,7 @@ impl CodexAgent {
             conversation_manager: ConversationManager::new(auth_manager),
             sessions: Rc::new(RefCell::new(HashMap::new())),
             model_presets,
-            notification_tx,
+            client,
         }
     }
 
@@ -184,24 +181,28 @@ impl CodexAgent {
             .map_err(|e| anyhow::anyhow!(e).into())
     }
 
-    fn send_notification(&self, session_id: SessionId, update: SessionUpdate) {
+    async fn send_notification(&self, session_id: SessionId, update: SessionUpdate) {
         let notification = SessionNotification {
             session_id,
             update,
             meta: None,
         };
 
-        if let Err(e) = self.notification_tx.send(notification) {
+        if let Err(e) = self.client.session_notification(notification).await {
             error!("Failed to send session notification: {:?}", e);
         }
     }
 
     /// Complete an active web search by sending a completion notification
-    fn complete_web_search(&self, session_id: SessionId, active_web_search: &mut Option<String>) {
+    async fn complete_web_search(
+        &self,
+        session_id: SessionId,
+        active_web_search: &mut Option<String>,
+    ) {
         if let Some(call_id) = active_web_search.take() {
-            let notification = SessionNotification {
+            self.send_notification(
                 session_id,
-                update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                SessionUpdate::ToolCallUpdate(ToolCallUpdate {
                     id: ToolCallId(call_id.into()),
                     fields: ToolCallUpdateFields {
                         status: Some(ToolCallStatus::Completed),
@@ -209,11 +210,8 @@ impl CodexAgent {
                     },
                     meta: None,
                 }),
-                meta: None,
-            };
-            if let Err(e) = self.notification_tx.send(notification) {
-                error!("Failed to send web search completion notification: {:?}", e);
-            }
+            )
+            .await;
         }
     }
 }
@@ -465,7 +463,7 @@ impl Agent for CodexAgent {
                                         meta: None,
                                     }),
                                 },
-                            );
+                            ).await;
                         }
                         EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent { delta: text })
                         | EventMsg::AgentReasoningRawContentDelta(
@@ -483,7 +481,7 @@ impl Agent for CodexAgent {
                                         meta: None,
                                     }),
                                 },
-                            );
+                            ).await;
                         }
                         EventMsg::AgentReasoningSectionBreak(
                             AgentReasoningSectionBreakEvent {},
@@ -498,7 +496,7 @@ impl Agent for CodexAgent {
                                         meta: None,
                                     }),
                                 },
-                            );
+                            ).await;
                         }
                         EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
                             // Send this to the client via session/update notification
@@ -524,7 +522,7 @@ impl Agent for CodexAgent {
                                         .collect(),
                                     meta: None,
                                 }),
-                            );
+                            ).await;
                         }
                         EventMsg::WebSearchBegin(search_event) => {
                             info!("Web search started: call_id={}", search_event.call_id);
@@ -533,29 +531,21 @@ impl Agent for CodexAgent {
                             self.complete_web_search(
                                 request.session_id.clone(),
                                 &mut active_web_search,
-                            );
+                            ).await;
                             active_web_search = Some(search_event.call_id.clone());
 
                             // Create a ToolCall notification for the search beginning
-                            let notification = SessionNotification {
-                                session_id: request.session_id.clone(),
-                                update: SessionUpdate::ToolCall(ToolCall {
-                                    id: ToolCallId(search_event.call_id.clone().into()),
-                                    title: "Searching the Web".to_string(),
-                                    kind: ToolKind::Fetch,
-                                    status: ToolCallStatus::Pending,
-                                    content: vec![],
-                                    locations: vec![],
-                                    raw_input: None,
-                                    raw_output: None,
-                                    meta: None,
-                                }),
+                            self.send_notification(request.session_id.clone(), SessionUpdate::ToolCall(ToolCall {
+                                id: ToolCallId(search_event.call_id.clone().into()),
+                                title: "Searching the Web".to_string(),
+                                kind: ToolKind::Fetch,
+                                status: ToolCallStatus::Pending,
+                                content: vec![],
+                                locations: vec![],
+                                raw_input: None,
+                                raw_output: None,
                                 meta: None,
-                            };
-
-                            if let Err(e) = self.notification_tx.send(notification) {
-                                error!("Failed to send web search begin notification: {:?}", e);
-                            }
+                            })).await;
                         }
                         EventMsg::WebSearchEnd(search_event) => {
                             info!(
@@ -582,7 +572,7 @@ impl Agent for CodexAgent {
                                     },
                                     meta: None,
                                 }),
-                            );
+                            ).await;
 
                             // The actual search results will come through AgentMessage events
                             // We mark as completed when a new tool call begins
@@ -597,43 +587,35 @@ impl Agent for CodexAgent {
                             self.complete_web_search(
                                 request.session_id.clone(),
                                 &mut active_web_search,
-                            );
+                            ).await;
 
                             // Create a new tool call for the command execution
                             let tool_call_id = ToolCallId(exec_event.call_id.clone().into());
                             active_command =
                                 Some((exec_event.call_id.clone(), tool_call_id.clone()));
 
-                            let notification = SessionNotification {
-                                session_id: request.session_id.clone(),
-                                update: SessionUpdate::ToolCall(ToolCall {
-                                    id: tool_call_id,
-                                    title: format!("Running: {}", exec_event.command.join(" ")),
-                                    kind: ToolKind::Execute,
-                                    status: ToolCallStatus::InProgress,
-                                    content: vec![],
-                                    locations: if exec_event.cwd != std::path::PathBuf::from(".") {
-                                        vec![ToolCallLocation {
-                                            path: exec_event.cwd.clone(),
-                                            line: None,
-                                            meta: None,
-                                        }]
-                                    } else {
-                                        vec![]
-                                    },
-                                    raw_input: Some(serde_json::json!({
-                                        "command": exec_event.command,
-                                        "cwd": exec_event.cwd,
-                                    })),
-                                    raw_output: None,
-                                    meta: None,
-                                }),
+                            self.send_notification(request.session_id.clone(), SessionUpdate::ToolCall(ToolCall {
+                                id: tool_call_id,
+                                title: format!("Running: {}", exec_event.command.join(" ")),
+                                kind: ToolKind::Execute,
+                                status: ToolCallStatus::InProgress,
+                                content: vec![],
+                                locations: if exec_event.cwd != std::path::PathBuf::from(".") {
+                                    vec![ToolCallLocation {
+                                        path: exec_event.cwd.clone(),
+                                        line: None,
+                                        meta: None,
+                                    }]
+                                } else {
+                                    vec![]
+                                },
+                                raw_input: Some(serde_json::json!({
+                                    "command": exec_event.command,
+                                    "cwd": exec_event.cwd,
+                                })),
+                                raw_output: None,
                                 meta: None,
-                            };
-
-                            if let Err(e) = self.notification_tx.send(notification) {
-                                error!("Failed to send exec begin notification: {:?}", e);
-                            }
+                            })).await;
                         }
                         EventMsg::ExecCommandOutputDelta(delta_event) => {
                             // Accumulate command output and send the full content
@@ -649,32 +631,24 @@ impl Agent for CodexAgent {
                                 // Send the full accumulated output (content is replaced, not appended)
                                 let accumulated_output = command_output.join("");
 
-                                let update = SessionNotification {
-                                    session_id: request.session_id.clone(),
-                                    update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                                        id: tool_call_id.clone(),
-                                        fields: ToolCallUpdateFields {
-                                            // Send the full accumulated content
-                                            content: Some(vec![ToolCallContent::Content {
-                                                content: ContentBlock::Text(TextContent {
-                                                    text: accumulated_output,
-                                                    annotations: None,
-                                                    meta: Some(serde_json::json!({
-                                                        "stream": format!("{:?}", delta_event.stream),
-                                                        "streaming": true,
-                                                    })),
-                                                }),
-                                            }]),
-                                            ..Default::default()
-                                        },
-                                        meta: None,
-                                    }),
+                                self.send_notification(request.session_id.clone(), SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                                    id: tool_call_id.clone(),
+                                    fields: ToolCallUpdateFields {
+                                        // Send the full accumulated content
+                                        content: Some(vec![ToolCallContent::Content {
+                                            content: ContentBlock::Text(TextContent {
+                                                text: accumulated_output,
+                                                annotations: None,
+                                                meta: Some(serde_json::json!({
+                                                    "stream": format!("{:?}", delta_event.stream),
+                                                    "streaming": true,
+                                                })),
+                                            }),
+                                        }]),
+                                        ..Default::default()
+                                    },
                                     meta: None,
-                                };
-
-                                if let Err(e) = self.notification_tx.send(update) {
-                                    error!("Failed to send exec output delta: {:?}", e);
-                                }
+                                })).await;
                             }
                         }
                         EventMsg::ExecCommandEnd(end_event) => {
@@ -688,9 +662,7 @@ impl Agent for CodexAgent {
                             {
                                 let is_success = end_event.exit_code == 0;
 
-                                let completion_update = SessionNotification {
-                                    session_id: request.session_id.clone(),
-                                    update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                                let completion_update = SessionUpdate::ToolCallUpdate(ToolCallUpdate {
                                         id: tool_call_id,
                                         fields: ToolCallUpdateFields {
                                             status: Some(if is_success {
@@ -728,16 +700,12 @@ impl Agent for CodexAgent {
                                             ..Default::default()
                                         },
                                         meta: None,
-                                    }),
-                                    meta: None,
-                                };
+                                    });
 
                                 // Clear accumulated output since we're done
                                 command_output.clear();
 
-                                if let Err(e) = self.notification_tx.send(completion_update) {
-                                    error!("Failed to send exec end notification: {:?}", e);
-                                }
+                                self.send_notification(request.session_id.clone(), completion_update).await;
                             }
                         }
                         EventMsg::McpToolCallBegin(_) | EventMsg::PatchApplyBegin(_) => {
@@ -745,7 +713,7 @@ impl Agent for CodexAgent {
                             self.complete_web_search(
                                 request.session_id.clone(),
                                 &mut active_web_search,
-                            );
+                            ).await;
                             // TODO: handle these tool call events properly
                         }
                         EventMsg::TaskComplete(complete_event) => {
@@ -758,7 +726,7 @@ impl Agent for CodexAgent {
                             self.complete_web_search(
                                 request.session_id.clone(),
                                 &mut active_web_search,
-                            );
+                            ).await;
 
                             stop_reason = StopReason::EndTurn;
                             break;
@@ -775,7 +743,7 @@ impl Agent for CodexAgent {
                             self.complete_web_search(
                                 request.session_id.clone(),
                                 &mut active_web_search,
-                            );
+                            ).await;
                             stop_reason = StopReason::Cancelled;
                             break;
                         }
@@ -786,7 +754,7 @@ impl Agent for CodexAgent {
                             self.complete_web_search(
                                 request.session_id.clone(),
                                 &mut active_web_search,
-                            );
+                            ).await;
                             stop_reason = StopReason::Cancelled;
                             break;
                         }
@@ -796,7 +764,7 @@ impl Agent for CodexAgent {
                             self.complete_web_search(
                                 request.session_id.clone(),
                                 &mut active_web_search,
-                            );
+                            ).await;
                         }
                         // we already have a way to diff the turn, so ignore
                         EventMsg::TurnDiff(..) =>  {
@@ -804,7 +772,7 @@ impl Agent for CodexAgent {
                             self.complete_web_search(
                                 request.session_id.clone(),
                                 &mut active_web_search,
-                            );
+                            ).await;
                         }
                         EventMsg::ApplyPatchApprovalRequest(..)
                         | EventMsg::PatchApplyEnd(..)

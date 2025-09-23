@@ -49,19 +49,15 @@ pub async fn run_main(
             use futures::future::LocalBoxFuture;
             use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-            // Create a channel for notifications
-            let (notification_tx, mut notification_rx) = tokio::sync::mpsc::unbounded_channel();
-
             // Create our Agent implementation with notification channel
-            let agent = codex_agent::CodexAgent::new(config, notification_tx);
 
             let stdin = tokio::io::stdin().compat();
             let stdout = tokio::io::stdout().compat_write();
 
             // Create the ACP connection
 
-            let (client_handle, io_task) = AgentSideConnection::new(
-                agent,
+            let (_, io_task) = AgentSideConnection::new(
+                move |client| codex_agent::CodexAgent::new(config, client),
                 stdout,
                 stdin,
                 |fut: LocalBoxFuture<'static, ()>| {
@@ -69,17 +65,6 @@ pub async fn run_main(
                     tokio::task::spawn_local(fut);
                 },
             );
-
-            // Spawn a task to forward notifications from the channel to the client
-            let client = std::sync::Arc::new(client_handle);
-            tokio::task::spawn_local(async move {
-                while let Some(notification) = notification_rx.recv().await {
-                    use agent_client_protocol::Client;
-                    if let Err(e) = client.session_notification(notification).await {
-                        tracing::error!("Failed to send session notification: {:?}", e);
-                    }
-                }
-            });
 
             // Run the I/O task to handle the actual communication
             io_task
