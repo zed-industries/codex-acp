@@ -301,7 +301,8 @@ impl Agent for CodexAgent {
                             } else {
                                 Some(env.into_iter().map(|env| (env.name, env.value)).collect())
                             },
-                            startup_timeout_ms: None,
+                            startup_timeout_sec: None,
+                            tool_timeout_sec: None,
                         },
                     );
                 }
