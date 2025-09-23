@@ -2,13 +2,14 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AgentSideConnection, AuthenticateRequest, AuthenticateResponse,
     CancelNotification, Client, ContentBlock, Error, ExtNotification, ExtRequest, ExtResponse,
     InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
-    McpCapabilities, McpServer, ModelId, ModelInfo, NewSessionRequest, NewSessionResponse, Plan,
-    PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest,
-    PromptResponse, SessionId, SessionMode, SessionModeId, SessionModeState, SessionModelState,
-    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse,
-    SetSessionModelRequest, SetSessionModelResponse, StopReason, TextContent, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, V1,
+    McpCapabilities, McpServer, ModelId, ModelInfo, NewSessionRequest, NewSessionResponse,
+    PermissionOption, PermissionOptionId, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionId, SessionMode, SessionModeId, SessionModeState,
+    SessionModelState, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, StopReason,
+    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
 };
 use codex_common::{
     approval_presets::{ApprovalPreset, builtin_approval_presets},
@@ -23,7 +24,8 @@ use codex_core::{
     protocol::{
         AgentMessageDeltaEvent, AgentMessageEvent, AgentReasoningDeltaEvent, AgentReasoningEvent,
         AgentReasoningRawContentDeltaEvent, AgentReasoningRawContentEvent,
-        AgentReasoningSectionBreakEvent, ErrorEvent, StreamErrorEvent,
+        AgentReasoningSectionBreakEvent, ErrorEvent, ExecApprovalRequestEvent, ReviewDecision,
+        StreamErrorEvent,
     },
 };
 use codex_protocol::{
@@ -594,6 +596,82 @@ impl Agent for CodexAgent {
                             // The actual search results will come through AgentMessage events
                             // We mark as completed when a new tool call begins
                         }
+                        EventMsg::ExecApprovalRequest(event) => {
+                            let raw_input = serde_json::json!(&event);
+                            let ExecApprovalRequestEvent { call_id, command, cwd, reason } = event;
+
+                            info!("Command execution started: call_id={call_id}, command={command:?}");
+
+                            // Complete any active web search when a command starts
+                            self.complete_web_search(
+                                request.session_id.clone(),
+                                &mut active_web_search,
+                            ).await;
+
+                            let conversation = self.get_conversation(&request.session_id).await?;
+
+                            // Create a new tool call for the command execution
+                            let tool_call_id = ToolCallId(call_id.clone().into());
+                            active_command =
+                                Some((call_id.clone(), tool_call_id.clone()));
+
+                            let response = self.client().request_permission(RequestPermissionRequest {
+                                session_id: request.session_id.clone(),
+                                tool_call: ToolCallUpdate {
+                                    id: tool_call_id,
+                                    fields: ToolCallUpdateFields {
+                                        kind: Some(ToolKind::Execute),
+                                        status: Some(ToolCallStatus::Pending),
+                                        title: Some(format!("Running: {}", command.join(" "))),
+                                        content: reason.map(|r| vec![r.into()]),
+                                        locations: if cwd != std::path::PathBuf::from(".") {
+                                            Some(vec![ToolCallLocation {
+                                                path: cwd.clone(),
+                                                line: None,
+                                                meta: None,
+                                            }])
+                                        } else {
+                                            None
+                                        },
+                                        raw_input: Some(raw_input),
+                                        raw_output: None
+                                    } ,
+                                    meta: None
+                                },
+                                options: vec![
+                                    PermissionOption {
+                                        id: PermissionOptionId("approved-for-session".into()),
+                                        name: "Always".into(),
+                                        kind: PermissionOptionKind::AllowAlways,
+                                        meta: None,
+                                    },
+                                    PermissionOption {
+                                        id: PermissionOptionId("approved".into()),
+                                        name: "Yes".into(),
+                                        kind: PermissionOptionKind::AllowOnce,
+                                        meta: None,
+                                    },
+                                    PermissionOption {
+                                        id: PermissionOptionId("denied".into()),
+                                        name: "No".into(),
+                                        kind: PermissionOptionKind::RejectOnce,
+                                        meta: None,
+                                    },
+                                ],
+                                meta: None,
+                            }).await?;
+
+                            let decision = match response.outcome {
+                                RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
+                                RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
+                                    "approved-for-session" => ReviewDecision::ApprovedForSession,
+                                    "approved" => ReviewDecision::Approved,
+                                    _ => ReviewDecision::Denied,
+                                },
+                            };
+
+                            conversation.submit(Op::ExecApproval { id: submission_id.clone(), decision }).await.map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+                        }
                         EventMsg::ExecCommandBegin(exec_event) => {
                             info!(
                                 "Command execution started: call_id={}, command={:?}",
@@ -792,7 +870,6 @@ impl Agent for CodexAgent {
                         }
                         EventMsg::ApplyPatchApprovalRequest(..)
                         | EventMsg::PatchApplyEnd(..)
-                        | EventMsg::ExecApprovalRequest(..)
                         | EventMsg::McpToolCallEnd(..)
                         | EventMsg::ListCustomPromptsResponse(..) // Get slash commands
                         | EventMsg::ConversationPath(..) // Used for loading history, not needed for prompt
