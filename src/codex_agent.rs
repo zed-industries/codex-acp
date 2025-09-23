@@ -440,6 +440,9 @@ impl Agent for CodexAgent {
                     );
 
                     match event.msg {
+                        EventMsg::TaskStarted(event) => {
+                            info!("Task started with context window of {:?}", event.model_context_window);
+                        }
                         EventMsg::UserMessage(msg_event) => {
                             info!("User message echoed: {:?}", msg_event.message);
                         }
@@ -745,7 +748,6 @@ impl Agent for CodexAgent {
                             );
                             // TODO: handle these tool call events properly
                         }
-                        // TODO: This is a pair with TaskStarted, not the end
                         EventMsg::TaskComplete(complete_event) => {
                             info!(
                                 "Task completed successfully after {} events. Last agent message: {:?}",
@@ -768,26 +770,55 @@ impl Agent for CodexAgent {
                         }
                         EventMsg::TurnAborted(abort_event) => {
                             info!("Turn aborted: {:?}", abort_event.reason);
+
+                            // Complete any remaining active web search
+                            self.complete_web_search(
+                                request.session_id.clone(),
+                                &mut active_web_search,
+                            );
                             stop_reason = StopReason::Cancelled;
                             break;
                         }
+                        EventMsg::ShutdownComplete => {
+                            info!("Agent shutting down");
 
+                            // Complete any remaining active web search
+                            self.complete_web_search(
+                                request.session_id.clone(),
+                                &mut active_web_search,
+                            );
+                            stop_reason = StopReason::Cancelled;
+                            break;
+                        }
+                        // In the future we can use this to update usage stats
+                        EventMsg::TokenCount(..)=> {
+                            // Complete any remaining active web search
+                            self.complete_web_search(
+                                request.session_id.clone(),
+                                &mut active_web_search,
+                            );
+                        }
+                        // we already have a way to diff the turn, so ignore
+                        EventMsg::TurnDiff(..) =>  {
+                            // Complete any remaining active web search
+                            self.complete_web_search(
+                                request.session_id.clone(),
+                                &mut active_web_search,
+                            );
+                        }
                         EventMsg::ApplyPatchApprovalRequest(..)
-                        | EventMsg::BackgroundEvent(..)
-                        | EventMsg::ConversationPath(..)
-                        | EventMsg::EnteredReviewMode(..)
-                        | EventMsg::ExecApprovalRequest(..)
-                        | EventMsg::ExitedReviewMode(..)
-                        | EventMsg::GetHistoryEntryResponse(..)
-                        | EventMsg::ListCustomPromptsResponse(..)
-                        | EventMsg::McpListToolsResponse(..)
-                        | EventMsg::McpToolCallEnd(..)
                         | EventMsg::PatchApplyEnd(..)
-                        | EventMsg::SessionConfigured(..)
-                        | EventMsg::ShutdownComplete
-                        | EventMsg::TaskStarted(..)
-                        | EventMsg::TokenCount(..)
-                        | EventMsg::TurnDiff(..) => {}
+                        | EventMsg::ExecApprovalRequest(..)
+                        | EventMsg::McpToolCallEnd(..)
+                        | EventMsg::ListCustomPromptsResponse(..) // Get slash commands
+                        | EventMsg::ConversationPath(..) // Used for loading history, not needed for prompt
+                        | EventMsg::SessionConfigured(..) // use for loading session and replay
+                        | EventMsg::GetHistoryEntryResponse(..) // use for loading session?
+                        | EventMsg::EnteredReviewMode(..) // Figure out how to handle this..
+                        | EventMsg::ExitedReviewMode(..) // Figure out how to handle this..
+                        | EventMsg::BackgroundEvent(..) // Revisit when we can emit status updates
+                        | EventMsg::McpListToolsResponse(..) // use for /mcp?
+                         => {}
                     }
                 }
                 Err(e) => {
