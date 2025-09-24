@@ -291,9 +291,6 @@ impl Agent for CodexAgent {
         } = request;
         info!("Creating new session with cwd: {}", cwd.display());
 
-        // Generate a unique session ID
-        let session_id = SessionId(Arc::from(format!("sess_{}", uuid::Uuid::new_v4())));
-
         // Create config for the new conversation
         // TODO: Set working directory and MCP servers in the config
         let mut config = self.config.clone();
@@ -340,6 +337,7 @@ impl Agent for CodexAgent {
             conversation_id: new_conversation.conversation_id,
             config,
         };
+        let session_id = SessionId(new_conversation.conversation_id.to_string().into());
 
         self.sessions
             .borrow_mut()
