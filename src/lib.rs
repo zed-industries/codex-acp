@@ -1,10 +1,13 @@
 //! Codex ACP - An Agent Client Protocol implementation for Codex.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+use agent_client_protocol::AgentSideConnection;
 use codex_common::CliConfigOverrides;
 use codex_core::config::{Config, ConfigOverrides};
-use std::io::Result as IoResult;
 use std::path::PathBuf;
+use std::{io::Result as IoResult, rc::Rc};
+use tokio::task::LocalSet;
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
@@ -40,48 +43,22 @@ pub async fn run_main(
             )
         })?;
 
-    // Create a local task set for running !Send futures
-    let local = tokio::task::LocalSet::new();
+    // Create our Agent implementation with notification channel
+    let agent = Rc::new(codex_agent::CodexAgent::new(config));
 
-    local
+    let stdin = tokio::io::stdin().compat();
+    let stdout = tokio::io::stdout().compat_write();
+
+    // Run the I/O task to handle the actual communication
+    LocalSet::new()
         .run_until(async move {
-            use agent_client_protocol::AgentSideConnection;
-            use futures::future::LocalBoxFuture;
-            use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-
-            // Create a channel for notifications
-            let (notification_tx, mut notification_rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Create our Agent implementation with notification channel
-            let agent = codex_agent::CodexAgent::new(config, notification_tx);
-
-            let stdin = tokio::io::stdin().compat();
-            let stdout = tokio::io::stdout().compat_write();
-
             // Create the ACP connection
-
-            let (client_handle, io_task) = AgentSideConnection::new(
-                agent,
-                stdout,
-                stdin,
-                |fut: LocalBoxFuture<'static, ()>| {
-                    // Use tokio::task::spawn_local for !Send futures
-                    tokio::task::spawn_local(fut);
-                },
-            );
-
-            // Spawn a task to forward notifications from the channel to the client
-            let client = std::sync::Arc::new(client_handle);
-            tokio::task::spawn_local(async move {
-                while let Some(notification) = notification_rx.recv().await {
-                    use agent_client_protocol::Client;
-                    if let Err(e) = client.session_notification(notification).await {
-                        tracing::error!("Failed to send session notification: {:?}", e);
-                    }
-                }
+            let (client, io_task) = AgentSideConnection::new(agent.clone(), stdout, stdin, |fut| {
+                tokio::task::spawn_local(fut);
             });
 
-            // Run the I/O task to handle the actual communication
+            agent.set_client(client);
+
             io_task
                 .await
                 .map_err(|e| std::io::Error::other(format!("ACP I/O error: {e}")))
