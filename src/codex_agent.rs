@@ -20,12 +20,13 @@ use codex_core::{
     auth::{AuthManager, CodexAuth, read_openai_api_key_from_env},
     config::Config,
     config_types::McpServerConfig,
-    plan_tool::{StepStatus, UpdatePlanArgs},
+    plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
         AgentMessageDeltaEvent, AgentMessageEvent, AgentReasoningDeltaEvent, AgentReasoningEvent,
         AgentReasoningRawContentDeltaEvent, AgentReasoningRawContentEvent,
-        AgentReasoningSectionBreakEvent, ErrorEvent, ExecApprovalRequestEvent, ReviewDecision,
-        StreamErrorEvent,
+        AgentReasoningSectionBreakEvent, ErrorEvent, ExecApprovalRequestEvent,
+        ExecCommandBeginEvent, ExecCommandOutputDeltaEvent, ReviewDecision, StreamErrorEvent,
+        TaskStartedEvent, UserMessageEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
 };
 use codex_protocol::{
@@ -213,6 +214,49 @@ impl CodexAgent {
         }
     }
 
+    async fn start_web_search(
+        &self,
+        session_id: SessionId,
+        call_id: String,
+        active_web_search: &mut Option<String>,
+    ) {
+        *active_web_search = Some(call_id.clone());
+        self.send_notification(
+            session_id,
+            SessionUpdate::ToolCall(ToolCall {
+                id: ToolCallId(call_id.into()),
+                title: "Searching the Web".to_string(),
+                kind: ToolKind::Fetch,
+                status: ToolCallStatus::Pending,
+                content: vec![],
+                locations: vec![],
+                raw_input: None,
+                raw_output: None,
+                meta: None,
+            }),
+        )
+        .await;
+    }
+
+    async fn update_web_search_query(&self, session_id: SessionId, call_id: String, query: String) {
+        self.send_notification(
+            session_id,
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                id: ToolCallId(call_id.into()),
+                fields: ToolCallUpdateFields {
+                    status: Some(ToolCallStatus::InProgress),
+                    title: Some(format!("Searching for: {}", query)),
+                    raw_input: Some(serde_json::json!({
+                        "query": query
+                    })),
+                    ..Default::default()
+                },
+                meta: None,
+            }),
+        )
+        .await;
+    }
+
     /// Complete an active web search by sending a completion notification
     async fn complete_web_search(
         &self,
@@ -233,6 +277,171 @@ impl CodexAgent {
             )
             .await;
         }
+    }
+
+    async fn send_agent_text(&self, session_id: SessionId, text: impl Into<String>) {
+        let update = SessionUpdate::AgentMessageChunk {
+            content: ContentBlock::Text(TextContent {
+                text: text.into(),
+                annotations: None,
+                meta: None,
+            }),
+        };
+        self.send_notification(session_id, update).await;
+    }
+
+    async fn send_agent_thought(&self, session_id: SessionId, text: impl Into<String>) {
+        let update = SessionUpdate::AgentThoughtChunk {
+            content: ContentBlock::Text(TextContent {
+                text: text.into(),
+                annotations: None,
+                meta: None,
+            }),
+        };
+        self.send_notification(session_id, update).await;
+    }
+
+    async fn update_plan(&self, session_id: SessionId, plan: Vec<PlanItemArg>) {
+        let update = SessionUpdate::Plan(Plan {
+            entries: plan
+                .into_iter()
+                .map(|entry| PlanEntry {
+                    content: entry.step,
+                    priority: PlanEntryPriority::Medium,
+                    status: match entry.status {
+                        StepStatus::Pending => PlanEntryStatus::Pending,
+                        StepStatus::InProgress => PlanEntryStatus::InProgress,
+                        StepStatus::Completed => PlanEntryStatus::Completed,
+                    },
+                    meta: None,
+                })
+                .collect(),
+            meta: None,
+        });
+        self.send_notification(session_id, update).await;
+    }
+
+    async fn exec_approval(
+        &self,
+        session_id: SessionId,
+        submission_id: String,
+        event: ExecApprovalRequestEvent,
+        active_command: &mut Option<(String, ToolCallId)>,
+    ) -> Result<(), Error> {
+        let raw_input = serde_json::json!(&event);
+        let ExecApprovalRequestEvent {
+            call_id,
+            command,
+            cwd,
+            reason,
+        } = event;
+        let conversation = self.get_conversation(&session_id).await?;
+
+        // Create a new tool call for the command execution
+        let tool_call_id = ToolCallId(call_id.clone().into());
+        *active_command = Some((call_id, tool_call_id.clone()));
+
+        let response = self
+            .client()
+            .request_permission(RequestPermissionRequest {
+                session_id,
+                tool_call: ToolCallUpdate {
+                    id: tool_call_id,
+                    fields: ToolCallUpdateFields {
+                        kind: Some(ToolKind::Execute),
+                        status: Some(ToolCallStatus::Pending),
+                        title: Some(format!("Running: {}", command.join(" "))),
+                        content: reason.map(|r| vec![r.into()]),
+                        locations: if cwd == std::path::PathBuf::from(".") {
+                            None
+                        } else {
+                            Some(vec![ToolCallLocation {
+                                path: cwd.clone(),
+                                line: None,
+                                meta: None,
+                            }])
+                        },
+                        raw_input: Some(raw_input),
+                        raw_output: None,
+                    },
+                    meta: None,
+                },
+                options: vec![
+                    PermissionOption {
+                        id: PermissionOptionId("approved-for-session".into()),
+                        name: "Always".into(),
+                        kind: PermissionOptionKind::AllowAlways,
+                        meta: None,
+                    },
+                    PermissionOption {
+                        id: PermissionOptionId("approved".into()),
+                        name: "Yes".into(),
+                        kind: PermissionOptionKind::AllowOnce,
+                        meta: None,
+                    },
+                    PermissionOption {
+                        id: PermissionOptionId("denied".into()),
+                        name: "No".into(),
+                        kind: PermissionOptionKind::RejectOnce,
+                        meta: None,
+                    },
+                ],
+                meta: None,
+            })
+            .await?;
+
+        let decision = match response.outcome {
+            RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
+            RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
+                "approved-for-session" => ReviewDecision::ApprovedForSession,
+                "approved" => ReviewDecision::Approved,
+                _ => ReviewDecision::Denied,
+            },
+        };
+
+        conversation
+            .submit(Op::ExecApproval {
+                id: submission_id,
+                decision,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        Ok(())
+    }
+
+    fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<InputItem> {
+        prompt
+            .into_iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text_block) => Some(InputItem::Text {
+                    text: text_block.text.clone(),
+                }),
+                ContentBlock::Image(image_block) => {
+                    // Convert to data URI if needed
+                    if let Some(uri) = &image_block.uri {
+                        Some(InputItem::Image {
+                            image_url: uri.clone(),
+                        })
+                    } else {
+                        // Base64 data
+                        let data_uri = format!(
+                            "data:{};base64,{}",
+                            image_block.mime_type.clone(),
+                            image_block.data.clone()
+                        );
+                        Some(InputItem::Image {
+                            image_url: data_uri,
+                        })
+                    }
+                }
+                ContentBlock::Audio(..)
+                | ContentBlock::Resource(..)
+                | ContentBlock::ResourceLink(..) => {
+                    // Skip other content types for now
+                    None
+                }
+            })
+            .collect()
     }
 }
 
@@ -378,40 +587,7 @@ impl Agent for CodexAgent {
         let conversation = self.get_conversation(&request.session_id).await?;
 
         // Convert ACP prompt format to codex format
-        let items = request
-            .prompt
-            .into_iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text(text_block) => Some(InputItem::Text {
-                    text: text_block.text.clone(),
-                }),
-                ContentBlock::Image(image_block) => {
-                    // Convert to data URI if needed
-                    if let Some(uri) = &image_block.uri {
-                        Some(InputItem::Image {
-                            image_url: uri.clone(),
-                        })
-                    } else {
-                        // Base64 data
-                        let data_uri = format!(
-                            "data:{};base64,{}",
-                            image_block.mime_type.clone(),
-                            image_block.data.clone()
-                        );
-                        Some(InputItem::Image {
-                            image_url: data_uri,
-                        })
-                    }
-                }
-                ContentBlock::Audio(..)
-                | ContentBlock::Resource(..)
-                | ContentBlock::ResourceLink(..) => {
-                    // Skip other content types for now
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
+        let items = Self::build_prompt_items(request.prompt);
         let items_len = items.len();
 
         let submission_id = conversation
@@ -443,11 +619,11 @@ impl Agent for CodexAgent {
                     );
 
                     match event.msg {
-                        EventMsg::TaskStarted(event) => {
-                            info!("Task started with context window of {:?}", event.model_context_window);
+                        EventMsg::TaskStarted(TaskStartedEvent { model_context_window }) => {
+                            info!("Task started with context window of {model_context_window:?}");
                         }
-                        EventMsg::UserMessage(msg_event) => {
-                            info!("User message echoed: {:?}", msg_event.message);
+                        EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
+                            info!("User message echoed: {message:?}");
                         }
                         // Since we are getting the deltas, we can ignore these events
                         EventMsg::AgentReasoning(AgentReasoningEvent { .. })
@@ -455,138 +631,52 @@ impl Agent for CodexAgent {
                             ..
                         })
                         | EventMsg::AgentMessage(AgentMessageEvent { .. }) => {}
-                        EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta: message }) => {
+                        EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
                             // Send this to the client via session/update notification
-                            info!("Agent message received: {:?}", message);
-
-                            self.send_notification(
-                                request.session_id.clone(),
-                                SessionUpdate::AgentMessageChunk {
-                                    content: ContentBlock::Text(TextContent {
-                                        text: message,
-                                        annotations: None,
-                                        meta: None,
-                                    }),
-                                },
-                            ).await;
+                            info!("Agent message received: {delta:?}");
+                            self.send_agent_text(request.session_id.clone(), delta).await;
                         }
-                        EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent { delta: text })
+                        EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent { delta })
                         | EventMsg::AgentReasoningRawContentDelta(
-                            AgentReasoningRawContentDeltaEvent { delta: text },
+                            AgentReasoningRawContentDeltaEvent { delta },
                         ) => {
                             // Send this to the client via session/update notification
-                            info!("Agent reasoning message received: {:?}", text);
-
-                            self.send_notification(
-                                request.session_id.clone(),
-                                SessionUpdate::AgentThoughtChunk {
-                                    content: ContentBlock::Text(TextContent {
-                                        text,
-                                        annotations: None,
-                                        meta: None,
-                                    }),
-                                },
-                            ).await;
+                            info!("Agent reasoning message received: {:?}", delta);
+                            self.send_agent_thought(request.session_id.clone(), delta).await;
                         }
                         EventMsg::AgentReasoningSectionBreak(
                             AgentReasoningSectionBreakEvent {},
                         ) => {
                             // Make sure the section heading actually get spacing
-                            self.send_notification(
-                                request.session_id.clone(),
-                                SessionUpdate::AgentThoughtChunk {
-                                    content: ContentBlock::Text(TextContent {
-                                        text: "\n\n".to_owned(),
-                                        annotations: None,
-                                        meta: None,
-                                    }),
-                                },
-                            ).await;
+                            self.send_agent_thought(request.session_id.clone(), "\n\n").await;
                         }
                         EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
                             // Send this to the client via session/update notification
                             info!("Agent plan updated. Explanation: {:?}", explanation);
-
-                            self.send_notification(
-                                request.session_id.clone(),
-                                SessionUpdate::Plan(Plan {
-                                    entries: plan
-                                        .into_iter()
-                                        .map(|entry| PlanEntry {
-                                            content: entry.step,
-                                            priority: PlanEntryPriority::Medium,
-                                            status: match entry.status {
-                                                StepStatus::Pending => PlanEntryStatus::Pending,
-                                                StepStatus::InProgress => {
-                                                    PlanEntryStatus::InProgress
-                                                }
-                                                StepStatus::Completed => PlanEntryStatus::Completed,
-                                            },
-                                            meta: None,
-                                        })
-                                        .collect(),
-                                    meta: None,
-                                }),
-                                ).await;
+                            self.update_plan(request.session_id.clone(), plan).await;
                         }
-                        EventMsg::WebSearchBegin(search_event) => {
-                            info!("Web search started: call_id={}", search_event.call_id);
+                        EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id }) => {
+                            info!("Web search started: call_id={}", call_id);
 
                             // Complete any previous web search before starting a new one
                             self.complete_web_search(
                                 request.session_id.clone(),
                                 &mut active_web_search,
                             ).await;
-                            active_web_search = Some(search_event.call_id.clone());
 
                             // Create a ToolCall notification for the search beginning
-                            self.send_notification(request.session_id.clone(), SessionUpdate::ToolCall(ToolCall {
-                                id: ToolCallId(search_event.call_id.clone().into()),
-                                title: "Searching the Web".to_string(),
-                                kind: ToolKind::Fetch,
-                                status: ToolCallStatus::Pending,
-                                content: vec![],
-                                locations: vec![],
-                                raw_input: None,
-                                raw_output: None,
-                                meta: None,
-                            })).await;
+                            self.start_web_search(request.session_id.clone(), call_id, &mut active_web_search).await;
                         }
-                        EventMsg::WebSearchEnd(search_event) => {
-                            info!(
-                                "Web search query received: call_id={}, query={}",
-                                search_event.call_id, search_event.query
-                            );
-
+                        EventMsg::WebSearchEnd(WebSearchEndEvent { call_id, query }) => {
+                            info!("Web search query received: call_id={call_id}, query={query}");
                             // Send update that the search is in progress with the query
                             // (WebSearchEnd just means we have the query, not that results are ready)
-                            self.send_notification(
-                                request.session_id.clone(),
-                                SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                                    id: ToolCallId(search_event.call_id.clone().into()),
-                                    fields: ToolCallUpdateFields {
-                                        status: Some(ToolCallStatus::InProgress),
-                                        title: Some(format!(
-                                            "Searching for: {}",
-                                            search_event.query
-                                        )),
-                                        raw_input: Some(serde_json::json!({
-                                            "query": search_event.query.clone()
-                                        })),
-                                        ..Default::default()
-                                    },
-                                    meta: None,
-                                }),
-                            ).await;
-
+                            self.update_web_search_query(request.session_id.clone(), call_id, query).await;
                             // The actual search results will come through AgentMessage events
                             // We mark as completed when a new tool call begins
                         }
                         EventMsg::ExecApprovalRequest(event) => {
-                            let raw_input = serde_json::json!(&event);
-                            let ExecApprovalRequestEvent { call_id, command, cwd, reason } = event;
-
-                            info!("Command execution started: call_id={call_id}, command={command:?}");
+                            info!("Command execution started: call_id={}, command={:?}", event.call_id, event.command);
 
                             // Complete any active web search when a command starts
                             self.complete_web_search(
@@ -594,74 +684,12 @@ impl Agent for CodexAgent {
                                 &mut active_web_search,
                             ).await;
 
-                            let conversation = self.get_conversation(&request.session_id).await?;
-
-                            // Create a new tool call for the command execution
-                            let tool_call_id = ToolCallId(call_id.clone().into());
-                            active_command =
-                                Some((call_id, tool_call_id.clone()));
-
-                            let response = self.client().request_permission(RequestPermissionRequest {
-                                session_id: request.session_id.clone(),
-                                tool_call: ToolCallUpdate {
-                                    id: tool_call_id,
-                                    fields: ToolCallUpdateFields {
-                                        kind: Some(ToolKind::Execute),
-                                        status: Some(ToolCallStatus::Pending),
-                                        title: Some(format!("Running: {}", command.join(" "))),
-                                        content: reason.map(|r| vec![r.into()]),
-                                        locations: if cwd == std::path::PathBuf::from(".") {
-                                            None
-                                        } else {
-                                            Some(vec![ToolCallLocation {
-                                                path: cwd.clone(),
-                                                line: None,
-                                                meta: None,
-                                            }])
-                                        },
-                                        raw_input: Some(raw_input),
-                                        raw_output: None
-                                    } ,
-                                    meta: None
-                                },
-                                options: vec![
-                                    PermissionOption {
-                                        id: PermissionOptionId("approved-for-session".into()),
-                                        name: "Always".into(),
-                                        kind: PermissionOptionKind::AllowAlways,
-                                        meta: None,
-                                    },
-                                    PermissionOption {
-                                        id: PermissionOptionId("approved".into()),
-                                        name: "Yes".into(),
-                                        kind: PermissionOptionKind::AllowOnce,
-                                        meta: None,
-                                    },
-                                    PermissionOption {
-                                        id: PermissionOptionId("denied".into()),
-                                        name: "No".into(),
-                                        kind: PermissionOptionKind::RejectOnce,
-                                        meta: None,
-                                    },
-                                ],
-                                meta: None,
-                            }).await?;
-
-                            let decision = match response.outcome {
-                                RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
-                                RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
-                                    "approved-for-session" => ReviewDecision::ApprovedForSession,
-                                    "approved" => ReviewDecision::Approved,
-                                    _ => ReviewDecision::Denied,
-                                },
-                            };
-
-                            conversation.submit(Op::ExecApproval { id: submission_id.clone(), decision }).await.map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+                            self.exec_approval(request.session_id.clone(), submission_id.clone(), event, &mut active_command).await?;
                         }
-                        EventMsg::ExecCommandBegin(exec_event) => {
+                        EventMsg::ExecCommandBegin(event) => {
                             info!(
                                 "Command execution started: call_id={}, command={:?}",
-                                exec_event.call_id, exec_event.command
+                                event.call_id, event.command
                             );
 
                             // Complete any active web search when a command starts
@@ -670,33 +698,40 @@ impl Agent for CodexAgent {
                                 &mut active_web_search,
                             ).await;
 
+                            let raw_input = serde_json::json!(&event);
+                            let ExecCommandBeginEvent {
+                                call_id,
+                                command,
+                                cwd,
+                                parsed_cmd: _,
+                            } = event;
                             // Create a new tool call for the command execution
-                            let tool_call_id = ToolCallId(exec_event.call_id.clone().into());
-                            active_command =
-                                Some((exec_event.call_id, tool_call_id.clone()));
+                            let tool_call_id = ToolCallId(call_id.clone().into());
+                            active_command = Some((call_id, tool_call_id.clone()));
 
-                            self.send_notification(request.session_id.clone(),SessionUpdate::ToolCall(ToolCall {
-                                id: tool_call_id,
-                                title: format!("Running: {}", exec_event.command.join(" ")),
-                                kind: ToolKind::Execute,
-                                status: ToolCallStatus::InProgress,
-                                content: vec![],
-                                locations: if exec_event.cwd == std::path::PathBuf::from(".") {
-                                    vec![]
-                                } else {
-                                    vec![ToolCallLocation {
-                                        path: exec_event.cwd.clone(),
-                                        line: None,
-                                        meta: None,
-                                    }]
-                                },
-                                raw_input: Some(serde_json::json!({
-                                    "command": exec_event.command,
-                                    "cwd": exec_event.cwd,
-                                })),
-                                raw_output: None,
-                                meta: None,
-                            }) ).await;
+                            self.send_notification(
+                                request.session_id.clone(),
+                                SessionUpdate::ToolCall(ToolCall {
+                                    id: tool_call_id,
+                                    title: format!("Running: {}", command.join(" ")),
+                                    kind: ToolKind::Execute,
+                                    status: ToolCallStatus::InProgress,
+                                    content: vec![],
+                                    locations: if cwd == std::path::PathBuf::from(".") {
+                                        vec![]
+                                    } else {
+                                        vec![ToolCallLocation {
+                                            path: cwd,
+                                            line: None,
+                                            meta: None,
+                                        }]
+                                    },
+                                    raw_input: Some(raw_input),
+                                    raw_output: None,
+                                    meta: None,
+                                }),
+                            )
+                            .await;
                         }
                         EventMsg::ExecCommandOutputDelta(delta_event) => {
                             // Accumulate command output and send the full content
@@ -733,6 +768,7 @@ impl Agent for CodexAgent {
                             }
                         }
                         EventMsg::ExecCommandEnd(end_event) => {
+                            let raw_output = serde_json::json!(&end_event);
                             info!(
                                 "Command execution ended: call_id={}, exit_code={}",
                                 end_event.call_id, end_event.exit_code
@@ -744,44 +780,39 @@ impl Agent for CodexAgent {
                                 let is_success = end_event.exit_code == 0;
 
                                 let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                                        id: tool_call_id,
-                                        fields: ToolCallUpdateFields {
-                                            status: Some(if is_success {
-                                                ToolCallStatus::Completed
-                                            } else {
-                                                ToolCallStatus::Failed
+                                    id: tool_call_id,
+                                    fields: ToolCallUpdateFields {
+                                        status: Some(if is_success {
+                                            ToolCallStatus::Completed
+                                        } else {
+                                            ToolCallStatus::Failed
+                                        }),
+                                        // Send final aggregated output
+                                        content: Some(vec![ToolCallContent::Content {
+                                            content: ContentBlock::Text(TextContent {
+                                                text: if !end_event.formatted_output.is_empty()
+                                                {
+                                                    end_event.formatted_output.clone()
+                                                } else if !end_event
+                                                    .aggregated_output
+                                                    .is_empty()
+                                                {
+                                                    end_event.aggregated_output.clone()
+                                                } else {
+                                                    format!(
+                                                        "stdout:\n{}\n\nstderr:\n{}",
+                                                        end_event.stdout, end_event.stderr
+                                                    )
+                                                },
+                                                annotations: None,
+                                                meta: None,
                                             }),
-                                            // Send final aggregated output
-                                            content: Some(vec![ToolCallContent::Content {
-                                                content: ContentBlock::Text(TextContent {
-                                                    text: if !end_event.formatted_output.is_empty()
-                                                    {
-                                                        end_event.formatted_output.clone()
-                                                    } else if !end_event
-                                                        .aggregated_output
-                                                        .is_empty()
-                                                    {
-                                                        end_event.aggregated_output.clone()
-                                                    } else {
-                                                        format!(
-                                                            "stdout:\n{}\n\nstderr:\n{}",
-                                                            end_event.stdout, end_event.stderr
-                                                        )
-                                                    },
-                                                    annotations: None,
-                                                    meta: None,
-                                                }),
-                                            }]),
-                                            raw_output: Some(serde_json::json!({
-                                                "exit_code": end_event.exit_code,
-                                                "stdout": end_event.stdout,
-                                                "stderr": end_event.stderr,
-                                                "duration": end_event.duration.as_secs_f64(),
-                                            })),
-                                            ..Default::default()
-                                        },
-                                        meta: None,
-                                    });
+                                        }]),
+                                        raw_output: Some(raw_output),
+                                        ..Default::default()
+                                    },
+                                    meta: None,
+                                });
                                 self.send_notification(request.session_id.clone(), update).await;
 
                                 // Clear accumulated output since we're done
