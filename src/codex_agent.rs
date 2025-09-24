@@ -618,6 +618,35 @@ impl Agent for CodexAgent {
                         event.msg, event.id
                     );
 
+                    // Complete any previous web search before starting a new one
+                    match &event.msg {
+                        EventMsg::Error(..)
+                        | EventMsg::StreamError(..)
+                        | EventMsg::WebSearchBegin(..)
+                        | EventMsg::UserMessage(..)
+                        | EventMsg::ExecApprovalRequest(..)
+                        | EventMsg::ExecCommandBegin(..)
+                        | EventMsg::ExecCommandOutputDelta(..)
+                        | EventMsg::ExecCommandEnd(..)
+                        | EventMsg::McpToolCallBegin(..)
+                        | EventMsg::McpToolCallEnd(..)
+                        | EventMsg::ApplyPatchApprovalRequest(..)
+                        | EventMsg::PatchApplyBegin(..)
+                        | EventMsg::PatchApplyEnd(..)
+                        | EventMsg::TaskComplete(..)
+                        | EventMsg::TokenCount(..)
+                        | EventMsg::TurnDiff(..)
+                        | EventMsg::TurnAborted(..)
+                        | EventMsg::ShutdownComplete => {
+                            self.complete_web_search(
+                                request.session_id.clone(),
+                                &mut active_web_search,
+                            )
+                            .await;
+                        }
+                        _ => {}
+                    };
+
                     match event.msg {
                         EventMsg::TaskStarted(TaskStartedEvent { model_context_window }) => {
                             info!("Task started with context window of {model_context_window:?}");
@@ -657,13 +686,6 @@ impl Agent for CodexAgent {
                         }
                         EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id }) => {
                             info!("Web search started: call_id={}", call_id);
-
-                            // Complete any previous web search before starting a new one
-                            self.complete_web_search(
-                                request.session_id.clone(),
-                                &mut active_web_search,
-                            ).await;
-
                             // Create a ToolCall notification for the search beginning
                             self.start_web_search(request.session_id.clone(), call_id, &mut active_web_search).await;
                         }
@@ -677,13 +699,6 @@ impl Agent for CodexAgent {
                         }
                         EventMsg::ExecApprovalRequest(event) => {
                             info!("Command execution started: call_id={}, command={:?}", event.call_id, event.command);
-
-                            // Complete any active web search when a command starts
-                            self.complete_web_search(
-                                request.session_id.clone(),
-                                &mut active_web_search,
-                            ).await;
-
                             self.exec_approval(request.session_id.clone(), submission_id.clone(), event, &mut active_command).await?;
                         }
                         EventMsg::ExecCommandBegin(event) => {
@@ -691,12 +706,6 @@ impl Agent for CodexAgent {
                                 "Command execution started: call_id={}, command={:?}",
                                 event.call_id, event.command
                             );
-
-                            // Complete any active web search when a command starts
-                            self.complete_web_search(
-                                request.session_id.clone(),
-                                &mut active_web_search,
-                            ).await;
 
                             let raw_input = serde_json::json!(&event);
                             let ExecCommandBeginEvent {
@@ -819,26 +828,11 @@ impl Agent for CodexAgent {
                                 command_output.clear();
                             }
                         }
-                        EventMsg::McpToolCallBegin(_) | EventMsg::PatchApplyBegin(_) => {
-                            // Complete any active web search when other tools start
-                            self.complete_web_search(
-                                request.session_id.clone(),
-                                &mut active_web_search,
-                            ).await;
-                            // TODO: handle these tool call events properly
-                        }
                         EventMsg::TaskComplete(complete_event) => {
                             info!(
                                 "Task completed successfully after {} events. Last agent message: {:?}",
                                 event_count, complete_event.last_agent_message
                             );
-
-                            // Complete any remaining active web search
-                            self.complete_web_search(
-                                request.session_id.clone(),
-                                &mut active_web_search,
-                            ).await;
-
                             stop_reason = StopReason::EndTurn;
                             break;
                         }
@@ -849,43 +843,20 @@ impl Agent for CodexAgent {
                         }
                         EventMsg::TurnAborted(abort_event) => {
                             info!("Turn aborted: {:?}", abort_event.reason);
-
-                            // Complete any remaining active web search
-                            self.complete_web_search(
-                                request.session_id.clone(),
-                                &mut active_web_search,
-                            ).await;
                             stop_reason = StopReason::Cancelled;
                             break;
                         }
                         EventMsg::ShutdownComplete => {
                             info!("Agent shutting down");
-
-                            // Complete any remaining active web search
-                            self.complete_web_search(
-                                request.session_id.clone(),
-                                &mut active_web_search,
-                            ).await;
                             stop_reason = StopReason::Cancelled;
                             break;
                         }
                         // In the future we can use this to update usage stats
-                        EventMsg::TokenCount(..)=> {
-                            // Complete any remaining active web search
-                            self.complete_web_search(
-                                request.session_id.clone(),
-                                &mut active_web_search,
-                            ).await;
-                        }
+                        EventMsg::TokenCount(..)
                         // we already have a way to diff the turn, so ignore
-                        EventMsg::TurnDiff(..) =>  {
-                            // Complete any remaining active web search
-                            self.complete_web_search(
-                                request.session_id.clone(),
-                                &mut active_web_search,
-                            ).await;
-                        }
-                        EventMsg::ApplyPatchApprovalRequest(..)
+                        | EventMsg::TurnDiff(..)
+                        | EventMsg::McpToolCallBegin(_) | EventMsg::PatchApplyBegin(_)
+                        | EventMsg::ApplyPatchApprovalRequest(..)
                         | EventMsg::PatchApplyEnd(..)
                         | EventMsg::McpToolCallEnd(..)
                         | EventMsg::ListCustomPromptsResponse(..) // Get slash commands
