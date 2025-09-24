@@ -25,8 +25,8 @@ use codex_core::{
         AgentMessageDeltaEvent, AgentMessageEvent, AgentReasoningDeltaEvent, AgentReasoningEvent,
         AgentReasoningRawContentDeltaEvent, AgentReasoningRawContentEvent,
         AgentReasoningSectionBreakEvent, ErrorEvent, ExecApprovalRequestEvent,
-        ExecCommandBeginEvent, ExecCommandOutputDeltaEvent, ReviewDecision, StreamErrorEvent,
-        TaskStartedEvent, UserMessageEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        ExecCommandBeginEvent, ReviewDecision, StreamErrorEvent, TaskStartedEvent,
+        UserMessageEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
 };
 use codex_protocol::{
