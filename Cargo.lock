@@ -377,6 +377,7 @@ dependencies = [
  "codex-core",
  "codex-mcp-server",
  "codex-protocol",
+ "mcp-types",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -389,7 +390,6 @@ name = "codex-apply-patch"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "once_cell",
  "similar",
  "thiserror 2.0.16",
  "tree-sitter",

@@ -1,15 +1,16 @@
 use agent_client_protocol::{
-    Agent, AgentCapabilities, AgentSideConnection, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, Client, ContentBlock, Error, ExtNotification, ExtRequest, ExtResponse,
-    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
+    Agent, AgentCapabilities, AgentSideConnection, Annotations, AudioContent, AuthenticateRequest,
+    AuthenticateResponse, BlobResourceContents, CancelNotification, Client, ContentBlock,
+    EmbeddedResource, EmbeddedResourceResource, Error, ExtNotification, ExtRequest, ExtResponse,
+    ImageContent, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
     McpCapabilities, McpServer, ModelId, ModelInfo, NewSessionRequest, NewSessionResponse,
     PermissionOption, PermissionOptionId, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
     PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionId, SessionMode, SessionModeId, SessionModeState,
-    SessionModelState, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    RequestPermissionRequest, ResourceLink, SessionId, SessionMode, SessionModeId,
+    SessionModeState, SessionModelState, SessionNotification, SessionUpdate, SetSessionModeRequest,
     SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, StopReason,
-    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
+    TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
 };
 use codex_common::{
     approval_presets::{ApprovalPreset, builtin_approval_presets},
@@ -25,7 +26,8 @@ use codex_core::{
         AgentMessageDeltaEvent, AgentMessageEvent, AgentReasoningDeltaEvent, AgentReasoningEvent,
         AgentReasoningRawContentDeltaEvent, AgentReasoningRawContentEvent,
         AgentReasoningSectionBreakEvent, ErrorEvent, ExecApprovalRequestEvent,
-        ExecCommandBeginEvent, ReviewDecision, StreamErrorEvent, TaskStartedEvent,
+        ExecCommandBeginEvent, McpInvocation, McpToolCallBeginEvent, McpToolCallEndEvent,
+        ReviewDecision, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent,
         UserMessageEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
 };
@@ -34,6 +36,7 @@ use codex_protocol::{
     mcp_protocol::ConversationId,
     protocol::{EventMsg, InputItem, Op},
 };
+use mcp_types::CallToolResult;
 use std::{
     cell::{OnceCell, RefCell},
     collections::HashMap,
@@ -212,6 +215,151 @@ impl CodexAgent {
         if let Err(e) = self.client().session_notification(notification).await {
             error!("Failed to send session notification: {:?}", e);
         }
+    }
+
+    async fn start_mcp_tool_call(
+        &self,
+        session_id: SessionId,
+        call_id: String,
+        invocation: McpInvocation,
+    ) {
+        let McpInvocation {
+            server,
+            tool,
+            arguments,
+        } = invocation;
+
+        self.send_notification(
+            session_id,
+            SessionUpdate::ToolCall(ToolCall {
+                id: ToolCallId(call_id.into()),
+                title: format!("{tool} ({server})"),
+                kind: ToolKind::Other,
+                status: ToolCallStatus::InProgress,
+                content: arguments
+                    .as_ref()
+                    .and_then(|args| serde_json::to_string_pretty(args).ok())
+                    .map(Into::into)
+                    .into_iter()
+                    .collect(),
+                locations: vec![],
+                raw_input: arguments,
+                raw_output: None,
+                meta: None,
+            }),
+        )
+        .await;
+    }
+
+    async fn end_mcp_tool_call(
+        &self,
+        session_id: SessionId,
+        call_id: String,
+        result: Result<CallToolResult, String>,
+    ) {
+        let is_error = match result.as_ref() {
+            Ok(result) => result.is_error.unwrap_or_default(),
+            Err(_) => true,
+        };
+        let raw_output = match result.as_ref() {
+            Ok(result) => serde_json::json!(result),
+            Err(err) => serde_json::json!(err),
+        };
+        self.send_notification(
+            session_id,
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                id: ToolCallId(call_id.into()),
+                fields: ToolCallUpdateFields {
+                    status: Some(if is_error {
+                        ToolCallStatus::Failed
+                    } else {
+                        ToolCallStatus::Completed
+                    }),
+                    content: result.ok().map(|result| {
+                        result
+                            .content
+                            .into_iter()
+                            .map(|content|  ToolCallContent::Content {
+                                content: match content {
+                                    mcp_types::ContentBlock::TextContent(text_content) => {
+                                        ContentBlock::Text(TextContent {
+                                            annotations: text_content
+                                                .annotations
+                                                .map(convert_annotations),
+                                            text: text_content.text,
+                                            meta: None,
+                                        })
+                                    }
+                                    mcp_types::ContentBlock::ImageContent(image_content) => {
+                                        ContentBlock::Image(ImageContent {
+                                            annotations: image_content
+                                                .annotations
+                                                .map(convert_annotations),
+                                            data: image_content.data,
+                                            mime_type: image_content.mime_type,
+                                            uri: None,
+                                            meta: None,
+                                        })
+                                    }
+                                    mcp_types::ContentBlock::AudioContent(audio_content) => {
+                                        ContentBlock::Audio(AudioContent {
+                                            annotations: audio_content
+                                                .annotations
+                                                .map(convert_annotations),
+                                            data: audio_content.data,
+                                            mime_type: audio_content.mime_type,
+                                            meta: None,
+                                        })
+                                    }
+                                    mcp_types::ContentBlock::ResourceLink(resource_link) => {
+                                        ContentBlock::ResourceLink(ResourceLink {
+                                            annotations: resource_link
+                                                .annotations
+                                                .map(convert_annotations),
+                                            description: resource_link.description,
+                                            mime_type: resource_link.mime_type,
+                                            name: resource_link.name,
+                                            size: resource_link.size,
+                                            title: resource_link.title,
+                                            uri: resource_link.uri,
+                                            meta: None,
+                                        })
+                                    }
+                                    mcp_types::ContentBlock::EmbeddedResource(embedded_resource) => {
+                                        ContentBlock::Resource(EmbeddedResource {
+                                            annotations: embedded_resource.annotations.map(convert_annotations),
+                                            resource: match embedded_resource.resource {
+                                                mcp_types::EmbeddedResourceResource::TextResourceContents(text_resource_contents) => {
+                                                    EmbeddedResourceResource::TextResourceContents(TextResourceContents {
+                                                        mime_type: text_resource_contents.mime_type,
+                                                        text: text_resource_contents.text,
+                                                        uri: text_resource_contents.uri,
+                                                        meta: None
+                                                    })
+                                                },
+                                                mcp_types::EmbeddedResourceResource::BlobResourceContents(blob_resource_contents) => {
+                                                    EmbeddedResourceResource::BlobResourceContents(BlobResourceContents {
+                                                        blob: blob_resource_contents.blob,
+                                                        mime_type: blob_resource_contents.mime_type,
+                                                        uri: blob_resource_contents.uri,
+                                                        meta: None
+                                                    })
+                                                },
+                                            },
+                                            meta: None,
+                                        })
+                                    }
+                                }
+                            })
+                            .collect()
+                    }),
+                    raw_output: Some(raw_output),
+                    ..Default::default()
+                },
+                meta: None,
+            }),
+        )
+        .await;
     }
 
     async fn start_web_search(
@@ -828,10 +976,17 @@ impl Agent for CodexAgent {
                                 command_output.clear();
                             }
                         }
-                        EventMsg::TaskComplete(complete_event) => {
+                        EventMsg::McpToolCallBegin(McpToolCallBeginEvent { call_id, invocation }) => {
+                            info!("MCP tool call begin: call_id={call_id}, invocation={} {}", invocation.server, invocation.tool);
+                            self.start_mcp_tool_call(request.session_id.clone(), call_id, invocation).await;
+                        }
+                        EventMsg::McpToolCallEnd(McpToolCallEndEvent { call_id, invocation, duration, result }) => {
+                            info!("MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}", invocation.server, invocation.tool);
+                            self.end_mcp_tool_call(request.session_id.clone(), call_id, result).await;
+                        }
+                        EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message}) => {
                             info!(
-                                "Task completed successfully after {} events. Last agent message: {:?}",
-                                event_count, complete_event.last_agent_message
+                                "Task completed successfully after {event_count} events. Last agent message: {last_agent_message:?}",
                             );
                             stop_reason = StopReason::EndTurn;
                             break;
@@ -841,8 +996,8 @@ impl Agent for CodexAgent {
                             error!("Error during turn: {}", message);
                             return Err(Error::internal_error().with_data(message));
                         }
-                        EventMsg::TurnAborted(abort_event) => {
-                            info!("Turn aborted: {:?}", abort_event.reason);
+                        EventMsg::TurnAborted(TurnAbortedEvent { reason }) => {
+                            info!("Turn aborted: {reason:?}");
                             stop_reason = StopReason::Cancelled;
                             break;
                         }
@@ -855,10 +1010,9 @@ impl Agent for CodexAgent {
                         EventMsg::TokenCount(..)
                         // we already have a way to diff the turn, so ignore
                         | EventMsg::TurnDiff(..)
-                        | EventMsg::McpToolCallBegin(_) | EventMsg::PatchApplyBegin(_)
+                        | EventMsg::PatchApplyBegin(..)
                         | EventMsg::ApplyPatchApprovalRequest(..)
                         | EventMsg::PatchApplyEnd(..)
-                        | EventMsg::McpToolCallEnd(..)
                         | EventMsg::ListCustomPromptsResponse(..) // Get slash commands
                         | EventMsg::ConversationPath(..) // Used for loading history, not needed for prompt
                         | EventMsg::SessionConfigured(..) // use for loading session and replay
@@ -975,5 +1129,22 @@ impl Agent for CodexAgent {
 
     async fn ext_notification(&self, _args: ExtNotification) -> Result<(), Error> {
         Err(Error::method_not_found())
+    }
+}
+
+fn convert_annotations(annotations: mcp_types::Annotations) -> Annotations {
+    Annotations {
+        audience: annotations.audience.map(|audience| {
+            audience
+                .into_iter()
+                .map(|audience| match audience {
+                    mcp_types::Role::Assistant => agent_client_protocol::Role::Assistant,
+                    mcp_types::Role::User => agent_client_protocol::Role::User,
+                })
+                .collect()
+        }),
+        last_modified: annotations.last_modified,
+        priority: annotations.priority,
+        meta: None,
     }
 }
