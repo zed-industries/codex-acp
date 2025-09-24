@@ -52,7 +52,7 @@ pub struct CodexAgent {
     config: Config,
     /// Conversation manager for handling sessions
     conversation_manager: ConversationManager,
-    /// Active sessions mapped by SessionId
+    /// Active sessions mapped by `SessionId`
     sessions: Rc<RefCell<HashMap<SessionId, SessionState>>>,
     /// Default model presets for a given auth mode
     model_presets: Vec<ModelPreset>,
@@ -101,9 +101,10 @@ impl CodexAgent {
     }
 
     pub fn set_client(&self, client: AgentSideConnection) {
-        if self.client.set(client).is_err() {
-            panic!("Client should only be set once");
-        }
+        assert!(
+            self.client.set(client).is_ok(),
+            "Client should only be set once"
+        );
     }
 
     fn client(&self) -> &AgentSideConnection {
@@ -245,11 +246,8 @@ impl Agent for CodexAgent {
 
         let protocol_version = V1;
 
-        // Build list of available models from codex configuration
-
-        // Define our agent capabilities
         let agent_capabilities = AgentCapabilities {
-            load_session: false, // Currently only able to do in-memory... which doens't help us at the moment
+            load_session: false, // Currently only able to do in-memory... which doesn't help us at the moment
             prompt_capabilities: PromptCapabilities {
                 audio: false,
                 embedded_context: true,
@@ -291,8 +289,6 @@ impl Agent for CodexAgent {
         } = request;
         info!("Creating new session with cwd: {}", cwd.display());
 
-        // Create config for the new conversation
-        // TODO: Set working directory and MCP servers in the config
         let mut config = self.config.clone();
         config.cwd.clone_from(&cwd);
         for mcp_server in mcp_servers {
@@ -382,21 +378,19 @@ impl Agent for CodexAgent {
         let conversation = self.get_conversation(&request.session_id).await?;
 
         // Convert ACP prompt format to codex format
-        let mut input_items = Vec::new();
-        for block in &request.prompt {
-            // TODO make this a ::collect() instead of a `for` loop
-            match block {
-                ContentBlock::Text(text_block) => {
-                    input_items.push(InputItem::Text {
-                        text: text_block.text.clone(),
-                    });
-                }
+        let items = request
+            .prompt
+            .into_iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text_block) => Some(InputItem::Text {
+                    text: text_block.text.clone(),
+                }),
                 ContentBlock::Image(image_block) => {
                     // Convert to data URI if needed
                     if let Some(uri) = &image_block.uri {
-                        input_items.push(InputItem::Image {
+                        Some(InputItem::Image {
                             image_url: uri.clone(),
-                        });
+                        })
                     } else {
                         // Base64 data
                         let data_uri = format!(
@@ -404,42 +398,36 @@ impl Agent for CodexAgent {
                             image_block.mime_type.clone(),
                             image_block.data.clone()
                         );
-                        input_items.push(InputItem::Image {
+                        Some(InputItem::Image {
                             image_url: data_uri,
-                        });
+                        })
                     }
                 }
                 ContentBlock::Audio(..)
                 | ContentBlock::Resource(..)
                 | ContentBlock::ResourceLink(..) => {
                     // Skip other content types for now
+                    None
                 }
-            }
-        }
+            })
+            .collect::<Vec<_>>();
+
+        let items_len = items.len();
 
         let submission_id = conversation
-            .submit(Op::UserInput {
-                items: input_items.clone(),
-            })
+            .submit(Op::UserInput { items })
             .await
             .map_err(|e| {
-                error!("Failed to submit prompt: {:?}", e);
+                error!("Failed to submit prompt: {e:?}");
                 Error::internal_error()
             })?;
 
-        info!(
-            "Submitted prompt with submission_id: {}, {} input items",
-            submission_id,
-            input_items.len()
-        );
+        info!("Submitted prompt with submission_id: {submission_id}, {items_len} input items");
 
         // Wait for the conversation to complete (TaskComplete or TurnAborted)
         let stop_reason;
 
-        info!(
-            "Starting to wait for conversation events for submission_id: {}",
-            submission_id
-        );
+        info!("Starting to wait for conversation events for submission_id: {submission_id}");
 
         let mut event_count = 0;
         let mut active_web_search: Option<String> = None;
@@ -450,8 +438,8 @@ impl Agent for CodexAgent {
             match conversation.next_event().await {
                 Ok(event) => {
                     info!(
-                        "Received event #{}: {:?} (id: {})",
-                        event_count, event.msg, event.id
+                        "Received event #{event_count}: {:?} (id: {})",
+                        event.msg, event.id
                     );
 
                     match event.msg {
@@ -611,7 +599,7 @@ impl Agent for CodexAgent {
                             // Create a new tool call for the command execution
                             let tool_call_id = ToolCallId(call_id.clone().into());
                             active_command =
-                                Some((call_id.clone(), tool_call_id.clone()));
+                                Some((call_id, tool_call_id.clone()));
 
                             let response = self.client().request_permission(RequestPermissionRequest {
                                 session_id: request.session_id.clone(),
@@ -622,14 +610,14 @@ impl Agent for CodexAgent {
                                         status: Some(ToolCallStatus::Pending),
                                         title: Some(format!("Running: {}", command.join(" "))),
                                         content: reason.map(|r| vec![r.into()]),
-                                        locations: if cwd != std::path::PathBuf::from(".") {
+                                        locations: if cwd == std::path::PathBuf::from(".") {
+                                            None
+                                        } else {
                                             Some(vec![ToolCallLocation {
                                                 path: cwd.clone(),
                                                 line: None,
                                                 meta: None,
                                             }])
-                                        } else {
-                                            None
                                         },
                                         raw_input: Some(raw_input),
                                         raw_output: None
@@ -685,7 +673,7 @@ impl Agent for CodexAgent {
                             // Create a new tool call for the command execution
                             let tool_call_id = ToolCallId(exec_event.call_id.clone().into());
                             active_command =
-                                Some((exec_event.call_id.clone(), tool_call_id.clone()));
+                                Some((exec_event.call_id, tool_call_id.clone()));
 
                             self.send_notification(request.session_id.clone(),SessionUpdate::ToolCall(ToolCall {
                                 id: tool_call_id,
@@ -693,14 +681,14 @@ impl Agent for CodexAgent {
                                 kind: ToolKind::Execute,
                                 status: ToolCallStatus::InProgress,
                                 content: vec![],
-                                locations: if exec_event.cwd != std::path::PathBuf::from(".") {
+                                locations: if exec_event.cwd == std::path::PathBuf::from(".") {
+                                    vec![]
+                                } else {
                                     vec![ToolCallLocation {
                                         path: exec_event.cwd.clone(),
                                         line: None,
                                         meta: None,
                                     }]
-                                } else {
-                                    vec![]
                                 },
                                 raw_input: Some(serde_json::json!({
                                     "command": exec_event.command,
