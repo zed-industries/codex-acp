@@ -34,40 +34,25 @@ jobs:
           fi
 
   build:
-    name: Build - ${{ matrix.os }} (${{ matrix.arch }})
+    name: Build - ${{ matrix.os }}
     needs: get-version
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Native runners
+          # Native runners only
           - os: macos-14
-            arch: aarch64
             target: aarch64-apple-darwin
             binary_extension: ""
           - os: macos-13
-            arch: x86_64
             target: x86_64-apple-darwin
             binary_extension: ""
           - os: windows-latest
-            arch: x86_64
             target: x86_64-pc-windows-msvc
             binary_extension: ".exe"
           - os: ubuntu-latest
-            arch: x86_64
             target: x86_64-unknown-linux-gnu
             binary_extension: ""
-          # Cross-compilation required (no native runners)
-          - os: windows-latest
-            arch: aarch64
-            target: aarch64-pc-windows-msvc
-            binary_extension: ".exe"
-            use_cross: true
-          - os: ubuntu-latest
-            arch: aarch64
-            target: aarch64-unknown-linux-gnu
-            binary_extension: ""
-            use_cross: true
 
     runs-on: ${{ matrix.os }}
 
@@ -83,27 +68,20 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/registry
-          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.arch }}-cargo-registry-
+            ${{ runner.os }}-cargo-registry-
 
       - name: Cache cargo index
         uses: actions/cache@v4
         with:
           path: ~/.cargo/git
-          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.arch }}-cargo-git-
+            ${{ runner.os }}-cargo-git-
 
-      - name: Build release binary (native)
-        if: matrix.use_cross != true
+      - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build release binary (cross)
-        if: matrix.use_cross == true
-        run: |
-          cargo install cross --git https://github.com/cross-rs/cross
-          cross build --release --target ${{ matrix.target }}
 
       - name: Create archive
         id: create_archive
