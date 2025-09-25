@@ -12,15 +12,15 @@ name = "codex_acp"
 path = "src/lib.rs"
 
 [dependencies]
-agent-client-protocol = { path = "../agent-client-protocol", features = ["unstable"] }
+agent-client-protocol = { git = "https://github.com/zed-industries/agent-client-protocol", rev = "37f6d3b6b5e8ad65ec7df65a05745c20e7b9399e", features = ["unstable"] }
 anyhow = "1"
 async-trait = "0.1"
-codex-arg0 = { path = "../codex/codex-rs/arg0" }
-codex-common = { path = "../codex/codex-rs/common", features = ["cli"] }
-codex-core = { path = "../codex/codex-rs/core" }
-codex-mcp-server = { path = "../codex/codex-rs/mcp-server" }
-codex-protocol = { path = "../codex/codex-rs/protocol" }
-mcp-types = { path = "../codex/codex-rs/mcp-types" }
+codex-arg0 = { git = "https://github.com/openai/codex", rev = "42847baaf74f909d9c051d9d3d546b1bb3cc227a" }
+codex-common = { git = "https://github.com/openai/codex", rev = "42847baaf74f909d9c051d9d3d546b1bb3cc227a", features = ["cli"] }
+codex-core = { git = "https://github.com/openai/codex", rev = "42847baaf74f909d9c051d9d3d546b1bb3cc227a" }
+codex-mcp-server = { git = "https://github.com/openai/codex", rev = "42847baaf74f909d9c051d9d3d546b1bb3cc227a" }
+codex-protocol = { git = "https://github.com/openai/codex", rev = "42847baaf74f909d9c051d9d3d546b1bb3cc227a" }
+mcp-types = { git = "https://github.com/openai/codex", rev = "42847baaf74f909d9c051d9d3d546b1bb3cc227a" }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
 tokio-util = { version = "0.7", features = ["compat"] }

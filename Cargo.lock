@@ -19,7 +19,8 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-client-protocol"
-version = "0.4.2"
+version = "0.4.3"
+source = "git+https://github.com/zed-industries/agent-client-protocol?rev=37f6d3b6b5e8ad65ec7df65a05745c20e7b9399e#37f6d3b6b5e8ad65ec7df65a05745c20e7b9399e"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -388,6 +389,7 @@ dependencies = [
 [[package]]
 name = "codex-apply-patch"
 version = "0.0.0"
+source = "git+https://github.com/openai/codex?rev=42847baaf74f909d9c051d9d3d546b1bb3cc227a#42847baaf74f909d9c051d9d3d546b1bb3cc227a"
 dependencies = [
  "anyhow",
  "similar",
@@ -399,6 +401,7 @@ dependencies = [
 [[package]]
 name = "codex-arg0"
 version = "0.0.0"
+source = "git+https://github.com/openai/codex?rev=42847baaf74f909d9c051d9d3d546b1bb3cc227a#42847baaf74f909d9c051d9d3d546b1bb3cc227a"
 dependencies = [
  "anyhow",
  "codex-apply-patch",
@@ -412,6 +415,7 @@ dependencies = [
 [[package]]
 name = "codex-common"
 version = "0.0.0"
+source = "git+https://github.com/openai/codex?rev=42847baaf74f909d9c051d9d3d546b1bb3cc227a#42847baaf74f909d9c051d9d3d546b1bb3cc227a"
 dependencies = [
  "clap",
  "codex-core",
@@ -423,6 +427,7 @@ dependencies = [
 [[package]]
 name = "codex-core"
 version = "0.0.0"
+source = "git+https://github.com/openai/codex?rev=42847baaf74f909d9c051d9d3d546b1bb3cc227a#42847baaf74f909d9c051d9d3d546b1bb3cc227a"
 dependencies = [
  "anyhow",
  "askama",
@@ -472,6 +477,7 @@ dependencies = [
 [[package]]
 name = "codex-file-search"
 version = "0.0.0"
+source = "git+https://github.com/openai/codex?rev=42847baaf74f909d9c051d9d3d546b1bb3cc227a#42847baaf74f909d9c051d9d3d546b1bb3cc227a"
 dependencies = [
  "anyhow",
  "clap",
@@ -485,6 +491,7 @@ dependencies = [
 [[package]]
 name = "codex-linux-sandbox"
 version = "0.0.0"
+source = "git+https://github.com/openai/codex?rev=42847baaf74f909d9c051d9d3d546b1bb3cc227a#42847baaf74f909d9c051d9d3d546b1bb3cc227a"
 dependencies = [
  "clap",
  "codex-core",
@@ -496,6 +503,7 @@ dependencies = [
 [[package]]
 name = "codex-login"
 version = "0.0.0"
+source = "git+https://github.com/openai/codex?rev=42847baaf74f909d9c051d9d3d546b1bb3cc227a#42847baaf74f909d9c051d9d3d546b1bb3cc227a"
 dependencies = [
  "base64",
  "chrono",
@@ -517,6 +525,7 @@ dependencies = [
 [[package]]
 name = "codex-mcp-client"
 version = "0.0.0"
+source = "git+https://github.com/openai/codex?rev=42847baaf74f909d9c051d9d3d546b1bb3cc227a#42847baaf74f909d9c051d9d3d546b1bb3cc227a"
 dependencies = [
  "anyhow",
  "mcp-types",
@@ -530,6 +539,7 @@ dependencies = [
 [[package]]
 name = "codex-mcp-server"
 version = "0.0.0"
+source = "git+https://github.com/openai/codex?rev=42847baaf74f909d9c051d9d3d546b1bb3cc227a#42847baaf74f909d9c051d9d3d546b1bb3cc227a"
 dependencies = [
  "anyhow",
  "codex-arg0",
@@ -552,6 +562,7 @@ dependencies = [
 [[package]]
 name = "codex-protocol"
 version = "0.0.0"
+source = "git+https://github.com/openai/codex?rev=42847baaf74f909d9c051d9d3d546b1bb3cc227a#42847baaf74f909d9c051d9d3d546b1bb3cc227a"
 dependencies = [
  "base64",
  "icu_decimal",
@@ -1627,6 +1638,7 @@ dependencies = [
 [[package]]
 name = "mcp-types"
 version = "0.0.0"
+source = "git+https://github.com/openai/codex?rev=42847baaf74f909d9c051d9d3d546b1bb3cc227a#42847baaf74f909d9c051d9d3d546b1bb3cc227a"
 dependencies = [
  "serde",
  "serde_json",

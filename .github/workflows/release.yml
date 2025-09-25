@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Tag name for release (optional - uses version from Cargo.toml if not specified)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  get-version:
+    name: Get Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      tag_name: ${{ steps.get_version.outputs.tag_name }}
+    steps:
+      - name: Checkout codex-acp
+        uses: actions/checkout@v4
+
+      - name: Get version from Cargo.toml
+        id: get_version
+        run: |
+          VERSION=$(grep -m1 "^version" Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            echo "tag_name=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag_name=v$VERSION" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    name: Build - ${{ matrix.os }}
+    needs: get-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners only
+          - os: macos-14
+            target: aarch64-apple-darwin
+            binary_extension: ""
+          - os: macos-13
+            target: x86_64-apple-darwin
+            binary_extension: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_extension: ".exe"
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_extension: ""
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Create archive
+        id: create_archive
+        shell: bash
+        run: |
+          BINARY_NAME="codex-acp${{ matrix.binary_extension }}"
+          ARCHIVE_NAME="codex-acp-${{ needs.get-version.outputs.version }}-${{ matrix.target }}"
+
+          cd target/${{ matrix.target }}/release
+
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            7z a -tzip "${ARCHIVE_NAME}.zip" "${BINARY_NAME}"
+            echo "archive_path=${ARCHIVE_NAME}.zip" >> $GITHUB_OUTPUT
+            echo "archive_name=${ARCHIVE_NAME}.zip" >> $GITHUB_OUTPUT
+            mv "${ARCHIVE_NAME}.zip" ../../../
+          else
+            tar czf "${ARCHIVE_NAME}.tar.gz" "${BINARY_NAME}"
+            echo "archive_path=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_OUTPUT
+            echo "archive_name=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_OUTPUT
+            mv "${ARCHIVE_NAME}.tar.gz" ../../../
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.create_archive.outputs.archive_name }}
+          path: ${{ steps.create_archive.outputs.archive_path }}
+          retention-days: 1
+
+  create-release:
+    name: Create Release
+    needs: [get-version, build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure of downloaded files
+        run: ls -la artifacts/
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.get-version.outputs.tag_name }}
+          name: Release ${{ needs.get-version.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
