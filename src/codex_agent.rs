@@ -1,16 +1,17 @@
 use crate::mcp_http::AcpMcpHttpServer;
 use agent_client_protocol::{
-    Agent, AgentCapabilities, AgentSideConnection, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, Client, ContentBlock, Error, ExtNotification, ExtRequest, ExtResponse,
-    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
+    Agent, AgentCapabilities, AgentSideConnection, Annotations, AudioContent, AuthenticateRequest,
+    AuthenticateResponse, BlobResourceContents, CancelNotification, Client, ContentBlock,
+    EmbeddedResource, EmbeddedResourceResource, Error, ExtNotification, ExtRequest, ExtResponse,
+    ImageContent, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
     McpCapabilities, McpServer, ModelId, ModelInfo, NewSessionRequest, NewSessionResponse,
     PermissionOption, PermissionOptionId, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
     PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionId, SessionMode, SessionModeId, SessionModeState,
-    SessionModelState, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    RequestPermissionRequest, ResourceLink, SessionId, SessionMode, SessionModeId,
+    SessionModeState, SessionModelState, SessionNotification, SessionUpdate, SetSessionModeRequest,
     SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, StopReason,
-    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
+    TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
 };
 use codex_common::{
     approval_presets::{ApprovalPreset, builtin_approval_presets},
@@ -334,24 +335,109 @@ impl CodexAgent {
         &self,
         session_id: SessionId,
         call_id: String,
+        _invocation: McpInvocation,
         result: Result<CallToolResult, String>,
     ) {
-        // Update the ToolCall status to Completed/Failed
-        let tool_call_id = ToolCallId(call_id.into());
-        let status = if match &result {
-            Ok(r) => r.is_error.unwrap_or(false),
+        let is_error = match result.as_ref() {
+            Ok(result) => result.is_error.unwrap_or_default(),
             Err(_) => true,
-        } {
-            ToolCallStatus::Failed
-        } else {
-            ToolCallStatus::Completed
+        };
+        let raw_output = match result.as_ref() {
+            Ok(result) => serde_json::json!(result),
+            Err(err) => serde_json::json!(err),
         };
         self.send_notification(
             session_id,
             SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                id: tool_call_id,
+                id: ToolCallId(call_id.into()),
                 fields: ToolCallUpdateFields {
-                    status: Some(status),
+                    status: Some(if is_error {
+                        ToolCallStatus::Failed
+                    } else {
+                        ToolCallStatus::Completed
+                    }),
+                    content: result
+                        .ok()
+                        .filter(|result| !result.content.is_empty())
+                        .map(|result| {
+                            result
+                                .content
+                                .into_iter()
+                                .map(|content| ToolCallContent::Content {
+                                    content: match content {
+                                            mcp_types::ContentBlock::TextContent(text_content) => {
+                                                ContentBlock::Text(TextContent {
+                                                    annotations: text_content
+                                                        .annotations
+                                                        .map(convert_annotations),
+                                                    text: text_content.text,
+                                                    meta: None,
+                                                })
+                                            }
+                                            mcp_types::ContentBlock::ImageContent(image_content) => {
+                                                ContentBlock::Image(ImageContent {
+                                                    annotations: image_content
+                                                        .annotations
+                                                        .map(convert_annotations),
+                                                    data: image_content.data,
+                                                    mime_type: image_content.mime_type,
+                                                    uri: None,
+                                                    meta: None,
+                                                })
+                                            }
+                                            mcp_types::ContentBlock::AudioContent(audio_content) => {
+                                                ContentBlock::Audio(AudioContent {
+                                                    annotations: audio_content
+                                                        .annotations
+                                                        .map(convert_annotations),
+                                                    data: audio_content.data,
+                                                    mime_type: audio_content.mime_type,
+                                                    meta: None,
+                                                })
+                                            }
+                                            mcp_types::ContentBlock::ResourceLink(resource_link) => {
+                                                ContentBlock::ResourceLink(ResourceLink {
+                                                    annotations: resource_link
+                                                        .annotations
+                                                        .map(convert_annotations),
+                                                    description: resource_link.description,
+                                                    mime_type: resource_link.mime_type,
+                                                    name: resource_link.name,
+                                                    size: resource_link.size,
+                                                    title: resource_link.title,
+                                                    uri: resource_link.uri,
+                                                    meta: None,
+                                                })
+                                            }
+                                            mcp_types::ContentBlock::EmbeddedResource(embedded_resource) => {
+                                                ContentBlock::Resource(EmbeddedResource {
+                                                    annotations: embedded_resource.annotations.map(convert_annotations),
+                                                    resource: match embedded_resource.resource {
+                                                        mcp_types::EmbeddedResourceResource::TextResourceContents(text_resource_contents) => {
+                                                            EmbeddedResourceResource::TextResourceContents(TextResourceContents {
+                                                                mime_type: text_resource_contents.mime_type,
+                                                                text: text_resource_contents.text,
+                                                                uri: text_resource_contents.uri,
+                                                                meta: None
+                                                            })
+                                                        },
+                                                        mcp_types::EmbeddedResourceResource::BlobResourceContents(blob_resource_contents) => {
+                                                            EmbeddedResourceResource::BlobResourceContents(BlobResourceContents {
+                                                                blob: blob_resource_contents.blob,
+                                                                mime_type: blob_resource_contents.mime_type,
+                                                                uri: blob_resource_contents.uri,
+                                                                meta: None
+                                                            })
+                                                        },
+                                                    },
+                                                    meta: None,
+                                                })
+                                            }
+                                    }
+                                })
+                                .collect()
+                        }),
+                    raw_output: Some(raw_output),
                     ..Default::default()
                 },
                 meta: None,
@@ -1021,7 +1107,7 @@ impl Agent for CodexAgent {
                         }
                         EventMsg::McpToolCallEnd(McpToolCallEndEvent { call_id, invocation, duration, result }) => {
                             info!("MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}", invocation.server, invocation.tool);
-                            self.end_mcp_tool_call(request.session_id.clone(), call_id, result).await;
+                            self.end_mcp_tool_call(request.session_id.clone(), call_id, invocation, result).await;
                         }
                         EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message}) => {
                             info!(
@@ -1168,5 +1254,22 @@ impl Agent for CodexAgent {
 
     async fn ext_notification(&self, _args: ExtNotification) -> Result<(), Error> {
         Err(Error::method_not_found())
+    }
+}
+
+fn convert_annotations(annotations: mcp_types::Annotations) -> Annotations {
+    Annotations {
+        audience: annotations.audience.map(|audience| {
+            audience
+                .into_iter()
+                .map(|audience| match audience {
+                    mcp_types::Role::Assistant => agent_client_protocol::Role::Assistant,
+                    mcp_types::Role::User => agent_client_protocol::Role::User,
+                })
+                .collect()
+        }),
+        last_modified: annotations.last_modified,
+        priority: annotations.priority,
+        meta: None,
     }
 }
