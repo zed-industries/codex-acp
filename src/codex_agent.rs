@@ -1,3 +1,4 @@
+use crate::mcp_http::AcpMcpHttpServer;
 use agent_client_protocol::{
     Agent, AgentCapabilities, AgentSideConnection, Annotations, AudioContent, AuthenticateRequest,
     AuthenticateResponse, BlobResourceContents, CancelNotification, Client, ContentBlock,
@@ -20,7 +21,7 @@ use codex_core::{
     CodexConversation, ConversationManager,
     auth::{AuthManager, CodexAuth, read_openai_api_key_from_env},
     config::Config,
-    config_types::McpServerConfig,
+    config_types::{McpServerConfig, McpTransport, OpenAiToolId},
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
         AgentMessageDeltaEvent, AgentMessageEvent, AgentReasoningDeltaEvent, AgentReasoningEvent,
@@ -45,6 +46,7 @@ use std::{
 };
 use tracing::{debug, error, info, warn};
 
+const ACP_MCP_SERVER_NAME: &str = "acp";
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 
 /// The Codex implementation of the ACP Agent trait.
@@ -61,7 +63,7 @@ pub struct CodexAgent {
     /// Default model presets for a given auth mode
     model_presets: Vec<ModelPreset>,
     /// This should be set before any client calls are made
-    client: OnceCell<AgentSideConnection>,
+    client: OnceCell<Rc<AgentSideConnection>>,
 }
 
 /// State for an individual session
@@ -70,6 +72,8 @@ struct SessionState {
     conversation_id: ConversationId,
     /// The config used for this session
     config: Config,
+    /// Handle to the in-process HTTP MCP server for ACP tools
+    acp_server: Rc<AcpMcpHttpServer>,
 }
 
 impl CodexAgent {
@@ -106,13 +110,13 @@ impl CodexAgent {
 
     pub fn set_client(&self, client: AgentSideConnection) {
         assert!(
-            self.client.set(client).is_ok(),
+            self.client.set(Rc::new(client)).is_ok(),
             "Client should only be set once"
         );
     }
 
-    fn client(&self) -> &AgentSideConnection {
-        self.client.get().expect("Client should be set")
+    fn client(&self) -> Rc<AgentSideConnection> {
+        Rc::clone(self.client.get().expect("Client should be set"))
     }
 
     fn modes(config: &Config) -> Option<SessionModeState> {
@@ -223,32 +227,44 @@ impl CodexAgent {
         call_id: String,
         invocation: McpInvocation,
     ) {
-        let McpInvocation {
-            server,
-            tool,
-            arguments,
-        } = invocation;
-
+        // Create a ToolCall so subsequent ToolCallUpdate (e.g. terminal embedding) can attach by id.
+        let tool_call_id = ToolCallId(call_id.clone().into());
+        let title = format!("Tool: {}/{}", invocation.server, invocation.tool);
         self.send_notification(
-            session_id,
+            session_id.clone(),
             SessionUpdate::ToolCall(ToolCall {
-                id: ToolCallId(call_id.into()),
-                title: format!("{tool} ({server})"),
-                kind: ToolKind::Other,
+                id: tool_call_id,
+                title,
+                kind: if invocation.server == ACP_MCP_SERVER_NAME {
+                    ToolKind::Execute
+                } else {
+                    ToolKind::Other
+                },
                 status: ToolCallStatus::InProgress,
-                content: arguments
-                    .as_ref()
-                    .and_then(|args| serde_json::to_string_pretty(args).ok())
-                    .map(Into::into)
-                    .into_iter()
-                    .collect(),
+                content: vec![],
                 locations: vec![],
-                raw_input: arguments,
+                raw_input: Some(serde_json::json!(&invocation)),
                 raw_output: None,
                 meta: None,
             }),
         )
         .await;
+
+        // Record this invocation for correlation with the upcoming HTTP tools/call.
+        let acp_server = {
+            let sessions = self.sessions.borrow();
+            sessions.get(&session_id).map(|s| s.acp_server.clone())
+        };
+        if let Some(server) = acp_server {
+            let args_value = invocation
+                .arguments
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            server
+                .record_invocation(&invocation.tool, &args_value, &call_id, &session_id)
+                .await;
+        }
     }
 
     async fn end_mcp_tool_call(
@@ -275,84 +291,87 @@ impl CodexAgent {
                     } else {
                         ToolCallStatus::Completed
                     }),
-                    content: result.ok().map(|result| {
-                        result
-                            .content
-                            .into_iter()
-                            .map(|content|  ToolCallContent::Content {
-                                content: match content {
-                                    mcp_types::ContentBlock::TextContent(text_content) => {
-                                        ContentBlock::Text(TextContent {
-                                            annotations: text_content
-                                                .annotations
-                                                .map(convert_annotations),
-                                            text: text_content.text,
-                                            meta: None,
-                                        })
+                    content: result
+                        .ok()
+                        .filter(|result| !result.content.is_empty())
+                        .map(|result| {
+                            result
+                                .content
+                                .into_iter()
+                                .map(|content| ToolCallContent::Content {
+                                    content: match content {
+                                            mcp_types::ContentBlock::TextContent(text_content) => {
+                                                ContentBlock::Text(TextContent {
+                                                    annotations: text_content
+                                                        .annotations
+                                                        .map(convert_annotations),
+                                                    text: text_content.text,
+                                                    meta: None,
+                                                })
+                                            }
+                                            mcp_types::ContentBlock::ImageContent(image_content) => {
+                                                ContentBlock::Image(ImageContent {
+                                                    annotations: image_content
+                                                        .annotations
+                                                        .map(convert_annotations),
+                                                    data: image_content.data,
+                                                    mime_type: image_content.mime_type,
+                                                    uri: None,
+                                                    meta: None,
+                                                })
+                                            }
+                                            mcp_types::ContentBlock::AudioContent(audio_content) => {
+                                                ContentBlock::Audio(AudioContent {
+                                                    annotations: audio_content
+                                                        .annotations
+                                                        .map(convert_annotations),
+                                                    data: audio_content.data,
+                                                    mime_type: audio_content.mime_type,
+                                                    meta: None,
+                                                })
+                                            }
+                                            mcp_types::ContentBlock::ResourceLink(resource_link) => {
+                                                ContentBlock::ResourceLink(ResourceLink {
+                                                    annotations: resource_link
+                                                        .annotations
+                                                        .map(convert_annotations),
+                                                    description: resource_link.description,
+                                                    mime_type: resource_link.mime_type,
+                                                    name: resource_link.name,
+                                                    size: resource_link.size,
+                                                    title: resource_link.title,
+                                                    uri: resource_link.uri,
+                                                    meta: None,
+                                                })
+                                            }
+                                            mcp_types::ContentBlock::EmbeddedResource(embedded_resource) => {
+                                                ContentBlock::Resource(EmbeddedResource {
+                                                    annotations: embedded_resource.annotations.map(convert_annotations),
+                                                    resource: match embedded_resource.resource {
+                                                        mcp_types::EmbeddedResourceResource::TextResourceContents(text_resource_contents) => {
+                                                            EmbeddedResourceResource::TextResourceContents(TextResourceContents {
+                                                                mime_type: text_resource_contents.mime_type,
+                                                                text: text_resource_contents.text,
+                                                                uri: text_resource_contents.uri,
+                                                                meta: None
+                                                            })
+                                                        },
+                                                        mcp_types::EmbeddedResourceResource::BlobResourceContents(blob_resource_contents) => {
+                                                            EmbeddedResourceResource::BlobResourceContents(BlobResourceContents {
+                                                                blob: blob_resource_contents.blob,
+                                                                mime_type: blob_resource_contents.mime_type,
+                                                                uri: blob_resource_contents.uri,
+                                                                meta: None
+                                                            })
+                                                        },
+                                                    },
+                                                    meta: None,
+                                                })
+                                            }
                                     }
-                                    mcp_types::ContentBlock::ImageContent(image_content) => {
-                                        ContentBlock::Image(ImageContent {
-                                            annotations: image_content
-                                                .annotations
-                                                .map(convert_annotations),
-                                            data: image_content.data,
-                                            mime_type: image_content.mime_type,
-                                            uri: None,
-                                            meta: None,
-                                        })
-                                    }
-                                    mcp_types::ContentBlock::AudioContent(audio_content) => {
-                                        ContentBlock::Audio(AudioContent {
-                                            annotations: audio_content
-                                                .annotations
-                                                .map(convert_annotations),
-                                            data: audio_content.data,
-                                            mime_type: audio_content.mime_type,
-                                            meta: None,
-                                        })
-                                    }
-                                    mcp_types::ContentBlock::ResourceLink(resource_link) => {
-                                        ContentBlock::ResourceLink(ResourceLink {
-                                            annotations: resource_link
-                                                .annotations
-                                                .map(convert_annotations),
-                                            description: resource_link.description,
-                                            mime_type: resource_link.mime_type,
-                                            name: resource_link.name,
-                                            size: resource_link.size,
-                                            title: resource_link.title,
-                                            uri: resource_link.uri,
-                                            meta: None,
-                                        })
-                                    }
-                                    mcp_types::ContentBlock::EmbeddedResource(embedded_resource) => {
-                                        ContentBlock::Resource(EmbeddedResource {
-                                            annotations: embedded_resource.annotations.map(convert_annotations),
-                                            resource: match embedded_resource.resource {
-                                                mcp_types::EmbeddedResourceResource::TextResourceContents(text_resource_contents) => {
-                                                    EmbeddedResourceResource::TextResourceContents(TextResourceContents {
-                                                        mime_type: text_resource_contents.mime_type,
-                                                        text: text_resource_contents.text,
-                                                        uri: text_resource_contents.uri,
-                                                        meta: None
-                                                    })
-                                                },
-                                                mcp_types::EmbeddedResourceResource::BlobResourceContents(blob_resource_contents) => {
-                                                    EmbeddedResourceResource::BlobResourceContents(BlobResourceContents {
-                                                        blob: blob_resource_contents.blob,
-                                                        mime_type: blob_resource_contents.mime_type,
-                                                        uri: blob_resource_contents.uri,
-                                                        meta: None
-                                                    })
-                                                },
-                                            },
-                                            meta: None,
-                                        })
-                                    }
-                                }
-                            })
-                            .collect()
-                    }),
+                                })
+                                .collect()
+                        }),
                     raw_output: Some(raw_output),
                     ..Default::default()
                 },
@@ -648,6 +667,16 @@ impl Agent for CodexAgent {
 
         let mut config = self.config.clone();
         config.cwd.clone_from(&cwd);
+        // Disable builtin shell-related tools so the model uses our MCP terminal tools.
+        config.disabled_tools.extend_from_slice(&[
+            OpenAiToolId::ShellDefault,
+            OpenAiToolId::ShellLocal,
+            OpenAiToolId::ExecCommand,
+            OpenAiToolId::WriteStdin,
+            OpenAiToolId::UnifiedExec,
+        ]);
+
+        // Propagate any client-provided MCP servers that codex-rs supports.
         for mcp_server in mcp_servers {
             match mcp_server {
                 // Not supported in codex yet
@@ -661,20 +690,50 @@ impl Agent for CodexAgent {
                     config.mcp_servers.insert(
                         name.clone(),
                         McpServerConfig {
-                            command: command.display().to_string(),
+                            transport: McpTransport::Stdio,
+                            command: Some(command.display().to_string()),
                             args,
                             env: if env.is_empty() {
                                 None
                             } else {
                                 Some(env.into_iter().map(|env| (env.name, env.value)).collect())
                             },
-                            startup_timeout_sec: None,
-                            tool_timeout_sec: None,
+                            url: None,
+                            messages_url: None,
+                            headers: None,
+                            startup_timeout_ms: None,
                         },
                     );
                 }
             }
         }
+
+        // Note: the ACP-backed terminal tools will be provided by the agent (this process).
+        // We disabled codex's shell tools above so that the agent will use these instead.
+
+        // Start in-process HTTP MCP server for ACP terminal tools and register it.
+        let acp_http = Rc::new(
+            AcpMcpHttpServer::bind_and_spawn()
+                .await
+                .map_err(|_| Error::internal_error())?,
+        );
+        let stream_url = acp_http.stream_url();
+        let messages_url = acp_http.messages_url();
+        config.mcp_servers.insert(
+            ACP_MCP_SERVER_NAME.to_string(),
+            McpServerConfig {
+                transport: McpTransport::Http,
+                command: None,
+                args: vec![],
+                env: None,
+                url: Some(stream_url),
+                messages_url: Some(messages_url),
+                headers: None,
+                startup_timeout_ms: Some(10_000),
+            },
+        );
+        acp_http.set_client(self.client()).await;
+
         let num_mcp_servers = config.mcp_servers.len();
 
         let modes = Self::modes(&config);
@@ -689,6 +748,7 @@ impl Agent for CodexAgent {
         let session_state = SessionState {
             conversation_id: new_conversation.conversation_id,
             config,
+            acp_server: acp_http,
         };
         let session_id = SessionId(new_conversation.conversation_id.to_string().into());
 
