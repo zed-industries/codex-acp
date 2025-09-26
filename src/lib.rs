@@ -11,6 +11,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
+mod mcp_http;
 
 /// Run the Codex ACP agent.
 ///
@@ -53,9 +54,14 @@ pub async fn run_main(
     LocalSet::new()
         .run_until(async move {
             // Create the ACP connection
-            let (client, io_task) = AgentSideConnection::new(agent.clone(), stdout, stdin, |fut| {
-                tokio::task::spawn_local(fut);
-            });
+            let (client, io_task) = AgentSideConnection::new(
+                codex_agent::AgentWrapper::new(agent.clone()),
+                stdout,
+                stdin,
+                |fut| {
+                    tokio::task::spawn_local(fut);
+                },
+            );
 
             agent.set_client(client);
 

@@ -1,16 +1,16 @@
+use crate::mcp_http::AcpMcpHttpServer;
 use agent_client_protocol::{
-    Agent, AgentCapabilities, AgentSideConnection, Annotations, AudioContent, AuthenticateRequest,
-    AuthenticateResponse, BlobResourceContents, CancelNotification, Client, ContentBlock,
-    EmbeddedResource, EmbeddedResourceResource, Error, ExtNotification, ExtRequest, ExtResponse,
-    ImageContent, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
+    Agent, AgentCapabilities, AgentSideConnection, AuthenticateRequest, AuthenticateResponse,
+    CancelNotification, Client, ContentBlock, Error, ExtNotification, ExtRequest, ExtResponse,
+    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
     McpCapabilities, McpServer, ModelId, ModelInfo, NewSessionRequest, NewSessionResponse,
     PermissionOption, PermissionOptionId, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
     PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, ResourceLink, SessionId, SessionMode, SessionModeId,
-    SessionModeState, SessionModelState, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    RequestPermissionRequest, SessionId, SessionMode, SessionModeId, SessionModeState,
+    SessionModelState, SessionNotification, SessionUpdate, SetSessionModeRequest,
     SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, StopReason,
-    TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
+    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
 };
 use codex_common::{
     approval_presets::{ApprovalPreset, builtin_approval_presets},
@@ -20,7 +20,7 @@ use codex_core::{
     CodexConversation, ConversationManager,
     auth::{AuthManager, CodexAuth, read_openai_api_key_from_env},
     config::Config,
-    config_types::McpServerConfig,
+    config_types::{McpServerConfig, McpTransport, OpenAiToolId},
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
         AgentMessageDeltaEvent, AgentMessageEvent, AgentReasoningDeltaEvent, AgentReasoningEvent,
@@ -51,6 +51,70 @@ static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_a
 ///
 /// This bridges the ACP protocol with the existing codex-rs infrastructure,
 /// allowing codex to be used as an ACP agent.
+/// Wrapper to pass an `Rc<CodexAgent>` where an `Agent` is required.
+pub struct AgentWrapper(pub Rc<CodexAgent>);
+
+#[async_trait::async_trait(?Send)]
+impl Agent for AgentWrapper {
+    async fn initialize(&self, request: InitializeRequest) -> Result<InitializeResponse, Error> {
+        self.0.initialize(request).await
+    }
+
+    async fn authenticate(
+        &self,
+        request: AuthenticateRequest,
+    ) -> Result<AuthenticateResponse, Error> {
+        self.0.authenticate(request).await
+    }
+
+    async fn new_session(&self, request: NewSessionRequest) -> Result<NewSessionResponse, Error> {
+        self.0.new_session(request).await
+    }
+
+    async fn load_session(
+        &self,
+        request: LoadSessionRequest,
+    ) -> Result<LoadSessionResponse, Error> {
+        self.0.load_session(request).await
+    }
+
+    async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {
+        self.0.prompt(request).await
+    }
+
+    async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
+        self.0.cancel(args).await
+    }
+
+    async fn set_session_mode(
+        &self,
+        args: SetSessionModeRequest,
+    ) -> Result<SetSessionModeResponse, Error> {
+        self.0.set_session_mode(args).await
+    }
+
+    async fn set_session_model(
+        &self,
+        args: SetSessionModelRequest,
+    ) -> Result<SetSessionModelResponse, Error> {
+        self.0.set_session_model(args).await
+    }
+
+    async fn ext_method(&self, args: ExtRequest) -> Result<ExtResponse, Error> {
+        self.0.ext_method(args).await
+    }
+
+    async fn ext_notification(&self, args: ExtNotification) -> Result<(), Error> {
+        self.0.ext_notification(args).await
+    }
+}
+
+impl AgentWrapper {
+    pub fn new(inner: std::rc::Rc<CodexAgent>) -> Self {
+        Self(inner)
+    }
+}
+
 pub struct CodexAgent {
     /// The underlying codex configuration
     config: Config,
@@ -61,7 +125,7 @@ pub struct CodexAgent {
     /// Default model presets for a given auth mode
     model_presets: Vec<ModelPreset>,
     /// This should be set before any client calls are made
-    client: OnceCell<AgentSideConnection>,
+    client: OnceCell<Rc<AgentSideConnection>>,
 }
 
 /// State for an individual session
@@ -70,6 +134,8 @@ struct SessionState {
     conversation_id: ConversationId,
     /// The config used for this session
     config: Config,
+    /// Handle to the in-process HTTP MCP server for ACP tools
+    acp_server: Rc<AcpMcpHttpServer>,
 }
 
 impl CodexAgent {
@@ -106,13 +172,13 @@ impl CodexAgent {
 
     pub fn set_client(&self, client: AgentSideConnection) {
         assert!(
-            self.client.set(client).is_ok(),
+            self.client.set(Rc::new(client)).is_ok(),
             "Client should only be set once"
         );
     }
 
-    fn client(&self) -> &AgentSideConnection {
-        self.client.get().expect("Client should be set")
+    fn client(&self) -> Rc<AgentSideConnection> {
+        Rc::clone(self.client.get().expect("Client should be set"))
     }
 
     fn modes(config: &Config) -> Option<SessionModeState> {
@@ -223,32 +289,45 @@ impl CodexAgent {
         call_id: String,
         invocation: McpInvocation,
     ) {
-        let McpInvocation {
-            server,
-            tool,
-            arguments,
-        } = invocation;
-
+        // Create a ToolCall so subsequent ToolCallUpdate (e.g. terminal embedding) can attach by id.
+        let tool_call_id = ToolCallId(call_id.clone().into());
+        let title = format!("Tool: {}/{}", invocation.server, invocation.tool);
+        let raw_input = Some(serde_json::json!({
+            "server": invocation.server,
+            "tool": invocation.tool,
+            "arguments": invocation.arguments
+        }));
         self.send_notification(
-            session_id,
+            session_id.clone(),
             SessionUpdate::ToolCall(ToolCall {
-                id: ToolCallId(call_id.into()),
-                title: format!("{tool} ({server})"),
-                kind: ToolKind::Other,
+                id: tool_call_id,
+                title,
+                kind: ToolKind::Execute,
                 status: ToolCallStatus::InProgress,
-                content: arguments
-                    .as_ref()
-                    .and_then(|args| serde_json::to_string_pretty(args).ok())
-                    .map(Into::into)
-                    .into_iter()
-                    .collect(),
+                content: vec![],
                 locations: vec![],
-                raw_input: arguments,
+                raw_input,
                 raw_output: None,
                 meta: None,
             }),
         )
         .await;
+
+        // Record this invocation for correlation with the upcoming HTTP tools/call.
+        let acp_server = {
+            let sessions = self.sessions.borrow();
+            sessions.get(&session_id).map(|s| s.acp_server.clone())
+        };
+        if let Some(server) = acp_server {
+            let args_value = invocation
+                .arguments
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            server
+                .record_invocation(&invocation.tool, &args_value, &call_id, &session_id)
+                .await;
+        }
     }
 
     async fn end_mcp_tool_call(
@@ -257,103 +336,22 @@ impl CodexAgent {
         call_id: String,
         result: Result<CallToolResult, String>,
     ) {
-        let is_error = match result.as_ref() {
-            Ok(result) => result.is_error.unwrap_or_default(),
+        // Update the ToolCall status to Completed/Failed
+        let tool_call_id = ToolCallId(call_id.into());
+        let status = if match &result {
+            Ok(r) => r.is_error.unwrap_or(false),
             Err(_) => true,
-        };
-        let raw_output = match result.as_ref() {
-            Ok(result) => serde_json::json!(result),
-            Err(err) => serde_json::json!(err),
+        } {
+            ToolCallStatus::Failed
+        } else {
+            ToolCallStatus::Completed
         };
         self.send_notification(
             session_id,
             SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                id: ToolCallId(call_id.into()),
+                id: tool_call_id,
                 fields: ToolCallUpdateFields {
-                    status: Some(if is_error {
-                        ToolCallStatus::Failed
-                    } else {
-                        ToolCallStatus::Completed
-                    }),
-                    content: result.ok().map(|result| {
-                        result
-                            .content
-                            .into_iter()
-                            .map(|content|  ToolCallContent::Content {
-                                content: match content {
-                                    mcp_types::ContentBlock::TextContent(text_content) => {
-                                        ContentBlock::Text(TextContent {
-                                            annotations: text_content
-                                                .annotations
-                                                .map(convert_annotations),
-                                            text: text_content.text,
-                                            meta: None,
-                                        })
-                                    }
-                                    mcp_types::ContentBlock::ImageContent(image_content) => {
-                                        ContentBlock::Image(ImageContent {
-                                            annotations: image_content
-                                                .annotations
-                                                .map(convert_annotations),
-                                            data: image_content.data,
-                                            mime_type: image_content.mime_type,
-                                            uri: None,
-                                            meta: None,
-                                        })
-                                    }
-                                    mcp_types::ContentBlock::AudioContent(audio_content) => {
-                                        ContentBlock::Audio(AudioContent {
-                                            annotations: audio_content
-                                                .annotations
-                                                .map(convert_annotations),
-                                            data: audio_content.data,
-                                            mime_type: audio_content.mime_type,
-                                            meta: None,
-                                        })
-                                    }
-                                    mcp_types::ContentBlock::ResourceLink(resource_link) => {
-                                        ContentBlock::ResourceLink(ResourceLink {
-                                            annotations: resource_link
-                                                .annotations
-                                                .map(convert_annotations),
-                                            description: resource_link.description,
-                                            mime_type: resource_link.mime_type,
-                                            name: resource_link.name,
-                                            size: resource_link.size,
-                                            title: resource_link.title,
-                                            uri: resource_link.uri,
-                                            meta: None,
-                                        })
-                                    }
-                                    mcp_types::ContentBlock::EmbeddedResource(embedded_resource) => {
-                                        ContentBlock::Resource(EmbeddedResource {
-                                            annotations: embedded_resource.annotations.map(convert_annotations),
-                                            resource: match embedded_resource.resource {
-                                                mcp_types::EmbeddedResourceResource::TextResourceContents(text_resource_contents) => {
-                                                    EmbeddedResourceResource::TextResourceContents(TextResourceContents {
-                                                        mime_type: text_resource_contents.mime_type,
-                                                        text: text_resource_contents.text,
-                                                        uri: text_resource_contents.uri,
-                                                        meta: None
-                                                    })
-                                                },
-                                                mcp_types::EmbeddedResourceResource::BlobResourceContents(blob_resource_contents) => {
-                                                    EmbeddedResourceResource::BlobResourceContents(BlobResourceContents {
-                                                        blob: blob_resource_contents.blob,
-                                                        mime_type: blob_resource_contents.mime_type,
-                                                        uri: blob_resource_contents.uri,
-                                                        meta: None
-                                                    })
-                                                },
-                                            },
-                                            meta: None,
-                                        })
-                                    }
-                                }
-                            })
-                            .collect()
-                    }),
-                    raw_output: Some(raw_output),
+                    status: Some(status),
                     ..Default::default()
                 },
                 meta: None,
@@ -648,6 +646,16 @@ impl Agent for CodexAgent {
 
         let mut config = self.config.clone();
         config.cwd.clone_from(&cwd);
+        // Disable builtin shell-related tools so the model uses our MCP terminal tools.
+        config.disabled_tools.extend_from_slice(&[
+            OpenAiToolId::ShellDefault,
+            OpenAiToolId::ShellLocal,
+            OpenAiToolId::ExecCommand,
+            OpenAiToolId::WriteStdin,
+            OpenAiToolId::UnifiedExec,
+        ]);
+
+        // Propagate any client-provided MCP servers that codex-rs supports.
         for mcp_server in mcp_servers {
             match mcp_server {
                 // Not supported in codex yet
@@ -661,20 +669,50 @@ impl Agent for CodexAgent {
                     config.mcp_servers.insert(
                         name.clone(),
                         McpServerConfig {
-                            command: command.display().to_string(),
+                            transport: McpTransport::Stdio,
+                            command: Some(command.display().to_string()),
                             args,
                             env: if env.is_empty() {
                                 None
                             } else {
                                 Some(env.into_iter().map(|env| (env.name, env.value)).collect())
                             },
-                            startup_timeout_sec: None,
-                            tool_timeout_sec: None,
+                            url: None,
+                            messages_url: None,
+                            headers: None,
+                            startup_timeout_ms: None,
                         },
                     );
                 }
             }
         }
+
+        // Note: the ACP-backed terminal tools will be provided by the agent (this process).
+        // We disabled codex's shell tools above so that the agent will use these instead.
+
+        // Start in-process HTTP MCP server for ACP terminal tools and register it.
+        let acp_http = Rc::new(
+            AcpMcpHttpServer::bind_and_spawn()
+                .await
+                .map_err(|_| Error::internal_error())?,
+        );
+        let stream_url = acp_http.stream_url();
+        let messages_url = acp_http.messages_url();
+        config.mcp_servers.insert(
+            "acp".to_string(),
+            McpServerConfig {
+                transport: McpTransport::Http,
+                command: None,
+                args: vec![],
+                env: None,
+                url: Some(stream_url),
+                messages_url: Some(messages_url),
+                headers: None,
+                startup_timeout_ms: Some(10_000),
+            },
+        );
+        acp_http.set_client(self.client()).await;
+
         let num_mcp_servers = config.mcp_servers.len();
 
         let modes = Self::modes(&config);
@@ -689,6 +727,7 @@ impl Agent for CodexAgent {
         let session_state = SessionState {
             conversation_id: new_conversation.conversation_id,
             config,
+            acp_server: acp_http,
         };
         let session_id = SessionId(new_conversation.conversation_id.to_string().into());
 
@@ -1129,22 +1168,5 @@ impl Agent for CodexAgent {
 
     async fn ext_notification(&self, _args: ExtNotification) -> Result<(), Error> {
         Err(Error::method_not_found())
-    }
-}
-
-fn convert_annotations(annotations: mcp_types::Annotations) -> Annotations {
-    Annotations {
-        audience: annotations.audience.map(|audience| {
-            audience
-                .into_iter()
-                .map(|audience| match audience {
-                    mcp_types::Role::Assistant => agent_client_protocol::Role::Assistant,
-                    mcp_types::Role::User => agent_client_protocol::Role::User,
-                })
-                .collect()
-        }),
-        last_modified: annotations.last_modified,
-        priority: annotations.priority,
-        meta: None,
     }
 }
