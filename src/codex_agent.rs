@@ -46,6 +46,7 @@ use std::{
 };
 use tracing::{debug, error, info, warn};
 
+const ACP_MCP_SERVER_NAME: &str = "acp";
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 
 /// The Codex implementation of the ACP Agent trait.
@@ -229,21 +230,20 @@ impl CodexAgent {
         // Create a ToolCall so subsequent ToolCallUpdate (e.g. terminal embedding) can attach by id.
         let tool_call_id = ToolCallId(call_id.clone().into());
         let title = format!("Tool: {}/{}", invocation.server, invocation.tool);
-        let raw_input = Some(serde_json::json!({
-            "server": invocation.server,
-            "tool": invocation.tool,
-            "arguments": invocation.arguments
-        }));
         self.send_notification(
             session_id.clone(),
             SessionUpdate::ToolCall(ToolCall {
                 id: tool_call_id,
                 title,
-                kind: ToolKind::Execute,
+                kind: if invocation.server == ACP_MCP_SERVER_NAME {
+                    ToolKind::Execute
+                } else {
+                    ToolKind::Other
+                },
                 status: ToolCallStatus::InProgress,
                 content: vec![],
                 locations: vec![],
-                raw_input,
+                raw_input: Some(serde_json::json!(&invocation)),
                 raw_output: None,
                 meta: None,
             }),
@@ -271,7 +271,6 @@ impl CodexAgent {
         &self,
         session_id: SessionId,
         call_id: String,
-        _invocation: McpInvocation,
         result: Result<CallToolResult, String>,
     ) {
         let is_error = match result.as_ref() {
@@ -721,7 +720,7 @@ impl Agent for CodexAgent {
         let stream_url = acp_http.stream_url();
         let messages_url = acp_http.messages_url();
         config.mcp_servers.insert(
-            "acp".to_string(),
+            ACP_MCP_SERVER_NAME.to_string(),
             McpServerConfig {
                 transport: McpTransport::Http,
                 command: None,
@@ -1043,7 +1042,7 @@ impl Agent for CodexAgent {
                         }
                         EventMsg::McpToolCallEnd(McpToolCallEndEvent { call_id, invocation, duration, result }) => {
                             info!("MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}", invocation.server, invocation.tool);
-                            self.end_mcp_tool_call(request.session_id.clone(), call_id, invocation, result).await;
+                            self.end_mcp_tool_call(request.session_id.clone(), call_id, result).await;
                         }
                         EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message}) => {
                             info!(
