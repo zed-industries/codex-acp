@@ -1073,17 +1073,26 @@ impl Agent for CodexAgent {
                         EventMsg::TokenCount(..)
                         // we already have a way to diff the turn, so ignore
                         | EventMsg::TurnDiff(..)
-                        | EventMsg::PatchApplyBegin(..)
+                        // returned from Op::ListMcpTools, ignore
+                        | EventMsg::McpListToolsResponse(..)
+                        // returned from Op::ListCustomPrompts, ignore
+                        | EventMsg::ListCustomPromptsResponse(..)
+                        // returned from Op::GetPath, ignore
+                        | EventMsg::ConversationPath(..)
+                        // Used for returning a single history entry
+                        | EventMsg::GetHistoryEntryResponse(..)
+                        // Used for session loading and replay
+                        | EventMsg::SessionConfigured(..)
+                        // used when requesting a code review, ignore for now
+                        | EventMsg::EnteredReviewMode(..)
+                        | EventMsg::ExitedReviewMode(..)
+                        // Revisit when we can emit status updates
+                        | EventMsg::BackgroundEvent(..)
+
+                        // File based events
                         | EventMsg::ApplyPatchApprovalRequest(..)
+                        | EventMsg::PatchApplyBegin(..)
                         | EventMsg::PatchApplyEnd(..)
-                        | EventMsg::ListCustomPromptsResponse(..) // Get slash commands
-                        | EventMsg::ConversationPath(..) // Used for loading history, not needed for prompt
-                        | EventMsg::SessionConfigured(..) // use for loading session and replay
-                        | EventMsg::GetHistoryEntryResponse(..) // use for loading session?
-                        | EventMsg::EnteredReviewMode(..) // Figure out how to handle this..
-                        | EventMsg::ExitedReviewMode(..) // Figure out how to handle this..
-                        | EventMsg::BackgroundEvent(..) // Revisit when we can emit status updates
-                        | EventMsg::McpListToolsResponse(..) // use for /mcp?
                          => {}
                     }
                 }
