@@ -15,12 +15,12 @@ path = "src/lib.rs"
 agent-client-protocol = { git = "https://github.com/zed-industries/agent-client-protocol", rev = "37f6d3b6b5e8ad65ec7df65a05745c20e7b9399e", features = ["unstable"] }
 anyhow = "1"
 async-trait = "0.1"
-codex-arg0 = { git = "https://github.com/zed-industries/codex", rev = "0d9b9d8942b319d62afef3c84ffce273dfb74e28" }
-codex-common = { git = "https://github.com/zed-industries/codex", rev = "0d9b9d8942b319d62afef3c84ffce273dfb74e28", features = ["cli"] }
-codex-core = { git = "https://github.com/zed-industries/codex", rev = "0d9b9d8942b319d62afef3c84ffce273dfb74e28" }
-codex-mcp-server = { git = "https://github.com/zed-industries/codex", rev = "0d9b9d8942b319d62afef3c84ffce273dfb74e28" }
-codex-protocol = { git = "https://github.com/zed-industries/codex", rev = "0d9b9d8942b319d62afef3c84ffce273dfb74e28" }
-mcp-types = { git = "https://github.com/zed-industries/codex", rev = "0d9b9d8942b319d62afef3c84ffce273dfb74e28" }
+codex-arg0 = { git = "https://github.com/zed-industries/codex", rev = "1273935fd810d8b15625820d47163ebc40c6cc7b" }
+codex-common = { git = "https://github.com/zed-industries/codex", rev = "1273935fd810d8b15625820d47163ebc40c6cc7b", features = ["cli"] }
+codex-core = { git = "https://github.com/zed-industries/codex", rev = "1273935fd810d8b15625820d47163ebc40c6cc7b" }
+codex-mcp-server = { git = "https://github.com/zed-industries/codex", rev = "1273935fd810d8b15625820d47163ebc40c6cc7b" }
+codex-protocol = { git = "https://github.com/zed-industries/codex", rev = "1273935fd810d8b15625820d47163ebc40c6cc7b" }
+mcp-types = { git = "https://github.com/zed-industries/codex", rev = "1273935fd810d8b15625820d47163ebc40c6cc7b" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }

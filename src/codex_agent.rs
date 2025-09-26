@@ -43,6 +43,7 @@ use std::{
     collections::HashMap,
     rc::Rc,
     sync::{Arc, LazyLock},
+    time::Duration,
 };
 use tracing::{debug, error, info, warn};
 
@@ -701,7 +702,8 @@ impl Agent for CodexAgent {
                             url: None,
                             messages_url: None,
                             headers: None,
-                            startup_timeout_ms: None,
+                            startup_timeout_sec: None,
+                            tool_timeout_sec: None,
                         },
                     );
                 }
@@ -729,7 +731,8 @@ impl Agent for CodexAgent {
                 url: Some(stream_url),
                 messages_url: Some(messages_url),
                 headers: None,
-                startup_timeout_ms: Some(10_000),
+                startup_timeout_sec: Some(Duration::from_secs(10)),
+                tool_timeout_sec: None,
             },
         );
         acp_http.set_client(self.client()).await;
