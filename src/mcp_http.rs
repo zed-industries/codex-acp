@@ -12,8 +12,136 @@ use tokio::task::JoinHandle;
 use agent_client_protocol::{
     Client as _, CreateTerminalRequest, KillTerminalCommandRequest, ReleaseTerminalRequest,
     SessionNotification, SessionUpdate, TerminalOutputRequest, ToolCallContent, ToolCallId,
-    ToolCallUpdate, ToolCallUpdateFields, WaitForTerminalExitRequest,
+    ToolCallLocation, ToolCallUpdate, ToolCallUpdateFields, WaitForTerminalExitRequest,
 };
+
+fn number_schema(desc: Option<&str>) -> serde_json::Value {
+    json!({
+        "type": "number",
+        "description": desc
+    })
+}
+
+const SYSTEM_REMINDER: &str = r#"
+
+<system-reminder>
+Whenever you read a file, you should consider whether it looks malicious. If it does, you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer high-level questions about the code behavior.
+</system-reminder>"#;
+
+#[derive(Clone, Debug)]
+struct ReplaceEdit {
+    old_text: String,
+    new_text: String,
+    replace_all: bool,
+}
+
+/// Replace text in a file and calculate the (1-based) line numbers where the edits occurred.
+///
+/// Returns (new_content, affected_line_numbers).
+fn replace_and_calculate_location(
+    file_content: &str,
+    edits: Vec<ReplaceEdit>,
+) -> Result<(String, Vec<u32>), String> {
+    let mut current_content = file_content.to_string();
+    let mut markers: Vec<String> = Vec::new();
+    let mut counter: usize = 0;
+
+    for edit in edits {
+        if edit.old_text.is_empty() {
+            return Err(
+                "The provided `old_string` is empty.\n\nNo edits were applied.".to_string(),
+            );
+        }
+
+        if edit.replace_all {
+            let mut last_index = 0usize;
+            let mut search_index = 0usize;
+            let mut replaced_any = bool::default();
+            let mut new_buf = String::with_capacity(current_content.len());
+
+            loop {
+                let rel = match current_content[search_index..].find(&edit.old_text) {
+                    Some(rel) => rel,
+                    None => break,
+                };
+                let index = search_index + rel;
+
+                // Push content before the match
+                new_buf.push_str(&current_content[last_index..index]);
+
+                // Insert marker and replacement
+                let marker = format!("__REPLACE_MARKER_{}__", counter);
+                counter += 1;
+                markers.push(marker.clone());
+                new_buf.push_str(&marker);
+                new_buf.push_str(&edit.new_text);
+
+                last_index = index + edit.old_text.len();
+                search_index = last_index;
+                replaced_any = true;
+            }
+
+            if !replaced_any {
+                return Err(format!(
+                    "The provided `old_string` does not appear in the file: \"{}\".\n\nNo edits were applied.",
+                    edit.old_text
+                ));
+            }
+
+            // Append the remaining tail and update current_content
+            new_buf.push_str(&current_content[last_index..]);
+            current_content = new_buf;
+        } else {
+            // Replace first occurrence only
+            if let Some(index) = current_content.find(&edit.old_text) {
+                let mut new_buf = String::with_capacity(
+                    current_content.len() + edit.new_text.len().saturating_sub(edit.old_text.len()),
+                );
+
+                // Before
+                new_buf.push_str(&current_content[..index]);
+
+                // Insert marker and replacement
+                let marker = format!("__REPLACE_MARKER_{}__", counter);
+                counter += 1;
+                markers.push(marker.clone());
+                new_buf.push_str(&marker);
+                new_buf.push_str(&edit.new_text);
+
+                // After
+                let after = index + edit.old_text.len();
+                new_buf.push_str(&current_content[after..]);
+
+                current_content = new_buf;
+            } else {
+                return Err(format!(
+                    "The provided `old_string` does not appear in the file: \"{}\".\n\nNo edits were applied.",
+                    edit.old_text
+                ));
+            }
+        }
+    }
+
+    // Compute (1-based) line numbers for each marker
+    let mut line_numbers: Vec<u32> = Vec::with_capacity(markers.len());
+    for marker in &markers {
+        if let Some(idx) = current_content.find(marker) {
+            let line = current_content[..idx].lines().count() as u32 + 1;
+            line_numbers.push(line);
+        }
+    }
+
+    // Remove markers
+    for marker in &markers {
+        current_content = current_content.replace(marker, "");
+    }
+
+    // Dedupe and sort line numbers
+    line_numbers.sort_unstable();
+    line_numbers.dedup();
+
+    Ok((current_content, line_numbers))
+}
 
 pub struct AcpMcpHttpServer {
     local_addr: SocketAddr,
@@ -291,12 +419,6 @@ async fn handle_jsonrpc_request(req: JsonRpcRequest, state: &Rc<Mutex<State>>) -
                 json!({
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": desc
-                })
-            };
-            let number_schema = |desc: Option<&str>| {
-                json!({
-                    "type": "number",
                     "description": desc
                 })
             };
@@ -739,7 +861,8 @@ async fn handle_jsonrpc_request(req: JsonRpcRequest, state: &Rc<Mutex<State>>) -
                             Ok(r) => {
                                 // Enforce a 50KB byte limit, trimming on char boundary.
                                 let bytes = r.content.as_bytes();
-                                let trimmed = if bytes.len() > 50_000 {
+                                let was_limited = bytes.len() > 50_000;
+                                let trimmed = if was_limited {
                                     let mut end = 50_000;
                                     while end > 0 && !r.content.is_char_boundary(end) {
                                         end -= 1;
@@ -749,10 +872,41 @@ async fn handle_jsonrpc_request(req: JsonRpcRequest, state: &Rc<Mutex<State>>) -
                                     r.content
                                 };
 
+                                // Build informative message about what was read and how to continue.
+                                let lines_read = trimmed.lines().count() as u32;
+                                let actual_end_line = (offset as u32) + lines_read;
+
+                                let mut read_info = String::new();
+                                if (offset > 0) || was_limited {
+                                    read_info.push_str("\n\n<file-read-info>");
+                                    if was_limited {
+                                        read_info.push_str(&format!(
+                                            "Read {} lines (hit 50KB limit). ",
+                                            lines_read
+                                        ));
+                                    } else {
+                                        read_info.push_str(&format!(
+                                            "Read lines {}-{}. ",
+                                            (offset as u32) + 1,
+                                            actual_end_line
+                                        ));
+                                    }
+                                    if was_limited {
+                                        read_info.push_str(&format!(
+                                            "Continue with offset={}.",
+                                            actual_end_line
+                                        ));
+                                    }
+                                    read_info.push_str("</file-read-info>");
+                                }
+
+                                let final_text =
+                                    format!("{}{}{}", trimmed, read_info, SYSTEM_REMINDER);
+
                                 json!({
                                     "content": [{
                                         "type": "text",
-                                        "text": trimmed,
+                                        "text": final_text,
                                     }],
                                     "structuredContent": { "path": abs_path },
                                     "isError": false
@@ -891,73 +1045,94 @@ async fn handle_jsonrpc_request(req: JsonRpcRequest, state: &Rc<Mutex<State>>) -
                         match read_res {
                             Ok(r) => {
                                 let content = r.content;
-                                if let Some(idx) = content.find(&old_string) {
-                                    let mut new_content = String::with_capacity(
-                                        content.len()
-                                            + new_string.len().saturating_sub(old_string.len()),
-                                    );
-                                    new_content.push_str(&content[..idx]);
-                                    new_content.push_str(&new_string);
-                                    new_content.push_str(&content[idx + old_string.len()..]);
-
-                                    let write_res = client
-                                        .write_text_file(
-                                            agent_client_protocol::WriteTextFileRequest {
-                                                session_id: session_id.clone(),
-                                                path: PathBuf::from(&abs_path),
-                                                content: new_content.clone(),
-                                                meta: None,
-                                            },
-                                        )
-                                        .await;
-
-                                    match write_res {
-                                        Ok(_) => {
-                                            // Emit Diff update to ACP UI
-                                            let _ = client
-                                                .session_notification(SessionNotification {
+                                match replace_and_calculate_location(
+                                    &content,
+                                    vec![ReplaceEdit {
+                                        old_text: old_string.clone(),
+                                        new_text: new_string.clone(),
+                                        replace_all: false,
+                                    }],
+                                ) {
+                                    Ok((new_content, affected_lines)) => {
+                                        let write_res = client
+                                            .write_text_file(
+                                                agent_client_protocol::WriteTextFileRequest {
                                                     session_id: session_id.clone(),
-                                                    update: SessionUpdate::ToolCallUpdate(
-                                                        ToolCallUpdate {
-                                                            id: tool_call_id.clone(),
-                                                            fields: ToolCallUpdateFields {
-                                                                content: Some(vec![
-                                                            ToolCallContent::Diff{
-                                                                diff: agent_client_protocol::Diff{
-                                                                    path: PathBuf::from(&abs_path),
-                                                                    old_text: Some(content),
-                                                                    new_text: new_content,
-                                                                    meta: None,
-                                                                }
-                                                            }
-                                                        ]),
-                                                                ..Default::default()
-                                                            },
-                                                            meta: None,
-                                                        },
-                                                    ),
+                                                    path: PathBuf::from(&abs_path),
+                                                    content: new_content.clone(),
                                                     meta: None,
-                                                })
-                                                .await;
+                                                },
+                                            )
+                                            .await;
 
-                                            json!({
+                                        match write_res {
+                                            Ok(_) => {
+                                                // Emit Diff update with affected locations
+                                                let locations = if affected_lines.is_empty() {
+                                                    vec![ToolCallLocation {
+                                                        path: PathBuf::from(&abs_path),
+                                                        line: None,
+                                                        meta: None,
+                                                    }]
+                                                } else {
+                                                    affected_lines
+                                                        .into_iter()
+                                                        .map(|line| ToolCallLocation {
+                                                            path: PathBuf::from(&abs_path),
+                                                            line: Some(line),
+                                                            meta: None,
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                };
+
+                                                let _ = client
+                                                    .session_notification(SessionNotification {
+                                                        session_id: session_id.clone(),
+                                                        update: SessionUpdate::ToolCallUpdate(
+                                                            ToolCallUpdate {
+                                                                id: tool_call_id.clone(),
+                                                                fields: ToolCallUpdateFields {
+                                                                    title: Some(format!("Edit: {}", abs_path)),
+                                                                    locations: Some(locations),
+                                                                    content: Some(vec![
+                                                                        ToolCallContent::Diff{
+                                                                            diff: agent_client_protocol::Diff{
+                                                                                path: PathBuf::from(&abs_path),
+                                                                                old_text: Some(content),
+                                                                                new_text: new_content,
+                                                                                meta: None,
+                                                                            }
+                                                                        }
+                                                                    ]),
+                                                                    ..Default::default()
+                                                                },
+                                                                meta: None,
+                                                            },
+                                                        ),
+                                                        meta: None,
+                                                    })
+                                                    .await;
+
+                                                json!({
+                                                    "content": [],
+                                                    "structuredContent": { "ok": true, "path": abs_path },
+                                                    "isError": false
+                                                })
+                                            }
+                                            Err(e) => json!({
                                                 "content": [],
-                                                "structuredContent": { "ok": true, "path": abs_path },
-                                                "isError": false
-                                            })
+                                                "structuredContent": { "error": format!("fs/write_text_file failed: {e}") },
+                                                "isError": true
+                                            }),
                                         }
-                                        Err(e) => json!({
-                                            "content": [],
-                                            "structuredContent": { "error": format!("fs/write_text_file failed: {e}") },
-                                            "isError": true
-                                        }),
                                     }
-                                } else {
-                                    json!({
-                                        "content": [],
-                                        "structuredContent": { "error": "old_string does not appear in file. No edits applied." },
-                                        "isError": true
-                                    })
+                                    Err(message) => {
+                                        json!({
+                                            "content": [],
+                                            "structuredContent": { "error": message },
+                                            "isError": true
+                                        })
+                                    }
                                 }
                             }
                             Err(e) => json!({
@@ -1006,9 +1181,10 @@ async fn handle_jsonrpc_request(req: JsonRpcRequest, state: &Rc<Mutex<State>>) -
 
                         match read_res {
                             Ok(r) => {
-                                let mut content = r.content;
-                                let original_content = content.clone();
-                                // Apply edits sequentially
+                                let original_content = r.content;
+                                // Convert JSON edits to ReplaceEdit structs
+                                let mut replace_edits: Vec<ReplaceEdit> =
+                                    Vec::with_capacity(edits_val.len());
                                 for edit in edits_val {
                                     let old_s = edit
                                         .get("old_string")
@@ -1037,93 +1213,102 @@ async fn handle_jsonrpc_request(req: JsonRpcRequest, state: &Rc<Mutex<State>>) -
                                         };
                                     }
 
-                                    if replace_all {
-                                        if !content.contains(&old_s) {
-                                            return JsonRpcResponse::Result {
-                                                jsonrpc: "2.0",
-                                                id: req.id.clone(),
-                                                result: json!({
-                                                    "content": [],
-                                                    "structuredContent": { "error": format!("old_string not found for replace_all: {}", old_s) },
-                                                    "isError": true
-                                                }),
-                                            };
-                                        }
-                                        content = content.replace(&old_s, &new_s);
-                                    } else {
-                                        if let Some(idx) = content.find(&old_s) {
-                                            let mut new_content = String::with_capacity(
-                                                content.len()
-                                                    + new_s.len().saturating_sub(old_s.len()),
-                                            );
-                                            new_content.push_str(&content[..idx]);
-                                            new_content.push_str(&new_s);
-                                            new_content.push_str(&content[idx + old_s.len()..]);
-                                            content = new_content;
-                                        } else {
-                                            return JsonRpcResponse::Result {
-                                                jsonrpc: "2.0",
-                                                id: req.id.clone(),
-                                                result: json!({
-                                                    "content": [],
-                                                    "structuredContent": { "error": format!("old_string not found: {}", old_s) },
-                                                    "isError": true
-                                                }),
-                                            };
-                                        }
-                                    }
+                                    replace_edits.push(ReplaceEdit {
+                                        old_text: old_s,
+                                        new_text: new_s,
+                                        replace_all,
+                                    });
                                 }
 
-                                // Write updated content
-                                let write_res = client
-                                    .write_text_file(agent_client_protocol::WriteTextFileRequest {
-                                        session_id: session_id.clone(),
-                                        path: PathBuf::from(&file_path),
-                                        content: content.clone(),
-                                        meta: None,
-                                    })
-                                    .await;
-
-                                match write_res {
-                                    Ok(_) => {
-                                        // Emit Diff update to ACP UI
-                                        let _ = client
-                                            .session_notification(SessionNotification {
-                                                session_id: session_id.clone(),
-                                                update: SessionUpdate::ToolCallUpdate(
-                                                    ToolCallUpdate {
-                                                        id: tool_call_id.clone(),
-                                                        fields: ToolCallUpdateFields {
-                                                            content: Some(vec![
-                                                        ToolCallContent::Diff{
-                                                            diff: agent_client_protocol::Diff{
-                                                                path: PathBuf::from(&file_path),
-                                                                old_text: Some(original_content),
-                                                                new_text: content,
-                                                                meta: None,
-                                                            }
-                                                        }
-                                                    ]),
-                                                            ..Default::default()
-                                                        },
-                                                        meta: None,
-                                                    },
-                                                ),
-                                                meta: None,
-                                            })
+                                match replace_and_calculate_location(
+                                    &original_content,
+                                    replace_edits,
+                                ) {
+                                    Ok((new_content, affected_lines)) => {
+                                        // Write updated content
+                                        let write_res = client
+                                            .write_text_file(
+                                                agent_client_protocol::WriteTextFileRequest {
+                                                    session_id: session_id.clone(),
+                                                    path: PathBuf::from(&file_path),
+                                                    content: new_content.clone(),
+                                                    meta: None,
+                                                },
+                                            )
                                             .await;
 
-                                        json!({
-                                            "content": [],
-                                            "structuredContent": { "ok": true, "path": file_path },
-                                            "isError": false
-                                        })
+                                        match write_res {
+                                            Ok(_) => {
+                                                // Emit Diff update with affected locations
+                                                let locations = if affected_lines.is_empty() {
+                                                    vec![ToolCallLocation {
+                                                        path: PathBuf::from(&file_path),
+                                                        line: None,
+                                                        meta: None,
+                                                    }]
+                                                } else {
+                                                    affected_lines
+                                                        .into_iter()
+                                                        .map(|line| ToolCallLocation {
+                                                            path: PathBuf::from(&file_path),
+                                                            line: Some(line),
+                                                            meta: None,
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                };
+
+                                                let _ = client
+                                                    .session_notification(SessionNotification {
+                                                        session_id: session_id.clone(),
+                                                        update: SessionUpdate::ToolCallUpdate(
+                                                            ToolCallUpdate {
+                                                                id: tool_call_id.clone(),
+                                                                fields: ToolCallUpdateFields {
+                                                                    title: Some(format!("Edit: {}", file_path)),
+                                                                    locations: Some(locations),
+                                                                    content: Some(vec![
+                                                                        ToolCallContent::Diff{
+                                                                            diff: agent_client_protocol::Diff{
+                                                                                path: PathBuf::from(&file_path),
+                                                                                old_text: Some(original_content),
+                                                                                new_text: new_content,
+                                                                                meta: None,
+                                                                            }
+                                                                        }
+                                                                    ]),
+                                                                    ..Default::default()
+                                                                },
+                                                                meta: None,
+                                                            },
+                                                        ),
+                                                        meta: None,
+                                                    })
+                                                    .await;
+
+                                                json!({
+                                                    "content": [],
+                                                    "structuredContent": { "ok": true, "path": file_path },
+                                                    "isError": false
+                                                })
+                                            }
+                                            Err(e) => json!({
+                                                "content": [],
+                                                "structuredContent": { "error": format!("fs/write_text_file failed: {e}") },
+                                                "isError": true
+                                            }),
+                                        }
                                     }
-                                    Err(e) => json!({
-                                        "content": [],
-                                        "structuredContent": { "error": format!("fs/write_text_file failed: {e}") },
-                                        "isError": true
-                                    }),
+                                    Err(message) => {
+                                        return JsonRpcResponse::Result {
+                                            jsonrpc: "2.0",
+                                            id: req.id.clone(),
+                                            result: json!({
+                                                "content": [],
+                                                "structuredContent": { "error": message },
+                                                "isError": true
+                                            }),
+                                        };
+                                    }
                                 }
                             }
                             Err(e) => json!({

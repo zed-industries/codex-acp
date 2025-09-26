@@ -292,7 +292,77 @@ impl CodexAgent {
     ) {
         // Create a ToolCall so subsequent ToolCallUpdate (e.g. terminal embedding) can attach by id.
         let tool_call_id = ToolCallId(call_id.clone().into());
-        let title = format!("Tool: {}/{}", invocation.server, invocation.tool);
+        let (kind, title, locations) = {
+            let tool = invocation.tool.as_str();
+            let args = invocation.arguments.as_ref();
+            let (path_opt, line_opt): (Option<std::path::PathBuf>, Option<u32>) =
+                if let Some(args) = args {
+                    let abs_path = args.get("abs_path").and_then(|v| v.as_str());
+                    let file_path = args.get("file_path").and_then(|v| v.as_str());
+                    let path = abs_path.or(file_path).map(|s| std::path::PathBuf::from(s));
+                    let offset_line = args
+                        .get("offset")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| (n as u32) + 1);
+                    (path, offset_line)
+                } else {
+                    (None, None)
+                };
+            match tool {
+                "read" => {
+                    let t = match &path_opt {
+                        Some(p) => format!("Read {}", p.display()),
+                        None => "Read".to_string(),
+                    };
+                    let locs = path_opt
+                        .map(|p| {
+                            vec![ToolCallLocation {
+                                path: p,
+                                line: line_opt,
+                                meta: None,
+                            }]
+                        })
+                        .unwrap_or_default();
+                    (ToolKind::Read, t, locs)
+                }
+                "write" => {
+                    let t = match &path_opt {
+                        Some(p) => format!("Write {}", p.display()),
+                        None => "Write".to_string(),
+                    };
+                    let locs = path_opt
+                        .map(|p| {
+                            vec![ToolCallLocation {
+                                path: p,
+                                line: None,
+                                meta: None,
+                            }]
+                        })
+                        .unwrap_or_default();
+                    (ToolKind::Edit, t, locs)
+                }
+                "edit" | "multi_edit" => {
+                    let t = match &path_opt {
+                        Some(p) => format!("Edit {}", p.display()),
+                        None => "Edit".to_string(),
+                    };
+                    let locs = path_opt
+                        .map(|p| {
+                            vec![ToolCallLocation {
+                                path: p,
+                                line: None,
+                                meta: None,
+                            }]
+                        })
+                        .unwrap_or_default();
+                    (ToolKind::Edit, t, locs)
+                }
+                _ => {
+                    let t = format!("Tool: {}/{}", invocation.server, invocation.tool);
+                    (ToolKind::Execute, t, Vec::new())
+                }
+            }
+        };
         let raw_input = Some(serde_json::json!({
             "server": invocation.server,
             "tool": invocation.tool,
@@ -303,10 +373,10 @@ impl CodexAgent {
             SessionUpdate::ToolCall(ToolCall {
                 id: tool_call_id,
                 title,
-                kind: ToolKind::Execute,
+                kind,
                 status: ToolCallStatus::InProgress,
                 content: vec![],
-                locations: vec![],
+                locations,
                 raw_input,
                 raw_output: None,
                 meta: None,
