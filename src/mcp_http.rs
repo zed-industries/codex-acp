@@ -278,7 +278,7 @@ async fn handle_jsonrpc_request(req: JsonRpcRequest, state: &Rc<Mutex<State>>) -
             }
         }
 
-        // List our terminal tools (bash, bash_output, kill_bash)
+        // List our terminal tools (bash, bash_output, kill_bash) and file tools (read, write, edit, multi_edit)
         "tools/list" => {
             // JSON Schema helper constructors
             let string_schema = |desc: Option<&str>| {
@@ -291,6 +291,12 @@ async fn handle_jsonrpc_request(req: JsonRpcRequest, state: &Rc<Mutex<State>>) -
                 json!({
                     "type": "array",
                     "items": { "type": "string" },
+                    "description": desc
+                })
+            };
+            let number_schema = |desc: Option<&str>| {
+                json!({
+                    "type": "number",
                     "description": desc
                 })
             };
@@ -327,8 +333,6 @@ async fn handle_jsonrpc_request(req: JsonRpcRequest, state: &Rc<Mutex<State>>) -
                     "required": ["terminal_id"],
                     "additionalProperties": false
                 }
-
-
             });
 
             // kill_bash tool schema
@@ -345,8 +349,83 @@ async fn handle_jsonrpc_request(req: JsonRpcRequest, state: &Rc<Mutex<State>>) -
                 }
             });
 
+            // file read tool schema
+            let read_tool = json!({
+                "name": "read",
+                "description": "Read a range of lines from a file by absolute path.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "abs_path": string_schema(Some("Absolute path to the file to read.")),
+                        "offset": number_schema(Some("0-based line index to start reading from (omit for 0).")),
+                        "linesToRead": number_schema(Some("Number of lines to read (default 1000)."))
+                    },
+                    "required": ["abs_path"],
+                    "additionalProperties": false
+                }
+            });
+
+            // file write tool schema
+            let write_tool = json!({
+                "name": "write",
+                "description": "Write the full content to the specified file (by absolute path).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "abs_path": string_schema(Some("Absolute path to the file to write.")),
+                        "content": string_schema(Some("Full content to write to the file."))
+                    },
+                    "required": ["abs_path", "content"],
+                    "additionalProperties": false
+                }
+            });
+
+            // file edit tool schema
+            let edit_tool = json!({
+                "name": "edit",
+                "description": "Edit a file by replacing the first occurrence of old_string with new_string.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "abs_path": string_schema(Some("Absolute path to the file to edit.")),
+                        "old_string": string_schema(Some("The exact text to replace (must appear in file).")),
+                        "new_string": string_schema(Some("The replacement text."))
+                    },
+                    "required": ["abs_path", "old_string", "new_string"],
+                    "additionalProperties": false
+                }
+            });
+
+            // file multi_edit tool schema
+            let multi_edit_tool = json!({
+                "name": "multi_edit",
+                "description": "Apply multiple sequential edits to a file.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": string_schema(Some("Absolute path to the file to modify.")),
+                        "edits": {
+                            "type": "array",
+                            "description": "Sequential edits to apply.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "old_string": string_schema(Some("The text to replace.")),
+                                    "new_string": string_schema(Some("The replacement text.")),
+                                    "replace_all": { "type": "boolean", "description": "Replace all occurrences (default false)." }
+                                },
+                                "required": ["old_string", "new_string"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["file_path", "edits"],
+                    "additionalProperties": false
+                }
+            });
+
             let result = json!({
-                "tools": [bash_tool, bash_output_tool, kill_bash_tool]
+                "tools": [bash_tool, bash_output_tool, kill_bash_tool, read_tool, write_tool, edit_tool, multi_edit_tool]
             });
             JsonRpcResponse::Result {
                 jsonrpc: "2.0",
@@ -620,6 +699,442 @@ async fn handle_jsonrpc_request(req: JsonRpcRequest, state: &Rc<Mutex<State>>) -
                         "isError": false
                     })
                 }
+
+                // FILE TOOLS
+                "read" => {
+                    let abs_path = args
+                        .get("abs_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if abs_path.is_empty() {
+                        json!({
+                            "content": [],
+                            "structuredContent": { "error": "abs_path is required" },
+                            "isError": true
+                        })
+                    } else {
+                        let offset: usize = args
+                            .get("offset")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as usize)
+                            .unwrap_or(0);
+                        let lines_to_read: u32 = args
+                            .get("linesToRead")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as u32)
+                            .unwrap_or(1000);
+
+                        let res = client
+                            .read_text_file(agent_client_protocol::ReadTextFileRequest {
+                                session_id: session_id.clone(),
+                                path: PathBuf::from(&abs_path),
+                                line: Some((offset as u32) + 1),
+                                limit: Some(lines_to_read),
+                                meta: None,
+                            })
+                            .await;
+
+                        match res {
+                            Ok(r) => {
+                                // Enforce a 50KB byte limit, trimming on char boundary.
+                                let bytes = r.content.as_bytes();
+                                let trimmed = if bytes.len() > 50_000 {
+                                    let mut end = 50_000;
+                                    while end > 0 && !r.content.is_char_boundary(end) {
+                                        end -= 1;
+                                    }
+                                    r.content[..end].to_string()
+                                } else {
+                                    r.content
+                                };
+
+                                json!({
+                                    "content": [{
+                                        "type": "text",
+                                        "text": trimmed,
+                                    }],
+                                    "structuredContent": { "path": abs_path },
+                                    "isError": false
+                                })
+                            }
+                            Err(e) => json!({
+                                "content": [],
+                                "structuredContent": { "error": format!("fs/read_text_file failed: {e}") },
+                                "isError": true
+                            }),
+                        }
+                    }
+                }
+
+                "write" => {
+                    let abs_path = args
+                        .get("abs_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let new_content = args
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if abs_path.is_empty() {
+                        json!({
+                            "content": [],
+                            "structuredContent": { "error": "abs_path is required" },
+                            "isError": true
+                        })
+                    } else {
+                        // Try to read old content (best effort)
+                        let old = client
+                            .read_text_file(agent_client_protocol::ReadTextFileRequest {
+                                session_id: session_id.clone(),
+                                path: PathBuf::from(&abs_path),
+                                line: None,
+                                limit: None,
+                                meta: None,
+                            })
+                            .await
+                            .ok()
+                            .map(|r| r.content);
+
+                        // Write new content
+                        let write_res = client
+                            .write_text_file(agent_client_protocol::WriteTextFileRequest {
+                                session_id: session_id.clone(),
+                                path: PathBuf::from(&abs_path),
+                                content: new_content.clone(),
+                                meta: None,
+                            })
+                            .await;
+
+                        match write_res {
+                            Ok(_) => {
+                                // Emit Diff update to ACP UI
+                                let _ = client
+                                    .session_notification(SessionNotification {
+                                        session_id: session_id.clone(),
+                                        update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                                            id: tool_call_id.clone(),
+                                            fields: ToolCallUpdateFields {
+                                                content: Some(vec![ToolCallContent::Diff {
+                                                    diff: agent_client_protocol::Diff {
+                                                        path: PathBuf::from(&abs_path),
+                                                        old_text: old,
+                                                        new_text: new_content,
+                                                        meta: None,
+                                                    },
+                                                }]),
+                                                ..Default::default()
+                                            },
+                                            meta: None,
+                                        }),
+                                        meta: None,
+                                    })
+                                    .await;
+
+                                json!({
+                                    "content": [],
+                                    "structuredContent": { "ok": true, "path": abs_path },
+                                    "isError": false
+                                })
+                            }
+                            Err(e) => json!({
+                                "content": [],
+                                "structuredContent": { "error": format!("fs/write_text_file failed: {e}") },
+                                "isError": true
+                            }),
+                        }
+                    }
+                }
+
+                "edit" => {
+                    let abs_path = args
+                        .get("abs_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let old_string = args
+                        .get("old_string")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let new_string = args
+                        .get("new_string")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+
+                    if abs_path.is_empty() {
+                        json!({
+                            "content": [],
+                            "structuredContent": { "error": "abs_path is required" },
+                            "isError": true
+                        })
+                    } else if old_string.is_empty() {
+                        json!({
+                            "content": [],
+                            "structuredContent": { "error": "old_string must not be empty" },
+                            "isError": true
+                        })
+                    } else {
+                        let read_res = client
+                            .read_text_file(agent_client_protocol::ReadTextFileRequest {
+                                session_id: session_id.clone(),
+                                path: PathBuf::from(&abs_path),
+                                line: None,
+                                limit: None,
+                                meta: None,
+                            })
+                            .await;
+
+                        match read_res {
+                            Ok(r) => {
+                                let content = r.content;
+                                if let Some(idx) = content.find(&old_string) {
+                                    let mut new_content = String::with_capacity(
+                                        content.len()
+                                            + new_string.len().saturating_sub(old_string.len()),
+                                    );
+                                    new_content.push_str(&content[..idx]);
+                                    new_content.push_str(&new_string);
+                                    new_content.push_str(&content[idx + old_string.len()..]);
+
+                                    let write_res = client
+                                        .write_text_file(
+                                            agent_client_protocol::WriteTextFileRequest {
+                                                session_id: session_id.clone(),
+                                                path: PathBuf::from(&abs_path),
+                                                content: new_content.clone(),
+                                                meta: None,
+                                            },
+                                        )
+                                        .await;
+
+                                    match write_res {
+                                        Ok(_) => {
+                                            // Emit Diff update to ACP UI
+                                            let _ = client
+                                                .session_notification(SessionNotification {
+                                                    session_id: session_id.clone(),
+                                                    update: SessionUpdate::ToolCallUpdate(
+                                                        ToolCallUpdate {
+                                                            id: tool_call_id.clone(),
+                                                            fields: ToolCallUpdateFields {
+                                                                content: Some(vec![
+                                                            ToolCallContent::Diff{
+                                                                diff: agent_client_protocol::Diff{
+                                                                    path: PathBuf::from(&abs_path),
+                                                                    old_text: Some(content),
+                                                                    new_text: new_content,
+                                                                    meta: None,
+                                                                }
+                                                            }
+                                                        ]),
+                                                                ..Default::default()
+                                                            },
+                                                            meta: None,
+                                                        },
+                                                    ),
+                                                    meta: None,
+                                                })
+                                                .await;
+
+                                            json!({
+                                                "content": [],
+                                                "structuredContent": { "ok": true, "path": abs_path },
+                                                "isError": false
+                                            })
+                                        }
+                                        Err(e) => json!({
+                                            "content": [],
+                                            "structuredContent": { "error": format!("fs/write_text_file failed: {e}") },
+                                            "isError": true
+                                        }),
+                                    }
+                                } else {
+                                    json!({
+                                        "content": [],
+                                        "structuredContent": { "error": "old_string does not appear in file. No edits applied." },
+                                        "isError": true
+                                    })
+                                }
+                            }
+                            Err(e) => json!({
+                                "content": [],
+                                "structuredContent": { "error": format!("fs/read_text_file failed: {e}") },
+                                "isError": true
+                            }),
+                        }
+                    }
+                }
+
+                "multi_edit" => {
+                    let file_path = args
+                        .get("file_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let edits_val = args
+                        .get("edits")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+
+                    if file_path.is_empty() {
+                        json!({
+                            "content": [],
+                            "structuredContent": { "error": "file_path is required" },
+                            "isError": true
+                        })
+                    } else if edits_val.is_empty() {
+                        json!({
+                            "content": [],
+                            "structuredContent": { "error": "edits must be a non-empty array" },
+                            "isError": true
+                        })
+                    } else {
+                        let read_res = client
+                            .read_text_file(agent_client_protocol::ReadTextFileRequest {
+                                session_id: session_id.clone(),
+                                path: PathBuf::from(&file_path),
+                                line: None,
+                                limit: None,
+                                meta: None,
+                            })
+                            .await;
+
+                        match read_res {
+                            Ok(r) => {
+                                let mut content = r.content;
+                                let original_content = content.clone();
+                                // Apply edits sequentially
+                                for edit in edits_val {
+                                    let old_s = edit
+                                        .get("old_string")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    let new_s = edit
+                                        .get("new_string")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    let replace_all = edit
+                                        .get("replace_all")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+
+                                    if old_s.is_empty() {
+                                        return JsonRpcResponse::Result {
+                                            jsonrpc: "2.0",
+                                            id: req.id.clone(),
+                                            result: json!({
+                                                "content": [],
+                                                "structuredContent": { "error": "one of the edits has empty old_string" },
+                                                "isError": true
+                                            }),
+                                        };
+                                    }
+
+                                    if replace_all {
+                                        if !content.contains(&old_s) {
+                                            return JsonRpcResponse::Result {
+                                                jsonrpc: "2.0",
+                                                id: req.id.clone(),
+                                                result: json!({
+                                                    "content": [],
+                                                    "structuredContent": { "error": format!("old_string not found for replace_all: {}", old_s) },
+                                                    "isError": true
+                                                }),
+                                            };
+                                        }
+                                        content = content.replace(&old_s, &new_s);
+                                    } else {
+                                        if let Some(idx) = content.find(&old_s) {
+                                            let mut new_content = String::with_capacity(
+                                                content.len()
+                                                    + new_s.len().saturating_sub(old_s.len()),
+                                            );
+                                            new_content.push_str(&content[..idx]);
+                                            new_content.push_str(&new_s);
+                                            new_content.push_str(&content[idx + old_s.len()..]);
+                                            content = new_content;
+                                        } else {
+                                            return JsonRpcResponse::Result {
+                                                jsonrpc: "2.0",
+                                                id: req.id.clone(),
+                                                result: json!({
+                                                    "content": [],
+                                                    "structuredContent": { "error": format!("old_string not found: {}", old_s) },
+                                                    "isError": true
+                                                }),
+                                            };
+                                        }
+                                    }
+                                }
+
+                                // Write updated content
+                                let write_res = client
+                                    .write_text_file(agent_client_protocol::WriteTextFileRequest {
+                                        session_id: session_id.clone(),
+                                        path: PathBuf::from(&file_path),
+                                        content: content.clone(),
+                                        meta: None,
+                                    })
+                                    .await;
+
+                                match write_res {
+                                    Ok(_) => {
+                                        // Emit Diff update to ACP UI
+                                        let _ = client
+                                            .session_notification(SessionNotification {
+                                                session_id: session_id.clone(),
+                                                update: SessionUpdate::ToolCallUpdate(
+                                                    ToolCallUpdate {
+                                                        id: tool_call_id.clone(),
+                                                        fields: ToolCallUpdateFields {
+                                                            content: Some(vec![
+                                                        ToolCallContent::Diff{
+                                                            diff: agent_client_protocol::Diff{
+                                                                path: PathBuf::from(&file_path),
+                                                                old_text: Some(original_content),
+                                                                new_text: content,
+                                                                meta: None,
+                                                            }
+                                                        }
+                                                    ]),
+                                                            ..Default::default()
+                                                        },
+                                                        meta: None,
+                                                    },
+                                                ),
+                                                meta: None,
+                                            })
+                                            .await;
+
+                                        json!({
+                                            "content": [],
+                                            "structuredContent": { "ok": true, "path": file_path },
+                                            "isError": false
+                                        })
+                                    }
+                                    Err(e) => json!({
+                                        "content": [],
+                                        "structuredContent": { "error": format!("fs/write_text_file failed: {e}") },
+                                        "isError": true
+                                    }),
+                                }
+                            }
+                            Err(e) => json!({
+                                "content": [],
+                                "structuredContent": { "error": format!("fs/read_text_file failed: {e}") },
+                                "isError": true
+                            }),
+                        }
+                    }
+                }
+
                 // Unknown tool name
                 other => {
                     json!({

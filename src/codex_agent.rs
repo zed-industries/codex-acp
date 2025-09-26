@@ -739,6 +739,7 @@ impl Agent for CodexAgent {
             OpenAiToolId::ExecCommand,
             OpenAiToolId::WriteStdin,
             OpenAiToolId::UnifiedExec,
+            OpenAiToolId::ApplyPatch,
         ]);
 
         // Propagate any client-provided MCP servers that codex-rs supports.
