@@ -1,6 +1,6 @@
 use agent_client_protocol::{
     Agent, AgentCapabilities, AgentSideConnection, Annotations, AudioContent, AuthenticateRequest,
-    AuthenticateResponse, BlobResourceContents, CancelNotification, Client, ContentBlock,
+    AuthenticateResponse, BlobResourceContents, CancelNotification, Client, ContentBlock, Diff,
     EmbeddedResource, EmbeddedResourceResource, Error, ExtNotification, ExtRequest, ExtResponse,
     ImageContent, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
     McpCapabilities, McpServer, ModelId, ModelInfo, NewSessionRequest, NewSessionResponse,
@@ -25,8 +25,9 @@ use codex_core::{
     protocol::{
         AgentMessageDeltaEvent, AgentMessageEvent, AgentReasoningDeltaEvent, AgentReasoningEvent,
         AgentReasoningRawContentDeltaEvent, AgentReasoningRawContentEvent,
-        AgentReasoningSectionBreakEvent, ErrorEvent, ExecApprovalRequestEvent,
-        ExecCommandBeginEvent, McpInvocation, McpToolCallBeginEvent, McpToolCallEndEvent,
+        AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ErrorEvent,
+        ExecApprovalRequestEvent, ExecCommandBeginEvent, FileChange, McpInvocation,
+        McpToolCallBeginEvent, McpToolCallEndEvent, PatchApplyBeginEvent, PatchApplyEndEvent,
         ReviewDecision, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent,
         UserMessageEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
@@ -36,10 +37,12 @@ use codex_protocol::{
     mcp_protocol::ConversationId,
     protocol::{EventMsg, InputItem, Op},
 };
+use itertools::Itertools;
 use mcp_types::CallToolResult;
 use std::{
     cell::{OnceCell, RefCell},
     collections::HashMap,
+    path::PathBuf,
     rc::Rc,
     sync::{Arc, LazyLock},
 };
@@ -523,8 +526,8 @@ impl CodexAgent {
                         meta: None,
                     },
                     PermissionOption {
-                        id: PermissionOptionId("denied".into()),
-                        name: "No".into(),
+                        id: PermissionOptionId("abort".into()),
+                        name: "No, provide feedback".into(),
                         kind: PermissionOptionKind::RejectOnce,
                         meta: None,
                     },
@@ -538,7 +541,7 @@ impl CodexAgent {
             RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
                 "approved-for-session" => ReviewDecision::ApprovedForSession,
                 "approved" => ReviewDecision::Approved,
-                _ => ReviewDecision::Denied,
+                _ => ReviewDecision::Abort,
             },
         };
 
@@ -550,6 +553,181 @@ impl CodexAgent {
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
         Ok(())
+    }
+
+    async fn patch_approval(
+        &self,
+        session_id: SessionId,
+        submission_id: String,
+        event: ApplyPatchApprovalRequestEvent,
+    ) -> Result<(), Error> {
+        let raw_input = serde_json::json!(&event);
+        let ApplyPatchApprovalRequestEvent {
+            call_id,
+            changes,
+            reason,
+            // grant_root doesn't seem to be set anywhere on the codex side
+            grant_root: _,
+        } = event;
+        let conversation = self.get_conversation(&session_id).await?;
+        let (title, locations, content) = Self::extract_tool_call_content_from_changes(changes);
+        let response = self
+            .client()
+            .request_permission(RequestPermissionRequest {
+                session_id,
+                tool_call: ToolCallUpdate {
+                    id: ToolCallId(call_id.into()),
+                    fields: ToolCallUpdateFields {
+                        kind: Some(ToolKind::Edit),
+                        status: Some(ToolCallStatus::Pending),
+                        title: Some(title),
+                        locations: Some(locations),
+                        content: Some(
+                            content
+                                .chain(
+                                    reason.map(|r| ToolCallContent::Content { content: r.into() }),
+                                )
+                                .collect(),
+                        ),
+                        raw_input: Some(raw_input),
+                        ..Default::default()
+                    },
+                    meta: None,
+                },
+                options: vec![
+                    PermissionOption {
+                        id: PermissionOptionId("approved".into()),
+                        name: "Yes".into(),
+                        kind: PermissionOptionKind::AllowOnce,
+                        meta: None,
+                    },
+                    PermissionOption {
+                        id: PermissionOptionId("abort".into()),
+                        name: "No, provide feedback".into(),
+                        kind: PermissionOptionKind::RejectOnce,
+                        meta: None,
+                    },
+                ],
+                meta: None,
+            })
+            .await?;
+
+        let decision = match response.outcome {
+            RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
+            RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
+                "approved" => ReviewDecision::Approved,
+                _ => ReviewDecision::Abort,
+            },
+        };
+        conversation
+            .submit(Op::PatchApproval {
+                id: submission_id,
+                decision,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        Ok(())
+    }
+
+    async fn start_patch_apply(&self, session_id: SessionId, event: PatchApplyBeginEvent) {
+        let raw_input = serde_json::json!(&event);
+        let PatchApplyBeginEvent {
+            call_id,
+            auto_approved: _,
+            changes,
+        } = event;
+
+        let (title, locations, content) = Self::extract_tool_call_content_from_changes(changes);
+
+        let update = SessionUpdate::ToolCall(ToolCall {
+            id: ToolCallId(call_id.into()),
+            title,
+            kind: ToolKind::Edit,
+            status: ToolCallStatus::InProgress,
+            locations,
+            content: content.collect(),
+            raw_input: Some(raw_input),
+            raw_output: None,
+            meta: None,
+        });
+        self.send_notification(session_id, update).await;
+    }
+
+    async fn end_patch_apply(&self, session_id: SessionId, event: PatchApplyEndEvent) {
+        let raw_output = serde_json::json!(&event);
+        let PatchApplyEndEvent {
+            call_id,
+            stdout: _,
+            stderr: _,
+            success,
+        } = event;
+
+        let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+            id: ToolCallId(call_id.into()),
+            fields: ToolCallUpdateFields {
+                status: Some(if success {
+                    ToolCallStatus::Completed
+                } else {
+                    ToolCallStatus::Failed
+                }),
+                raw_output: Some(raw_output),
+                ..Default::default()
+            },
+            meta: None,
+        });
+        self.send_notification(session_id, update).await;
+    }
+
+    fn extract_tool_call_content_from_changes(
+        changes: HashMap<PathBuf, FileChange>,
+    ) -> (
+        String,
+        Vec<ToolCallLocation>,
+        impl Iterator<Item = ToolCallContent>,
+    ) {
+        (
+            format!(
+                "Edit {}",
+                changes.keys().map(|p| p.display().to_string()).join(", ")
+            ),
+            changes
+                .keys()
+                .map(|p| ToolCallLocation {
+                    path: p.clone(),
+                    line: None,
+                    meta: None,
+                })
+                .collect(),
+            changes
+                .into_iter()
+                .map(|(path, change)| ToolCallContent::Diff {
+                    diff: match change {
+                        codex_core::protocol::FileChange::Add { content } => Diff {
+                            path,
+                            old_text: None,
+                            new_text: content,
+                            meta: None,
+                        },
+                        codex_core::protocol::FileChange::Delete { content } => Diff {
+                            path,
+                            old_text: Some(content),
+                            new_text: String::new(),
+                            meta: None,
+                        },
+                        codex_core::protocol::FileChange::Update {
+                            unified_diff: _,
+                            move_path,
+                            old_content,
+                            new_content,
+                        } => Diff {
+                            path: move_path.unwrap_or(path),
+                            old_text: Some(old_content),
+                            new_text: new_content,
+                            meta: None,
+                        },
+                    },
+                }),
+        )
     }
 
     fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<InputItem> {
@@ -644,6 +822,8 @@ impl Agent for CodexAgent {
         let mut config = self.config.clone();
         // Allows us to support HTTP MCP servers
         config.use_experimental_use_rmcp_client = true;
+        // Make sure we are going through the `apply_patch` code path
+        config.include_apply_patch_tool = true;
         config.cwd.clone_from(&cwd);
 
         // Propagate any client-provided MCP servers that codex-rs supports.
@@ -1004,6 +1184,19 @@ impl Agent for CodexAgent {
                             info!("MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}", invocation.server, invocation.tool);
                             self.end_mcp_tool_call(request.session_id.clone(), call_id, result).await;
                         }
+                        // File based events
+                        EventMsg::ApplyPatchApprovalRequest(event) => {
+                            info!("Apply patch approval request: call_id={}, reason={:?}", event.call_id, event.reason);
+                            self.patch_approval(request.session_id.clone(), submission_id.clone(), event).await?;
+                        }
+                        EventMsg::PatchApplyBegin(event) => {
+                            info!("Patch apply begin: call_id={}, auto_approved={}", event.call_id,event.auto_approved);
+                            self.start_patch_apply(request.session_id.clone(), event).await;
+                        }
+                        EventMsg::PatchApplyEnd(event) => {
+                            info!("Patch apply end: call_id={}, success={}", event.call_id, event.success);
+                            self.end_patch_apply(request.session_id.clone(), event).await;
+                        }
                         EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message}) => {
                             info!(
                                 "Task completed successfully after {event_count} events. Last agent message: {last_agent_message:?}",
@@ -1044,13 +1237,7 @@ impl Agent for CodexAgent {
                         | EventMsg::EnteredReviewMode(..)
                         | EventMsg::ExitedReviewMode(..)
                         // Revisit when we can emit status updates
-                        | EventMsg::BackgroundEvent(..)
-
-                        // File based events
-                        | EventMsg::ApplyPatchApprovalRequest(..)
-                        | EventMsg::PatchApplyBegin(..)
-                        | EventMsg::PatchApplyEnd(..)
-                         => {}
+                        | EventMsg::BackgroundEvent(..) => {}
                     }
                 }
                 Err(e) => {

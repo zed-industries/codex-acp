@@ -431,6 +431,7 @@ dependencies = [
  "codex-core",
  "codex-mcp-server",
  "codex-protocol",
+ "itertools",
  "mcp-types",
  "serde",
  "serde_json",
@@ -443,7 +444,7 @@ dependencies = [
 [[package]]
 name = "codex-apply-patch"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?rev=c4120a265b9444587d6c69e170b64d2440274e10#c4120a265b9444587d6c69e170b64d2440274e10"
+source = "git+https://github.com/zed-industries/codex?branch=acp#324f5fd26e92fbe14c59ae1ea9d4434fb09c386b"
 dependencies = [
  "anyhow",
  "similar",
@@ -455,7 +456,7 @@ dependencies = [
 [[package]]
 name = "codex-arg0"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?rev=c4120a265b9444587d6c69e170b64d2440274e10#c4120a265b9444587d6c69e170b64d2440274e10"
+source = "git+https://github.com/zed-industries/codex?branch=acp#324f5fd26e92fbe14c59ae1ea9d4434fb09c386b"
 dependencies = [
  "anyhow",
  "codex-apply-patch",
@@ -469,7 +470,7 @@ dependencies = [
 [[package]]
 name = "codex-common"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?rev=c4120a265b9444587d6c69e170b64d2440274e10#c4120a265b9444587d6c69e170b64d2440274e10"
+source = "git+https://github.com/zed-industries/codex?branch=acp#324f5fd26e92fbe14c59ae1ea9d4434fb09c386b"
 dependencies = [
  "clap",
  "codex-core",
@@ -481,7 +482,7 @@ dependencies = [
 [[package]]
 name = "codex-core"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?rev=c4120a265b9444587d6c69e170b64d2440274e10#c4120a265b9444587d6c69e170b64d2440274e10"
+source = "git+https://github.com/zed-industries/codex?branch=acp#324f5fd26e92fbe14c59ae1ea9d4434fb09c386b"
 dependencies = [
  "anyhow",
  "askama",
@@ -534,7 +535,7 @@ dependencies = [
 [[package]]
 name = "codex-file-search"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?rev=c4120a265b9444587d6c69e170b64d2440274e10#c4120a265b9444587d6c69e170b64d2440274e10"
+source = "git+https://github.com/zed-industries/codex?branch=acp#324f5fd26e92fbe14c59ae1ea9d4434fb09c386b"
 dependencies = [
  "anyhow",
  "clap",
@@ -548,7 +549,7 @@ dependencies = [
 [[package]]
 name = "codex-linux-sandbox"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?rev=c4120a265b9444587d6c69e170b64d2440274e10#c4120a265b9444587d6c69e170b64d2440274e10"
+source = "git+https://github.com/zed-industries/codex?branch=acp#324f5fd26e92fbe14c59ae1ea9d4434fb09c386b"
 dependencies = [
  "clap",
  "codex-core",
@@ -560,7 +561,7 @@ dependencies = [
 [[package]]
 name = "codex-login"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?rev=c4120a265b9444587d6c69e170b64d2440274e10#c4120a265b9444587d6c69e170b64d2440274e10"
+source = "git+https://github.com/zed-industries/codex?branch=acp#324f5fd26e92fbe14c59ae1ea9d4434fb09c386b"
 dependencies = [
  "base64",
  "chrono",
@@ -582,7 +583,7 @@ dependencies = [
 [[package]]
 name = "codex-mcp-client"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?rev=c4120a265b9444587d6c69e170b64d2440274e10#c4120a265b9444587d6c69e170b64d2440274e10"
+source = "git+https://github.com/zed-industries/codex?branch=acp#324f5fd26e92fbe14c59ae1ea9d4434fb09c386b"
 dependencies = [
  "anyhow",
  "mcp-types",
@@ -596,7 +597,7 @@ dependencies = [
 [[package]]
 name = "codex-mcp-server"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?rev=c4120a265b9444587d6c69e170b64d2440274e10#c4120a265b9444587d6c69e170b64d2440274e10"
+source = "git+https://github.com/zed-industries/codex?branch=acp#324f5fd26e92fbe14c59ae1ea9d4434fb09c386b"
 dependencies = [
  "anyhow",
  "codex-arg0",
@@ -619,7 +620,7 @@ dependencies = [
 [[package]]
 name = "codex-protocol"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?rev=c4120a265b9444587d6c69e170b64d2440274e10#c4120a265b9444587d6c69e170b64d2440274e10"
+source = "git+https://github.com/zed-industries/codex?branch=acp#324f5fd26e92fbe14c59ae1ea9d4434fb09c386b"
 dependencies = [
  "base64",
  "icu_decimal",
@@ -640,7 +641,7 @@ dependencies = [
 [[package]]
 name = "codex-rmcp-client"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?rev=c4120a265b9444587d6c69e170b64d2440274e10#c4120a265b9444587d6c69e170b64d2440274e10"
+source = "git+https://github.com/zed-industries/codex?branch=acp#324f5fd26e92fbe14c59ae1ea9d4434fb09c386b"
 dependencies = [
  "anyhow",
  "axum",
@@ -1596,6 +1597,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7943c866cc5cd64cbc25b2e01621d07fa8eb2a1a23160ee81ce38704e97b8ecf"
 
 [[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1730,7 +1740,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 [[package]]
 name = "mcp-types"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?rev=c4120a265b9444587d6c69e170b64d2440274e10#c4120a265b9444587d6c69e170b64d2440274e10"
+source = "git+https://github.com/zed-industries/codex?branch=acp#324f5fd26e92fbe14c59ae1ea9d4434fb09c386b"
 dependencies = [
  "serde",
  "serde_json",
