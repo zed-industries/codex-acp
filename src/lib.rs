@@ -11,7 +11,6 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
-mod mcp_http;
 
 /// Run the Codex ACP agent.
 ///

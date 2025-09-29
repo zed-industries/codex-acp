@@ -1,4 +1,3 @@
-use crate::mcp_http::AcpMcpHttpServer;
 use agent_client_protocol::{
     Agent, AgentCapabilities, AgentSideConnection, Annotations, AudioContent, AuthenticateRequest,
     AuthenticateResponse, BlobResourceContents, CancelNotification, Client, ContentBlock,
@@ -21,7 +20,7 @@ use codex_core::{
     CodexConversation, ConversationManager,
     auth::{AuthManager, CodexAuth, read_openai_api_key_from_env},
     config::Config,
-    config_types::{McpServerConfig, McpTransport, OpenAiToolId},
+    config_types::{McpServerConfig, McpServerTransportConfig},
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
         AgentMessageDeltaEvent, AgentMessageEvent, AgentReasoningDeltaEvent, AgentReasoningEvent,
@@ -43,11 +42,9 @@ use std::{
     collections::HashMap,
     rc::Rc,
     sync::{Arc, LazyLock},
-    time::Duration,
 };
 use tracing::{debug, error, info, warn};
 
-const ACP_MCP_SERVER_NAME: &str = "acp";
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 
 /// The Codex implementation of the ACP Agent trait.
@@ -73,8 +70,6 @@ struct SessionState {
     conversation_id: ConversationId,
     /// The config used for this session
     config: Config,
-    /// Handle to the in-process HTTP MCP server for ACP tools
-    acp_server: Rc<AcpMcpHttpServer>,
 }
 
 impl CodexAgent {
@@ -236,11 +231,7 @@ impl CodexAgent {
             SessionUpdate::ToolCall(ToolCall {
                 id: tool_call_id,
                 title,
-                kind: if invocation.server == ACP_MCP_SERVER_NAME {
-                    ToolKind::Execute
-                } else {
-                    ToolKind::Other
-                },
+                kind: ToolKind::Other,
                 status: ToolCallStatus::InProgress,
                 content: vec![],
                 locations: vec![],
@@ -250,22 +241,6 @@ impl CodexAgent {
             }),
         )
         .await;
-
-        // Record this invocation for correlation with the upcoming HTTP tools/call.
-        let acp_server = {
-            let sessions = self.sessions.borrow();
-            sessions.get(&session_id).map(|s| s.acp_server.clone())
-        };
-        if let Some(server) = acp_server {
-            let args_value = invocation
-                .arguments
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            server
-                .record_invocation(&invocation.tool, &args_value, &call_id, &session_id)
-                .await;
-        }
     }
 
     async fn end_mcp_tool_call(
@@ -667,21 +642,33 @@ impl Agent for CodexAgent {
         info!("Creating new session with cwd: {}", cwd.display());
 
         let mut config = self.config.clone();
+        // Allows us to support HTTP MCP servers
+        config.use_experimental_use_rmcp_client = true;
         config.cwd.clone_from(&cwd);
-        // Disable builtin shell-related tools so the model uses our MCP terminal tools.
-        config.disabled_tools.extend_from_slice(&[
-            OpenAiToolId::ShellDefault,
-            OpenAiToolId::ShellLocal,
-            OpenAiToolId::ExecCommand,
-            OpenAiToolId::WriteStdin,
-            OpenAiToolId::UnifiedExec,
-        ]);
 
         // Propagate any client-provided MCP servers that codex-rs supports.
         for mcp_server in mcp_servers {
             match mcp_server {
-                // Not supported in codex yet
-                McpServer::Http { .. } | McpServer::Sse { .. } => {}
+                // Not supported in codex
+                McpServer::Sse { .. } => {}
+                McpServer::Http { name, url, headers } => {
+                    config.mcp_servers.insert(
+                        name,
+                        McpServerConfig {
+                            transport: McpServerTransportConfig::StreamableHttp {
+                                url,
+                                bearer_token: headers
+                                    .into_iter()
+                                    .find(|header| header.name == "Authorization")
+                                    .and_then(|header| {
+                                        header.value.strip_prefix("Bearer ").map(|v| v.to_owned())
+                                    }),
+                            },
+                            startup_timeout_sec: None,
+                            tool_timeout_sec: None,
+                        },
+                    );
+                }
                 McpServer::Stdio {
                     name,
                     command,
@@ -689,19 +676,17 @@ impl Agent for CodexAgent {
                     env,
                 } => {
                     config.mcp_servers.insert(
-                        name.clone(),
+                        name,
                         McpServerConfig {
-                            transport: McpTransport::Stdio,
-                            command: Some(command.display().to_string()),
-                            args,
-                            env: if env.is_empty() {
-                                None
-                            } else {
-                                Some(env.into_iter().map(|env| (env.name, env.value)).collect())
+                            transport: McpServerTransportConfig::Stdio {
+                                command: command.display().to_string(),
+                                args,
+                                env: if env.is_empty() {
+                                    None
+                                } else {
+                                    Some(env.into_iter().map(|env| (env.name, env.value)).collect())
+                                },
                             },
-                            url: None,
-                            messages_url: None,
-                            headers: None,
                             startup_timeout_sec: None,
                             tool_timeout_sec: None,
                         },
@@ -709,33 +694,6 @@ impl Agent for CodexAgent {
                 }
             }
         }
-
-        // Note: the ACP-backed terminal tools will be provided by the agent (this process).
-        // We disabled codex's shell tools above so that the agent will use these instead.
-
-        // Start in-process HTTP MCP server for ACP terminal tools and register it.
-        let acp_http = Rc::new(
-            AcpMcpHttpServer::bind_and_spawn()
-                .await
-                .map_err(|_| Error::internal_error())?,
-        );
-        let stream_url = acp_http.stream_url();
-        let messages_url = acp_http.messages_url();
-        config.mcp_servers.insert(
-            ACP_MCP_SERVER_NAME.to_string(),
-            McpServerConfig {
-                transport: McpTransport::Http,
-                command: None,
-                args: vec![],
-                env: None,
-                url: Some(stream_url),
-                messages_url: Some(messages_url),
-                headers: None,
-                startup_timeout_sec: Some(Duration::from_secs(10)),
-                tool_timeout_sec: None,
-            },
-        );
-        acp_http.set_client(self.client()).await;
 
         let num_mcp_servers = config.mcp_servers.len();
 
@@ -751,7 +709,6 @@ impl Agent for CodexAgent {
         let session_state = SessionState {
             conversation_id: new_conversation.conversation_id,
             config,
-            acp_server: acp_http,
         };
         let session_id = SessionId(new_conversation.conversation_id.to_string().into());
 
