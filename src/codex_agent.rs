@@ -270,87 +270,15 @@ impl CodexAgent {
                     } else {
                         ToolCallStatus::Completed
                     }),
-                    content: result
-                        .ok()
-                        .filter(|result| !result.content.is_empty())
-                        .map(|result| {
+                    content: result.ok().filter(|result| !result.content.is_empty()).map(
+                        |result| {
                             result
                                 .content
                                 .into_iter()
-                                .map(|content| ToolCallContent::Content {
-                                    content: match content {
-                                            mcp_types::ContentBlock::TextContent(text_content) => {
-                                                ContentBlock::Text(TextContent {
-                                                    annotations: text_content
-                                                        .annotations
-                                                        .map(convert_annotations),
-                                                    text: text_content.text,
-                                                    meta: None,
-                                                })
-                                            }
-                                            mcp_types::ContentBlock::ImageContent(image_content) => {
-                                                ContentBlock::Image(ImageContent {
-                                                    annotations: image_content
-                                                        .annotations
-                                                        .map(convert_annotations),
-                                                    data: image_content.data,
-                                                    mime_type: image_content.mime_type,
-                                                    uri: None,
-                                                    meta: None,
-                                                })
-                                            }
-                                            mcp_types::ContentBlock::AudioContent(audio_content) => {
-                                                ContentBlock::Audio(AudioContent {
-                                                    annotations: audio_content
-                                                        .annotations
-                                                        .map(convert_annotations),
-                                                    data: audio_content.data,
-                                                    mime_type: audio_content.mime_type,
-                                                    meta: None,
-                                                })
-                                            }
-                                            mcp_types::ContentBlock::ResourceLink(resource_link) => {
-                                                ContentBlock::ResourceLink(ResourceLink {
-                                                    annotations: resource_link
-                                                        .annotations
-                                                        .map(convert_annotations),
-                                                    description: resource_link.description,
-                                                    mime_type: resource_link.mime_type,
-                                                    name: resource_link.name,
-                                                    size: resource_link.size,
-                                                    title: resource_link.title,
-                                                    uri: resource_link.uri,
-                                                    meta: None,
-                                                })
-                                            }
-                                            mcp_types::ContentBlock::EmbeddedResource(embedded_resource) => {
-                                                ContentBlock::Resource(EmbeddedResource {
-                                                    annotations: embedded_resource.annotations.map(convert_annotations),
-                                                    resource: match embedded_resource.resource {
-                                                        mcp_types::EmbeddedResourceResource::TextResourceContents(text_resource_contents) => {
-                                                            EmbeddedResourceResource::TextResourceContents(TextResourceContents {
-                                                                mime_type: text_resource_contents.mime_type,
-                                                                text: text_resource_contents.text,
-                                                                uri: text_resource_contents.uri,
-                                                                meta: None
-                                                            })
-                                                        },
-                                                        mcp_types::EmbeddedResourceResource::BlobResourceContents(blob_resource_contents) => {
-                                                            EmbeddedResourceResource::BlobResourceContents(BlobResourceContents {
-                                                                blob: blob_resource_contents.blob,
-                                                                mime_type: blob_resource_contents.mime_type,
-                                                                uri: blob_resource_contents.uri,
-                                                                meta: None
-                                                            })
-                                                        },
-                                                    },
-                                                    meta: None,
-                                                })
-                                            }
-                                    }
-                                })
+                                .map(Self::codex_content_to_acp_content)
                                 .collect()
-                        }),
+                        },
+                    ),
                     raw_output: Some(raw_output),
                     ..Default::default()
                 },
@@ -358,6 +286,77 @@ impl CodexAgent {
             }),
         )
         .await;
+    }
+
+    fn codex_content_to_acp_content(content: mcp_types::ContentBlock) -> ToolCallContent {
+        ToolCallContent::Content {
+            content: match content {
+                mcp_types::ContentBlock::TextContent(text_content) => {
+                    ContentBlock::Text(TextContent {
+                        annotations: text_content.annotations.map(convert_annotations),
+                        text: text_content.text,
+                        meta: None,
+                    })
+                }
+                mcp_types::ContentBlock::ImageContent(image_content) => {
+                    ContentBlock::Image(ImageContent {
+                        annotations: image_content.annotations.map(convert_annotations),
+                        data: image_content.data,
+                        mime_type: image_content.mime_type,
+                        uri: None,
+                        meta: None,
+                    })
+                }
+                mcp_types::ContentBlock::AudioContent(audio_content) => {
+                    ContentBlock::Audio(AudioContent {
+                        annotations: audio_content.annotations.map(convert_annotations),
+                        data: audio_content.data,
+                        mime_type: audio_content.mime_type,
+                        meta: None,
+                    })
+                }
+                mcp_types::ContentBlock::ResourceLink(resource_link) => {
+                    ContentBlock::ResourceLink(ResourceLink {
+                        annotations: resource_link.annotations.map(convert_annotations),
+                        description: resource_link.description,
+                        mime_type: resource_link.mime_type,
+                        name: resource_link.name,
+                        size: resource_link.size,
+                        title: resource_link.title,
+                        uri: resource_link.uri,
+                        meta: None,
+                    })
+                }
+                mcp_types::ContentBlock::EmbeddedResource(embedded_resource) => {
+                    ContentBlock::Resource(EmbeddedResource {
+                        annotations: embedded_resource.annotations.map(convert_annotations),
+                        resource: match embedded_resource.resource {
+                            mcp_types::EmbeddedResourceResource::TextResourceContents(
+                                text_resource_contents,
+                            ) => EmbeddedResourceResource::TextResourceContents(
+                                TextResourceContents {
+                                    mime_type: text_resource_contents.mime_type,
+                                    text: text_resource_contents.text,
+                                    uri: text_resource_contents.uri,
+                                    meta: None,
+                                },
+                            ),
+                            mcp_types::EmbeddedResourceResource::BlobResourceContents(
+                                blob_resource_contents,
+                            ) => EmbeddedResourceResource::BlobResourceContents(
+                                BlobResourceContents {
+                                    blob: blob_resource_contents.blob,
+                                    mime_type: blob_resource_contents.mime_type,
+                                    uri: blob_resource_contents.uri,
+                                    meta: None,
+                                },
+                            ),
+                        },
+                        meta: None,
+                    })
+                }
+            },
+        }
     }
 
     async fn start_web_search(
@@ -391,7 +390,7 @@ impl CodexAgent {
                 id: ToolCallId(call_id.into()),
                 fields: ToolCallUpdateFields {
                     status: Some(ToolCallStatus::InProgress),
-                    title: Some(format!("Searching for: {}", query)),
+                    title: Some(format!("Searching for: {query}")),
                     raw_input: Some(serde_json::json!({
                         "query": query
                     })),
@@ -841,7 +840,10 @@ impl Agent for CodexAgent {
                                     .into_iter()
                                     .find(|header| header.name == "Authorization")
                                     .and_then(|header| {
-                                        header.value.strip_prefix("Bearer ").map(|v| v.to_owned())
+                                        header
+                                            .value
+                                            .strip_prefix("Bearer ")
+                                            .map(std::borrow::ToOwned::to_owned)
                                     }),
                             },
                             startup_timeout_sec: None,
@@ -993,7 +995,7 @@ impl Agent for CodexAgent {
                             .await;
                         }
                         _ => {}
-                    };
+                    }
 
                     match event.msg {
                         EventMsg::TaskStarted(TaskStartedEvent { model_context_window }) => {
@@ -1002,12 +1004,6 @@ impl Agent for CodexAgent {
                         EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
                             info!("User message echoed: {message:?}");
                         }
-                        // Since we are getting the deltas, we can ignore these events
-                        EventMsg::AgentReasoning(AgentReasoningEvent { .. })
-                        | EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent {
-                            ..
-                        })
-                        | EventMsg::AgentMessage(AgentMessageEvent { .. }) => {}
                         EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
                             // Send this to the client via session/update notification
                             info!("Agent message received: {delta:?}");
@@ -1219,8 +1215,15 @@ impl Agent for CodexAgent {
                             stop_reason = StopReason::Cancelled;
                             break;
                         }
+
+                        // Since we are getting the deltas, we can ignore these events
+                        EventMsg::AgentReasoning(AgentReasoningEvent { .. })
+                        | EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent {
+                            ..
+                        })
+                        | EventMsg::AgentMessage(AgentMessageEvent { .. })
                         // In the future we can use this to update usage stats
-                        EventMsg::TokenCount(..)
+                        | EventMsg::TokenCount(..)
                         // we already have a way to diff the turn, so ignore
                         | EventMsg::TurnDiff(..)
                         // returned from Op::ListMcpTools, ignore
