@@ -84,12 +84,10 @@ impl CodexAgent {
             .ok()
             .flatten()
             .is_none()
+            && let Ok(api_key) = std::env::var("OPENAI_API_KEY")
+            && !api_key.is_empty()
         {
-            if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
-                if !api_key.is_empty() {
-                    let _ = login_with_api_key(&config.codex_home, &api_key);
-                }
-            }
+            let _ = login_with_api_key(&config.codex_home, &api_key);
         }
         let auth_manager = AuthManager::shared(config.codex_home.clone());
 
@@ -789,10 +787,10 @@ impl Agent for CodexAgent {
         };
 
         // Hide auth methods when already authenticated, otherwise advertise a single login method.
-        let is_authenticated = match CodexAuth::from_codex_home(&self.config.codex_home) {
-            Ok(Some(_)) => true,
-            _ => false,
-        };
+        let is_authenticated = matches!(
+            CodexAuth::from_codex_home(&self.config.codex_home),
+            Ok(Some(_))
+        );
         let auth_methods = if is_authenticated {
             vec![]
         } else {
