@@ -34,8 +34,8 @@ use codex_core::{
     },
 };
 use codex_protocol::{
+    ConversationId,
     config_types::ReasoningEffort,
-    mcp_protocol::ConversationId,
     protocol::{EventMsg, InputItem, Op},
 };
 use itertools::Itertools;
