@@ -18,7 +18,7 @@ use codex_common::{
 };
 use codex_core::{
     CodexConversation, ConversationManager,
-    auth::{AuthManager, CodexAuth, read_openai_api_key_from_env},
+    auth::{AuthManager, CodexAuth},
     config::Config,
     config_types::{McpServerConfig, McpServerTransportConfig},
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
@@ -46,7 +46,7 @@ use std::{
     rc::Rc,
     sync::{Arc, LazyLock},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 
@@ -80,21 +80,7 @@ impl CodexAgent {
     pub fn new(config: Config) -> Self {
         let auth_manager = AuthManager::shared(config.codex_home.clone());
 
-        let auth_manager = if auth_manager.auth().is_none() {
-            // No auth.json found, try environment variable
-            if let Some(api_key) = read_openai_api_key_from_env() {
-                // TODO obviously this is "for testing" - let's try to find a more robust way!
-                AuthManager::from_auth_for_testing(CodexAuth::from_api_key(&api_key))
-            } else {
-                // TODO report this to end user
-                warn!(
-                    "No authentication configured: neither auth.json nor OPENAI_API_KEY environment variable found"
-                );
-                auth_manager
-            }
-        } else {
-            auth_manager
-        };
+        // Env var/API key fallback removed: only browser/device login is supported via ACP authenticate.
 
         let model_presets = builtin_model_presets(auth_manager.auth().map(|auth| auth.mode));
 
@@ -791,8 +777,21 @@ impl Agent for CodexAgent {
             meta: None,
         };
 
-        // For now, we don't require authentication
-        let auth_methods = vec![];
+        // Hide auth methods when already authenticated, otherwise advertise a single login method.
+        let is_authenticated = match CodexAuth::from_codex_home(&self.config.codex_home) {
+            Ok(Some(_)) => true,
+            _ => false,
+        };
+        let auth_methods = if is_authenticated {
+            vec![]
+        } else {
+            vec![agent_client_protocol::AuthMethod {
+                id: agent_client_protocol::AuthMethodId("codex-login".into()),
+                name: "Codex Login".into(),
+                description: Some("Authenticate Codex from the terminal".into()),
+                meta: None,
+            }]
+        };
 
         Ok(InitializeResponse {
             protocol_version,
@@ -804,9 +803,25 @@ impl Agent for CodexAgent {
 
     async fn authenticate(
         &self,
-        _request: AuthenticateRequest,
+        request: AuthenticateRequest,
     ) -> Result<AuthenticateResponse, Error> {
-        // We don't currently require authentication
+        if request.method_id.0.as_ref() != "codex-login" {
+            return Err(Error::invalid_params().with_data("unsupported authentication method"));
+        }
+
+        // Perform browser/device login via codex-rs, then report success/failure to the client.
+        let opts = codex_login::ServerOptions::new(
+            self.config.codex_home.clone(),
+            codex_core::auth::CLIENT_ID.to_string(),
+        );
+
+        let server = codex_login::run_login_server(opts).map_err(Error::into_internal_error)?;
+
+        server
+            .block_until_done()
+            .await
+            .map_err(Error::into_internal_error)?;
+
         Ok(AuthenticateResponse { meta: None })
     }
 
