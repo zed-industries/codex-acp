@@ -961,6 +961,27 @@ impl Agent for CodexAgent {
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {
         info!("Processing prompt for session: {}", request.session_id);
 
+        // Preflight auth: ensure credentials exist, or return AUTH_REQUIRED without calling model.
+        // If OPENAI_API_KEY is present and no auth.json exists, persist it silently.
+        match CodexAuth::from_codex_home(&self.config.codex_home) {
+            Ok(Some(_)) => {}
+            _ => {
+                if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
+                    if !api_key.is_empty() {
+                        let _ = login_with_api_key(&self.config.codex_home, &api_key);
+                    }
+                }
+                // Recheck after potential env pre-auth; if still no creds, ask client to authenticate.
+                if CodexAuth::from_codex_home(&self.config.codex_home)
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    return Err(Error::auth_required());
+                }
+            }
+        }
+
         // Get the session state
         let conversation = self.get_conversation(&request.session_id).await?;
 
