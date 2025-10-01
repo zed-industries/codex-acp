@@ -10,6 +10,8 @@ use tokio::task::LocalSet;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::EnvFilter;
 
+use crate::codex_agent::ACP_CLIENT;
+
 mod codex_agent;
 
 /// Run the Codex ACP agent.
@@ -57,7 +59,9 @@ pub async fn run_main(
                 tokio::task::spawn_local(fut);
             });
 
-            agent.set_client(client);
+            if ACP_CLIENT.set(client).is_err() {
+                return Err(std::io::Error::other("ACP client already set"));
+            }
 
             io_task
                 .await
