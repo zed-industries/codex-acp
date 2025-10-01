@@ -18,7 +18,7 @@ use codex_common::{
 };
 use codex_core::{
     CodexConversation, ConversationManager,
-    auth::{AuthManager, CodexAuth},
+    auth::{AuthManager, CodexAuth, login_with_api_key},
     config::Config,
     config_types::{McpServerConfig, McpServerTransportConfig},
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
@@ -78,9 +78,20 @@ struct SessionState {
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
     pub fn new(config: Config) -> Self {
+        // Pre-auth from OPENAI_API_KEY before creating the AuthManager, so restored sessions
+        // have API-key auth state ready without surfacing any UI or errors.
+        if CodexAuth::from_codex_home(&config.codex_home)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
+                if !api_key.is_empty() {
+                    let _ = login_with_api_key(&config.codex_home, &api_key);
+                }
+            }
+        }
         let auth_manager = AuthManager::shared(config.codex_home.clone());
-
-        // Env var/API key fallback removed: only browser/device login is supported via ACP authenticate.
 
         let model_presets = builtin_model_presets(auth_manager.auth().map(|auth| auth.mode));
 
