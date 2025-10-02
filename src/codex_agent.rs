@@ -1109,6 +1109,8 @@ impl Agent for CodexAgent {
                             } = event;
                             // Create a new tool call for the command execution
                             let tool_call_id = ToolCallId(call_id.clone().into());
+                            let tool_call_id_for_update = tool_call_id.clone();
+                            let _call_id_for_meta = call_id.clone();
                             active_command = Some((call_id, tool_call_id.clone()));
 
                             self.send_notification(
@@ -1123,7 +1125,7 @@ impl Agent for CodexAgent {
                                         vec![]
                                     } else {
                                         vec![ToolCallLocation {
-                                            path: cwd,
+                                            path: cwd.clone(),
                                             line: None,
                                             meta: None,
                                         }]
@@ -1134,39 +1136,51 @@ impl Agent for CodexAgent {
                                 }),
                             )
                             .await;
+
+                            // Create a terminal in the client and embed it in the tool call so Zed renders it.
+                            let (cmd, cmd_args) = if command.is_empty() {
+                                ("sh".to_string(), vec![])
+                            } else {
+                                (command[0].clone(), command[1..].to_vec())
+                            };
+
+                            if let Ok(resp) = self
+                                .client()
+                                .create_terminal(agent_client_protocol::CreateTerminalRequest {
+                                    session_id: request.session_id.clone(),
+                                    command: cmd,
+                                    args: cmd_args,
+                                    env: vec![],
+                                    cwd: Some(cwd.clone()),
+                                    output_byte_limit: None,
+                                    meta: None,
+                                })
+                                .await
+                            {
+                                // Replace tool call content with an embedded terminal
+                                let _ = self
+                                    .send_notification(
+                                        request.session_id.clone(),
+                                        SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                                            id: tool_call_id_for_update,
+                                            fields: ToolCallUpdateFields {
+                                                content: Some(vec![ToolCallContent::Terminal {
+                                                    terminal_id: resp.terminal_id,
+                                                }]),
+                                                ..Default::default()
+                                            },
+                                            meta: None,
+                                        }),
+                                    )
+                                    .await;
+                            }
                         }
                         EventMsg::ExecCommandOutputDelta(delta_event) => {
-                            // Accumulate command output and send the full content
-                            if let Some((ref call_id, ref tool_call_id)) = active_command
+                            // Output is streamed by the embedded terminal; no ToolCall update is needed here.
+                            if let Some((ref call_id, _)) = active_command
                                 && call_id == &delta_event.call_id
                             {
-                                // Convert the output chunk to a string (best effort)
-                                let output_text = String::from_utf8_lossy(&delta_event.chunk);
-
-                                // Accumulate the output
-                                command_output.push(output_text.to_string());
-
-                                // Send the full accumulated output (content is replaced, not appended)
-                                let accumulated_output = command_output.join("");
-
-                                self.send_notification(request.session_id.clone(), SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                                    id: tool_call_id.clone(),
-                                    fields: ToolCallUpdateFields {
-                                        // Send the full accumulated content
-                                        content: Some(vec![ToolCallContent::Content {
-                                            content: ContentBlock::Text(TextContent {
-                                                text: accumulated_output,
-                                                annotations: None,
-                                                meta: Some(serde_json::json!({
-                                                    "stream": format!("{:?}", delta_event.stream),
-                                                    "streaming": true,
-                                                })),
-                                            }),
-                                        }]),
-                                        ..Default::default()
-                                    },
-                                    meta: None,
-                                })).await;
+                                // no-op
                             }
                         }
                         EventMsg::ExecCommandEnd(end_event) => {
@@ -1189,28 +1203,6 @@ impl Agent for CodexAgent {
                                         } else {
                                             ToolCallStatus::Failed
                                         }),
-                                        // Send final aggregated output
-                                        content: Some(vec![ToolCallContent::Content {
-                                            content: ContentBlock::Text(TextContent {
-                                                text: if !end_event.formatted_output.is_empty()
-                                                {
-                                                    end_event.formatted_output.clone()
-                                                } else if !end_event
-                                                    .aggregated_output
-                                                    .is_empty()
-                                                {
-                                                    end_event.aggregated_output.clone()
-                                                } else {
-                                                    format!(
-                                                        "stdout:\n{}\n\nstderr:\n{}",
-                                                        end_event.stdout, end_event.stderr
-                                                    )
-                                                },
-                                                annotations: None,
-                                                meta: None,
-                                            }),
-                                        }]),
-                                        raw_output: Some(raw_output),
                                         ..Default::default()
                                     },
                                     meta: None,
