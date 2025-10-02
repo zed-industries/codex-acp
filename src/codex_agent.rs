@@ -763,7 +763,7 @@ impl CodexAgent {
                     uri,
                     meta: _,
                 }) => Some(InputItem::Text {
-                    text: format_uri_as_link(name, uri),
+                    text: format_uri_as_link(Some(name), uri),
                 }),
                 ContentBlock::Resource(EmbeddedResource {
                     annotations: _,
@@ -776,7 +776,10 @@ impl CodexAgent {
                         }),
                     meta: _,
                 }) => Some(InputItem::Text {
-                    text: format_uri_as_link(text, uri),
+                    text: format!(
+                        "{}\n<context ref=\"{uri}\">\n${text}\n</context>",
+                        format_uri_as_link(None, uri.clone())
+                    ),
                 }),
                 // Skip other content types for now
                 ContentBlock::Audio(..) | ContentBlock::Resource(..) => None,
@@ -785,8 +788,10 @@ impl CodexAgent {
     }
 }
 
-fn format_uri_as_link(name: String, uri: String) -> String {
-    if !name.is_empty() {
+fn format_uri_as_link(name: Option<String>, uri: String) -> String {
+    if let Some(name) = name
+        && !name.is_empty()
+    {
         format!("[@{name}]({uri})")
     } else if let Some(path) = uri.strip_prefix("file://") {
         let name = path.split('/').next_back().unwrap_or(path);
