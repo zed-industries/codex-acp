@@ -18,7 +18,7 @@ use codex_common::{
     model_presets::{ModelPreset, builtin_model_presets},
 };
 use codex_core::{
-    CodexConversation, ConversationManager,
+    CodexConversation, ConversationManager, NewConversation,
     auth::{AuthManager, CodexAuth, login_with_api_key},
     config::Config,
     config_types::{McpServerConfig, McpServerTransportConfig},
@@ -70,7 +70,7 @@ pub struct CodexAgent {
 /// State for an individual session
 struct SessionState {
     /// The conversation ID in the conversation manager
-    conversation_id: ConversationId,
+    conversation: Arc<CodexConversation>,
     /// The config used for this session
     config: Config,
 }
@@ -193,18 +193,13 @@ impl CodexAgent {
         &self,
         session_id: &SessionId,
     ) -> Result<Arc<CodexConversation>, Error> {
-        // Get the session to find the conversation ID
-        let conversation_id = self
+        Ok(self
             .sessions
             .borrow()
             .get(session_id)
             .ok_or_else(Error::invalid_request)?
-            .conversation_id;
-
-        self.conversation_manager
-            .get_conversation(conversation_id)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).into())
+            .conversation
+            .clone())
     }
 
     async fn send_notification(&self, session_id: SessionId, update: SessionUpdate) {
@@ -950,17 +945,21 @@ impl Agent for CodexAgent {
         let modes = Self::modes(&config);
         let models = self.models(&config)?;
 
-        let new_conversation = self
+        let NewConversation {
+            conversation_id,
+            conversation,
+            session_configured: _,
+        } = self
             .conversation_manager
             .new_conversation(config.clone())
             .await
             .map_err(|_e| Error::internal_error())?;
 
         let session_state = SessionState {
-            conversation_id: new_conversation.conversation_id,
+            conversation,
             config,
         };
-        let session_id = Self::session_id_from_conversation_id(new_conversation.conversation_id);
+        let session_id = Self::session_id_from_conversation_id(conversation_id);
 
         self.sessions
             .borrow_mut()
