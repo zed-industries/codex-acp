@@ -966,10 +966,10 @@ impl Agent for CodexAgent {
         match CodexAuth::from_codex_home(&self.config.codex_home) {
             Ok(Some(_)) => {}
             _ => {
-                if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
-                    if !api_key.is_empty() {
-                        let _ = login_with_api_key(&self.config.codex_home, &api_key);
-                    }
+                if let Ok(api_key) = std::env::var("OPENAI_API_KEY")
+                    && !api_key.is_empty()
+                {
+                    let _ = login_with_api_key(&self.config.codex_home, &api_key);
                 }
                 // Recheck after potential env pre-auth; if still no creds, ask client to authenticate.
                 if CodexAuth::from_codex_home(&self.config.codex_home)
