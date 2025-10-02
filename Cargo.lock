@@ -447,7 +447,7 @@ dependencies = [
 [[package]]
 name = "codex-app-server-protocol"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#2e24239f82f93e6ec2fe4c253b7e40cab83c482f"
+source = "git+https://github.com/zed-industries/codex?branch=acp#8599b147b3cb28983a3b0f92bc532d173ee0a970"
 dependencies = [
  "codex-protocol",
  "paste",
@@ -461,7 +461,7 @@ dependencies = [
 [[package]]
 name = "codex-apply-patch"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#2e24239f82f93e6ec2fe4c253b7e40cab83c482f"
+source = "git+https://github.com/zed-industries/codex?branch=acp#8599b147b3cb28983a3b0f92bc532d173ee0a970"
 dependencies = [
  "anyhow",
  "similar",
@@ -473,7 +473,7 @@ dependencies = [
 [[package]]
 name = "codex-arg0"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#2e24239f82f93e6ec2fe4c253b7e40cab83c482f"
+source = "git+https://github.com/zed-industries/codex?branch=acp#8599b147b3cb28983a3b0f92bc532d173ee0a970"
 dependencies = [
  "anyhow",
  "codex-apply-patch",
@@ -487,7 +487,7 @@ dependencies = [
 [[package]]
 name = "codex-common"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#2e24239f82f93e6ec2fe4c253b7e40cab83c482f"
+source = "git+https://github.com/zed-industries/codex?branch=acp#8599b147b3cb28983a3b0f92bc532d173ee0a970"
 dependencies = [
  "clap",
  "codex-app-server-protocol",
@@ -500,7 +500,7 @@ dependencies = [
 [[package]]
 name = "codex-core"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#2e24239f82f93e6ec2fe4c253b7e40cab83c482f"
+source = "git+https://github.com/zed-industries/codex?branch=acp#8599b147b3cb28983a3b0f92bc532d173ee0a970"
 dependencies = [
  "anyhow",
  "askama",
@@ -517,6 +517,7 @@ dependencies = [
  "codex-protocol",
  "codex-rmcp-client",
  "dirs",
+ "dunce",
  "env-flags",
  "eventsource-stream",
  "futures",
@@ -555,7 +556,7 @@ dependencies = [
 [[package]]
 name = "codex-file-search"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#2e24239f82f93e6ec2fe4c253b7e40cab83c482f"
+source = "git+https://github.com/zed-industries/codex?branch=acp#8599b147b3cb28983a3b0f92bc532d173ee0a970"
 dependencies = [
  "anyhow",
  "clap",
@@ -569,7 +570,7 @@ dependencies = [
 [[package]]
 name = "codex-linux-sandbox"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#2e24239f82f93e6ec2fe4c253b7e40cab83c482f"
+source = "git+https://github.com/zed-industries/codex?branch=acp#8599b147b3cb28983a3b0f92bc532d173ee0a970"
 dependencies = [
  "clap",
  "codex-core",
@@ -581,7 +582,7 @@ dependencies = [
 [[package]]
 name = "codex-login"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#2e24239f82f93e6ec2fe4c253b7e40cab83c482f"
+source = "git+https://github.com/zed-industries/codex?branch=acp#8599b147b3cb28983a3b0f92bc532d173ee0a970"
 dependencies = [
  "base64",
  "chrono",
@@ -603,7 +604,7 @@ dependencies = [
 [[package]]
 name = "codex-mcp-client"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#2e24239f82f93e6ec2fe4c253b7e40cab83c482f"
+source = "git+https://github.com/zed-industries/codex?branch=acp#8599b147b3cb28983a3b0f92bc532d173ee0a970"
 dependencies = [
  "anyhow",
  "mcp-types",
@@ -617,7 +618,7 @@ dependencies = [
 [[package]]
 name = "codex-mcp-server"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#2e24239f82f93e6ec2fe4c253b7e40cab83c482f"
+source = "git+https://github.com/zed-industries/codex?branch=acp#8599b147b3cb28983a3b0f92bc532d173ee0a970"
 dependencies = [
  "anyhow",
  "codex-arg0",
@@ -638,7 +639,7 @@ dependencies = [
 [[package]]
 name = "codex-otel"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#2e24239f82f93e6ec2fe4c253b7e40cab83c482f"
+source = "git+https://github.com/zed-industries/codex?branch=acp#8599b147b3cb28983a3b0f92bc532d173ee0a970"
 dependencies = [
  "chrono",
  "codex-app-server-protocol",
@@ -660,7 +661,7 @@ dependencies = [
 [[package]]
 name = "codex-protocol"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#2e24239f82f93e6ec2fe4c253b7e40cab83c482f"
+source = "git+https://github.com/zed-industries/codex?branch=acp#8599b147b3cb28983a3b0f92bc532d173ee0a970"
 dependencies = [
  "base64",
  "icu_decimal",
@@ -681,7 +682,7 @@ dependencies = [
 [[package]]
 name = "codex-rmcp-client"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#2e24239f82f93e6ec2fe4c253b7e40cab83c482f"
+source = "git+https://github.com/zed-industries/codex?branch=acp#8599b147b3cb28983a3b0f92bc532d173ee0a970"
 dependencies = [
  "anyhow",
  "axum",
@@ -698,7 +699,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-json-to-toml"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#2e24239f82f93e6ec2fe4c253b7e40cab83c482f"
+source = "git+https://github.com/zed-industries/codex?branch=acp#8599b147b3cb28983a3b0f92bc532d173ee0a970"
 dependencies = [
  "serde_json",
  "toml",
@@ -897,6 +898,12 @@ name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
+
+[[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dyn-clone"
@@ -1803,7 +1810,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 [[package]]
 name = "mcp-types"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#2e24239f82f93e6ec2fe4c253b7e40cab83c482f"
+source = "git+https://github.com/zed-industries/codex?branch=acp#8599b147b3cb28983a3b0f92bc532d173ee0a970"
 dependencies = [
  "serde",
  "serde_json",
@@ -3681,9 +3688,9 @@ dependencies = [
 
 [[package]]
 name = "typenum"
-version = "1.18.0"
+version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1dccffe3ce07af9386bfd29e80c0ab1a8205a2fc34e4bcd40364df902cfa8f3f"
+checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
 
 [[package]]
 name = "unicase"

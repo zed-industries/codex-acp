@@ -753,14 +753,54 @@ impl CodexAgent {
                         })
                     }
                 }
-                ContentBlock::Audio(..)
-                | ContentBlock::Resource(..)
-                | ContentBlock::ResourceLink(..) => {
-                    // Skip other content types for now
-                    None
-                }
+                ContentBlock::ResourceLink(ResourceLink {
+                    annotations: _,
+                    description: _,
+                    mime_type: _,
+                    name,
+                    size: _,
+                    title: _,
+                    uri,
+                    meta: _,
+                }) => Some(InputItem::Text {
+                    text: format_uri_as_link(Some(name), uri),
+                }),
+                ContentBlock::Resource(EmbeddedResource {
+                    annotations: _,
+                    resource:
+                        EmbeddedResourceResource::TextResourceContents(TextResourceContents {
+                            mime_type: _,
+                            text,
+                            uri,
+                            meta: _,
+                        }),
+                    meta: _,
+                }) => Some(InputItem::Text {
+                    text: format!(
+                        "{}\n<context ref=\"{uri}\">\n${text}\n</context>",
+                        format_uri_as_link(None, uri.clone())
+                    ),
+                }),
+                // Skip other content types for now
+                ContentBlock::Audio(..) | ContentBlock::Resource(..) => None,
             })
             .collect()
+    }
+}
+
+fn format_uri_as_link(name: Option<String>, uri: String) -> String {
+    if let Some(name) = name
+        && !name.is_empty()
+    {
+        format!("[@{name}]({uri})")
+    } else if let Some(path) = uri.strip_prefix("file://") {
+        let name = path.split('/').next_back().unwrap_or(path);
+        format!("[@{name}]({uri})")
+    } else if uri.starts_with("zed://") {
+        let name = uri.split('/').next_back().unwrap_or(&uri);
+        format!("[@{name}]({uri})")
+    } else {
+        uri
     }
 }
 
