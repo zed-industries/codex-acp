@@ -1,11 +1,11 @@
 use agent_client_protocol::{
     Agent, AgentCapabilities, AgentSideConnection, Annotations, AudioContent, AuthenticateRequest,
     AuthenticateResponse, BlobResourceContents, CancelNotification, Client, ContentBlock, Diff,
-    EmbeddedResource, EmbeddedResourceResource, Error, ExtNotification, ExtRequest, ExtResponse,
-    ImageContent, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
-    McpCapabilities, McpServer, ModelId, ModelInfo, NewSessionRequest, NewSessionResponse,
-    PermissionOption, PermissionOptionId, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
+    EmbeddedResource, EmbeddedResourceResource, Error, ImageContent, InitializeRequest,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
+    ModelId, ModelInfo, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionId, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
     RequestPermissionOutcome, RequestPermissionRequest, ResourceLink, SessionId, SessionMode,
     SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate,
     SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
@@ -960,7 +960,7 @@ impl Agent for CodexAgent {
 
         let session_state = SessionState {
             conversation: conversation.clone(),
-            conversation_handle: Arc::new(ConversationHandle::new(conversation)),
+            conversation_handle: Arc::new(ConversationHandle::new(conversation, config.clone())),
             config,
         };
         let session_id = Self::session_id_from_conversation_id(conversation_id);
@@ -1332,10 +1332,9 @@ impl Agent for CodexAgent {
 
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
         info!("Cancelling operations for session: {}", args.session_id);
-
         self.get_conversation_handle(&args.session_id)
             .await?
-            .interrupt()
+            .cancel()
             .await?;
         Ok(())
     }
@@ -1345,31 +1344,10 @@ impl Agent for CodexAgent {
         args: SetSessionModeRequest,
     ) -> Result<SetSessionModeResponse, Error> {
         info!("Setting session mode for session: {}", args.session_id);
-
-        let preset = APPROVAL_PRESETS
-            .iter()
-            .find(|preset| args.mode_id.0.as_ref() == preset.id)
-            .ok_or_else(Error::invalid_params)?;
-
-        let conversation = self.get_conversation(&args.session_id).await?;
-
-        conversation
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: Some(preset.approval),
-                sandbox_policy: Some(preset.sandbox.clone()),
-                model: None,
-                effort: None,
-                summary: None,
-            })
-            .await
-            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-
-        if let Some(session_state) = self.sessions.borrow_mut().get_mut(&args.session_id) {
-            session_state.config.approval_policy = preset.approval;
-            session_state.config.sandbox_policy = preset.sandbox.clone();
-        }
-
+        self.get_conversation_handle(&args.session_id)
+            .await?
+            .set_mode(args.mode_id)
+            .await?;
         Ok(SetSessionModeResponse::default())
     }
 
@@ -1406,14 +1384,6 @@ impl Agent for CodexAgent {
 
         Ok(SetSessionModelResponse::default())
     }
-
-    async fn ext_method(&self, _args: ExtRequest) -> Result<ExtResponse, Error> {
-        Err(Error::method_not_found())
-    }
-
-    async fn ext_notification(&self, _args: ExtNotification) -> Result<(), Error> {
-        Err(Error::method_not_found())
-    }
 }
 
 fn convert_annotations(annotations: mcp_types::Annotations) -> Annotations {
@@ -1448,7 +1418,11 @@ enum ConversationMessage {
         decision: ReviewDecision,
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
-    Interrupt {
+    SetMode {
+        mode: SessionModeId,
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
+    Cancel {
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
 }
@@ -1461,10 +1435,10 @@ struct ConversationHandle {
 }
 
 impl ConversationHandle {
-    fn new(conversation: Arc<CodexConversation>) -> Self {
+    fn new(conversation: Arc<CodexConversation>, config: Config) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
 
-        let actor = ConversationActor::new(conversation.clone(), message_rx);
+        let actor = ConversationActor::new(conversation.clone(), config, message_rx);
         let handle = tokio::spawn(actor.spawn());
 
         Self {
@@ -1528,10 +1502,21 @@ impl ConversationHandle {
             .map_err(|e| Error::internal_error().with_data(e.to_string()))?
     }
 
-    async fn interrupt(&self) -> Result<(), Error> {
+    async fn set_mode(&self, mode: SessionModeId) -> Result<(), Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let message = ConversationMessage::Interrupt { response_tx };
+        let message = ConversationMessage::SetMode { mode, response_tx };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
+    }
+
+    async fn cancel(&self) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ConversationMessage::Cancel { response_tx };
         drop(self.message_tx.send(message));
 
         response_rx
@@ -1543,6 +1528,8 @@ impl ConversationHandle {
 struct ConversationActor {
     /// The conversation associated with this task.
     conversation: Arc<CodexConversation>,
+    /// The configuration for the conversation.
+    config: Config,
     /// A sender for each interested `Op` submission that needs events routed.
     submissions: HashMap<String, mpsc::UnboundedSender<EventMsg>>,
     /// A receiver for incoming conversation messages.
@@ -1552,10 +1539,12 @@ struct ConversationActor {
 impl ConversationActor {
     fn new(
         conversation: Arc<CodexConversation>,
+        config: Config,
         message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
     ) -> Self {
         Self {
             conversation,
+            config,
             submissions: HashMap::new(),
             message_rx,
         }
@@ -1613,8 +1602,12 @@ impl ConversationActor {
                 let result = self.handle_patch_approval(submission_id, decision).await;
                 drop(response_tx.send(result));
             }
-            ConversationMessage::Interrupt { response_tx } => {
-                let result = self.handle_interrupt().await;
+            ConversationMessage::SetMode { mode, response_tx } => {
+                let result = self.handle_set_mode(mode).await;
+                drop(response_tx.send(result));
+            }
+            ConversationMessage::Cancel { response_tx } => {
+                let result = self.handle_cancel().await;
                 drop(response_tx.send(result));
             }
         }
@@ -1672,7 +1665,31 @@ impl ConversationActor {
         Ok(())
     }
 
-    async fn handle_interrupt(&mut self) -> Result<(), Error> {
+    async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
+        let preset = APPROVAL_PRESETS
+            .iter()
+            .find(|preset| mode.0.as_ref() == preset.id)
+            .ok_or_else(Error::invalid_params)?;
+
+        self.conversation
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: Some(preset.approval),
+                sandbox_policy: Some(preset.sandbox.clone()),
+                model: None,
+                effort: None,
+                summary: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.config.approval_policy = preset.approval;
+        self.config.sandbox_policy = preset.sandbox.clone();
+
+        Ok(())
+    }
+
+    async fn handle_cancel(&mut self) -> Result<(), Error> {
         self.conversation
             .submit(Op::Interrupt)
             .await
