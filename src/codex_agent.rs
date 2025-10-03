@@ -1204,11 +1204,6 @@ impl Agent for CodexAgent {
                         }
                         EventMsg::ExecCommandOutputDelta(delta_event) => {
                             // Output is streamed by the embedded terminal; no ToolCall update is needed here.
-                            if let Some((ref call_id, _)) = active_command
-                                && call_id == &delta_event.call_id
-                            {
-                                // no-op
-                            }
                         }
                         EventMsg::ExecCommandEnd(end_event) => {
                             info!(
