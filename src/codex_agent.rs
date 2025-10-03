@@ -571,7 +571,7 @@ impl CodexAgent {
             // grant_root doesn't seem to be set anywhere on the codex side
             grant_root: _,
         } = event;
-        let conversation = self.get_conversation(&session_id).await?;
+        let conversation = self.get_conversation_handle(&session_id).await?;
         let (title, locations, content) = Self::extract_tool_call_content_from_changes(changes);
         let response = self
             .client()
@@ -621,13 +621,7 @@ impl CodexAgent {
                 _ => ReviewDecision::Abort,
             },
         };
-        conversation
-            .submit(Op::PatchApproval {
-                id: submission_id,
-                decision,
-            })
-            .await
-            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        conversation.patch_approval(submission_id, decision).await?;
         Ok(())
     }
 
@@ -1447,6 +1441,11 @@ enum ConversationMessage {
         decision: ReviewDecision,
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
+    PatchApproval {
+        submission_id: String,
+        decision: ReviewDecision,
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
     Prompt {
         request: PromptRequest,
         response_tx: oneshot::Sender<Result<(String, mpsc::UnboundedReceiver<EventMsg>), Error>>,
@@ -1481,6 +1480,25 @@ impl ConversationHandle {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ConversationMessage::ExecApproval {
+            submission_id,
+            decision,
+            response_tx,
+        };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
+    }
+
+    async fn patch_approval(
+        &self,
+        submission_id: String,
+        decision: ReviewDecision,
+    ) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ConversationMessage::PatchApproval {
             submission_id,
             decision,
             response_tx,
@@ -1568,6 +1586,14 @@ impl ConversationActor {
                 let result = self.handle_exec_approval(submission_id, decision).await;
                 drop(response_tx.send(result));
             }
+            ConversationMessage::PatchApproval {
+                submission_id,
+                decision,
+                response_tx,
+            } => {
+                let result = self.handle_patch_approval(submission_id, decision).await;
+                drop(response_tx.send(result));
+            }
             ConversationMessage::Prompt {
                 request,
                 response_tx,
@@ -1587,6 +1613,21 @@ impl ConversationActor {
     ) -> Result<(), Error> {
         self.conversation
             .submit(Op::ExecApproval {
+                id: submission_id,
+                decision,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        Ok(())
+    }
+
+    async fn handle_patch_approval(
+        &mut self,
+        submission_id: String,
+        decision: ReviewDecision,
+    ) -> Result<(), Error> {
+        self.conversation
+            .submit(Op::PatchApproval {
                 id: submission_id,
                 decision,
             })
