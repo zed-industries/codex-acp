@@ -47,6 +47,7 @@ use std::{
     rc::Rc,
     sync::{Arc, LazyLock, OnceLock},
 };
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
@@ -488,7 +489,7 @@ impl CodexAgent {
             cwd,
             reason,
         } = event;
-        let conversation = self.get_conversation(&session_id).await?;
+        let conversation = self.get_conversation_handle(&session_id).await?;
 
         // Create a new tool call for the command execution
         let tool_call_id = ToolCallId(call_id.clone().into());
@@ -552,13 +553,7 @@ impl CodexAgent {
             },
         };
 
-        conversation
-            .submit(Op::ExecApproval {
-                id: submission_id,
-                decision,
-            })
-            .await
-            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        conversation.exec_approval(submission_id, decision).await?;
         Ok(())
     }
 
@@ -1447,24 +1442,27 @@ fn convert_annotations(annotations: mcp_types::Annotations) -> Annotations {
 }
 
 enum ConversationMessage {
+    ExecApproval {
+        submission_id: String,
+        decision: ReviewDecision,
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
     Prompt {
         request: PromptRequest,
-        response_tx: tokio::sync::oneshot::Sender<
-            Result<(String, tokio::sync::mpsc::UnboundedReceiver<EventMsg>), Error>,
-        >,
+        response_tx: oneshot::Sender<Result<(String, mpsc::UnboundedReceiver<EventMsg>), Error>>,
     },
 }
 
 struct ConversationHandle {
     /// A sender for interacting with the conversation.
-    message_tx: tokio::sync::mpsc::UnboundedSender<ConversationMessage>,
+    message_tx: mpsc::UnboundedSender<ConversationMessage>,
     /// A handle to the spawned task.
     _handle: tokio::task::JoinHandle<()>,
 }
 
 impl ConversationHandle {
     fn new(conversation: Arc<CodexConversation>) -> Self {
-        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (message_tx, message_rx) = mpsc::unbounded_channel();
 
         let actor = ConversationActor::new(conversation.clone(), message_rx);
         let handle = tokio::spawn(actor.spawn());
@@ -1475,11 +1473,30 @@ impl ConversationHandle {
         }
     }
 
+    async fn exec_approval(
+        &self,
+        submission_id: String,
+        decision: ReviewDecision,
+    ) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ConversationMessage::ExecApproval {
+            submission_id,
+            decision,
+            response_tx,
+        };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
+    }
+
     async fn prompt(
         &self,
         request: PromptRequest,
-    ) -> Result<(String, tokio::sync::mpsc::UnboundedReceiver<EventMsg>), Error> {
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    ) -> Result<(String, mpsc::UnboundedReceiver<EventMsg>), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
 
         let message = ConversationMessage::Prompt {
             request,
@@ -1497,15 +1514,15 @@ struct ConversationActor {
     /// The conversation associated with this task.
     conversation: Arc<CodexConversation>,
     /// A sender for each interested `Op` submission that needs events routed.
-    submissions: HashMap<String, tokio::sync::mpsc::UnboundedSender<EventMsg>>,
+    submissions: HashMap<String, mpsc::UnboundedSender<EventMsg>>,
     /// A receiver for incoming conversation messages.
-    message_rx: tokio::sync::mpsc::UnboundedReceiver<ConversationMessage>,
+    message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
 }
 
 impl ConversationActor {
     fn new(
         conversation: Arc<CodexConversation>,
-        message_rx: tokio::sync::mpsc::UnboundedReceiver<ConversationMessage>,
+        message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
     ) -> Self {
         Self {
             conversation,
@@ -1543,6 +1560,14 @@ impl ConversationActor {
 
     async fn handle_message(&mut self, message: ConversationMessage) {
         match message {
+            ConversationMessage::ExecApproval {
+                submission_id,
+                decision,
+                response_tx,
+            } => {
+                let result = self.handle_exec_approval(submission_id, decision).await;
+                drop(response_tx.send(result));
+            }
             ConversationMessage::Prompt {
                 request,
                 response_tx,
@@ -1555,11 +1580,26 @@ impl ConversationActor {
         self.submissions.retain(|_, sender| !sender.is_closed());
     }
 
+    async fn handle_exec_approval(
+        &mut self,
+        submission_id: String,
+        decision: ReviewDecision,
+    ) -> Result<(), Error> {
+        self.conversation
+            .submit(Op::ExecApproval {
+                id: submission_id,
+                decision,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        Ok(())
+    }
+
     async fn handle_prompt(
         &mut self,
         request: PromptRequest,
-    ) -> Result<(String, tokio::sync::mpsc::UnboundedReceiver<EventMsg>), Error> {
-        let (session_tx, session_rx) = tokio::sync::mpsc::unbounded_channel();
+    ) -> Result<(String, mpsc::UnboundedReceiver<EventMsg>), Error> {
+        let (session_tx, session_rx) = mpsc::unbounded_channel();
         let items = build_prompt_items(request.prompt);
 
         let submission_id = match self.conversation.submit(Op::UserInput { items }).await {
@@ -1682,12 +1722,12 @@ impl codex_apply_patch::Fs for AcpFs {
 
 #[derive(Clone)]
 struct LocalSpawner {
-    send: tokio::sync::mpsc::UnboundedSender<FsTask>,
+    send: mpsc::UnboundedSender<FsTask>,
 }
 
 impl LocalSpawner {
     pub fn new() -> Self {
-        let (send, mut recv) = tokio::sync::mpsc::unbounded_channel::<FsTask>();
+        let (send, mut recv) = mpsc::unbounded_channel::<FsTask>();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
