@@ -63,7 +63,7 @@ pub struct CodexAgent {
     /// Conversation manager for handling sessions
     conversation_manager: ConversationManager,
     /// Active sessions mapped by `SessionId`
-    sessions: Rc<RefCell<HashMap<SessionId, Arc<ConversationHandle>>>>,
+    sessions: Rc<RefCell<HashMap<SessionId, Rc<ConversationHandle>>>>,
     /// Default model presets for a given auth mode
     model_presets: Arc<Vec<ModelPreset>>,
 }
@@ -115,7 +115,7 @@ impl CodexAgent {
     async fn get_conversation(
         &self,
         session_id: &SessionId,
-    ) -> Result<Arc<ConversationHandle>, Error> {
+    ) -> Result<Rc<ConversationHandle>, Error> {
         Ok(self
             .sessions
             .borrow()
@@ -862,7 +862,7 @@ impl Agent for CodexAgent {
             .await
             .map_err(|_e| Error::internal_error())?;
 
-        let conversation = Arc::new(ConversationHandle::new(
+        let conversation = Rc::new(ConversationHandle::new(
             conversation,
             config.clone(),
             self.model_presets.clone(),
