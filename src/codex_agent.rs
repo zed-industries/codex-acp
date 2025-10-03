@@ -63,18 +63,9 @@ pub struct CodexAgent {
     /// Conversation manager for handling sessions
     conversation_manager: ConversationManager,
     /// Active sessions mapped by `SessionId`
-    sessions: Rc<RefCell<HashMap<SessionId, SessionState>>>,
+    sessions: Rc<RefCell<HashMap<SessionId, Arc<ConversationHandle>>>>,
     /// Default model presets for a given auth mode
-    model_presets: Vec<ModelPreset>,
-}
-
-/// State for an individual session
-struct SessionState {
-    /// The conversation ID in the conversation manager
-    conversation: Arc<CodexConversation>,
-    conversation_handle: Arc<ConversationHandle>,
-    /// The config used for this session
-    config: Config,
+    model_presets: Arc<Vec<ModelPreset>>,
 }
 
 impl CodexAgent {
@@ -93,7 +84,9 @@ impl CodexAgent {
         }
         let auth_manager = AuthManager::shared(config.codex_home.clone());
 
-        let model_presets = builtin_model_presets(auth_manager.auth().map(|auth| auth.mode));
+        let model_presets = Arc::new(builtin_model_presets(
+            auth_manager.auth().map(|auth| auth.mode),
+        ));
         let local_spawner = LocalSpawner::new();
         let conversation_manager =
             ConversationManager::new(auth_manager).with_fs(Box::new(move |conversation_id| {
@@ -194,26 +187,12 @@ impl CodexAgent {
     async fn get_conversation(
         &self,
         session_id: &SessionId,
-    ) -> Result<Arc<CodexConversation>, Error> {
-        Ok(self
-            .sessions
-            .borrow()
-            .get(session_id)
-            .ok_or_else(Error::invalid_request)?
-            .conversation
-            .clone())
-    }
-
-    async fn get_conversation_handle(
-        &self,
-        session_id: &SessionId,
     ) -> Result<Arc<ConversationHandle>, Error> {
         Ok(self
             .sessions
             .borrow()
             .get(session_id)
             .ok_or_else(Error::invalid_request)?
-            .conversation_handle
             .clone())
     }
 
@@ -489,7 +468,7 @@ impl CodexAgent {
             cwd,
             reason,
         } = event;
-        let conversation = self.get_conversation_handle(&session_id).await?;
+        let conversation = self.get_conversation(&session_id).await?;
 
         // Create a new tool call for the command execution
         let tool_call_id = ToolCallId(call_id.clone().into());
@@ -571,7 +550,7 @@ impl CodexAgent {
             // grant_root doesn't seem to be set anywhere on the codex side
             grant_root: _,
         } = event;
-        let conversation = self.get_conversation_handle(&session_id).await?;
+        let conversation = self.get_conversation(&session_id).await?;
         let (title, locations, content) = Self::extract_tool_call_content_from_changes(changes);
         let response = self
             .client()
@@ -958,16 +937,16 @@ impl Agent for CodexAgent {
             .await
             .map_err(|_e| Error::internal_error())?;
 
-        let session_state = SessionState {
-            conversation: conversation.clone(),
-            conversation_handle: Arc::new(ConversationHandle::new(conversation, config.clone())),
-            config,
-        };
+        let conversation = Arc::new(ConversationHandle::new(
+            conversation,
+            config.clone(),
+            self.model_presets.clone(),
+        ));
         let session_id = Self::session_id_from_conversation_id(conversation_id);
 
         self.sessions
             .borrow_mut()
-            .insert(session_id.clone(), session_state);
+            .insert(session_id.clone(), conversation);
 
         debug!("Created new session with {} MCP servers", num_mcp_servers);
 
@@ -986,19 +965,14 @@ impl Agent for CodexAgent {
         info!("Loading session: {}", request.session_id);
 
         // Check if we have this session already
-        if let Some(session_state) = self.sessions.borrow().get(&request.session_id) {
-            // Session already loaded
-            return Ok(LoadSessionResponse {
-                modes: Self::modes(&session_state.config),
-                models: Some(self.models(&session_state.config)?),
-                meta: None,
-            });
-        }
+        let Some(conversation) = self.sessions.borrow().get(&request.session_id).cloned() else {
+            // For now, we can't actually load sessions from disk
+            // The conversation manager doesn't have a direct load method
+            // We would need to use resume_conversation_from_rollout with a rollout path
+            return Err(Error::invalid_request());
+        };
 
-        // For now, we can't actually load sessions from disk
-        // The conversation manager doesn't have a direct load method
-        // We would need to use resume_conversation_from_rollout with a rollout path
-        return Err(Error::invalid_request());
+        Ok(conversation.load().await?)
     }
 
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {
@@ -1026,7 +1000,7 @@ impl Agent for CodexAgent {
         }
 
         // Get the session state
-        let conversation = self.get_conversation_handle(&request.session_id).await?;
+        let conversation = self.get_conversation(&request.session_id).await?;
         let session_id = request.session_id.clone();
 
         let (submission_id, mut event_rx) = conversation.prompt(request).await?;
@@ -1332,7 +1306,7 @@ impl Agent for CodexAgent {
 
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
         info!("Cancelling operations for session: {}", args.session_id);
-        self.get_conversation_handle(&args.session_id)
+        self.get_conversation(&args.session_id)
             .await?
             .cancel()
             .await?;
@@ -1344,7 +1318,7 @@ impl Agent for CodexAgent {
         args: SetSessionModeRequest,
     ) -> Result<SetSessionModeResponse, Error> {
         info!("Setting session mode for session: {}", args.session_id);
-        self.get_conversation_handle(&args.session_id)
+        self.get_conversation(&args.session_id)
             .await?
             .set_mode(args.mode_id)
             .await?;
@@ -1357,30 +1331,10 @@ impl Agent for CodexAgent {
     ) -> Result<SetSessionModelResponse, Error> {
         info!("Setting session model for session: {}", args.session_id);
 
-        let conversation = self.get_conversation(&args.session_id).await?;
-
-        let preset = self
-            .model_presets
-            .iter()
-            .find(|p| p.id == args.model_id.0.as_ref())
-            .ok_or_else(|| Error::invalid_params().with_data("Model not found"))?;
-
-        conversation
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                sandbox_policy: None,
-                model: Some(preset.model.into()),
-                effort: Some(preset.effort),
-                summary: None,
-            })
-            .await
-            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-
-        if let Some(session_state) = self.sessions.borrow_mut().get_mut(&args.session_id) {
-            session_state.config.model = preset.model.into();
-            session_state.config.model_reasoning_effort = preset.effort;
-        }
+        self.get_conversation(&args.session_id)
+            .await?
+            .set_model(args.model_id)
+            .await?;
 
         Ok(SetSessionModelResponse::default())
     }
@@ -1404,6 +1358,9 @@ fn convert_annotations(annotations: mcp_types::Annotations) -> Annotations {
 }
 
 enum ConversationMessage {
+    Load {
+        response_tx: oneshot::Sender<Result<LoadSessionResponse, Error>>,
+    },
     Prompt {
         request: PromptRequest,
         response_tx: oneshot::Sender<Result<(String, mpsc::UnboundedReceiver<EventMsg>), Error>>,
@@ -1422,6 +1379,10 @@ enum ConversationMessage {
         mode: SessionModeId,
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
+    SetModel {
+        model: ModelId,
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
     Cancel {
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
@@ -1435,16 +1396,31 @@ struct ConversationHandle {
 }
 
 impl ConversationHandle {
-    fn new(conversation: Arc<CodexConversation>, config: Config) -> Self {
+    fn new(
+        conversation: Arc<CodexConversation>,
+        config: Config,
+        model_presets: Arc<Vec<ModelPreset>>,
+    ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
 
-        let actor = ConversationActor::new(conversation.clone(), config, message_rx);
+        let actor = ConversationActor::new(conversation.clone(), config, model_presets, message_rx);
         let handle = tokio::spawn(actor.spawn());
 
         Self {
             message_tx,
             _handle: handle,
         }
+    }
+
+    async fn load(&self) -> Result<LoadSessionResponse, Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ConversationMessage::Load { response_tx };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
     }
 
     async fn prompt(
@@ -1513,6 +1489,17 @@ impl ConversationHandle {
             .map_err(|e| Error::internal_error().with_data(e.to_string()))?
     }
 
+    async fn set_model(&self, model: ModelId) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ConversationMessage::SetModel { model, response_tx };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
+    }
+
     async fn cancel(&self) -> Result<(), Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -1530,6 +1517,8 @@ struct ConversationActor {
     conversation: Arc<CodexConversation>,
     /// The configuration for the conversation.
     config: Config,
+    /// The model presets for the conversation.
+    model_presets: Arc<Vec<ModelPreset>>,
     /// A sender for each interested `Op` submission that needs events routed.
     submissions: HashMap<String, mpsc::UnboundedSender<EventMsg>>,
     /// A receiver for incoming conversation messages.
@@ -1540,11 +1529,13 @@ impl ConversationActor {
     fn new(
         conversation: Arc<CodexConversation>,
         config: Config,
+        model_presets: Arc<Vec<ModelPreset>>,
         message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
     ) -> Self {
         Self {
             conversation,
             config,
+            model_presets,
             submissions: HashMap::new(),
             message_rx,
         }
@@ -1579,6 +1570,10 @@ impl ConversationActor {
 
     async fn handle_message(&mut self, message: ConversationMessage) {
         match message {
+            ConversationMessage::Load { response_tx } => {
+                let result = self.handle_load().await;
+                drop(response_tx.send(result));
+            }
             ConversationMessage::Prompt {
                 request,
                 response_tx,
@@ -1606,6 +1601,10 @@ impl ConversationActor {
                 let result = self.handle_set_mode(mode).await;
                 drop(response_tx.send(result));
             }
+            ConversationMessage::SetModel { model, response_tx } => {
+                let result = self.handle_set_model(model).await;
+                drop(response_tx.send(result));
+            }
             ConversationMessage::Cancel { response_tx } => {
                 let result = self.handle_cancel().await;
                 drop(response_tx.send(result));
@@ -1613,6 +1612,90 @@ impl ConversationActor {
         }
         // Litter collection of senders with no receivers
         self.submissions.retain(|_, sender| !sender.is_closed());
+    }
+
+    fn modes(&self) -> Option<SessionModeState> {
+        let current_mode_id = APPROVAL_PRESETS
+            .iter()
+            .find(|preset| {
+                preset.approval == self.config.approval_policy
+                    && preset.sandbox == self.config.sandbox_policy
+            })
+            .map(|preset| SessionModeId(preset.id.into()))?;
+
+        Some(SessionModeState {
+            current_mode_id,
+            available_modes: APPROVAL_PRESETS
+                .iter()
+                .map(|preset| SessionMode {
+                    id: SessionModeId(preset.id.into()),
+                    name: preset.label.to_owned(),
+                    description: Some(preset.description.to_owned()),
+                    meta: None,
+                })
+                .collect(),
+            meta: None,
+        })
+    }
+
+    fn find_model_preset(&self) -> Option<&ModelPreset> {
+        if let Some(preset) = self.model_presets.iter().find(|preset| {
+            preset.model == self.config.model && preset.effort == self.config.model_reasoning_effort
+        }) {
+            return Some(preset);
+        }
+
+        // If we didn't find it, and it is set to none, see if we can find one with the default value
+        if self.config.model_reasoning_effort.is_none()
+            && let Some(preset) = self.model_presets.iter().find(|preset| {
+                preset.model == self.config.model
+                    && preset.effort == Some(ReasoningEffort::default())
+            })
+        {
+            return Some(preset);
+        }
+
+        None
+    }
+
+    fn models(&self) -> Result<SessionModelState, Error> {
+        let current_model_id = self
+            .find_model_preset()
+            .map(|preset| ModelId(preset.id.into()))
+            .ok_or_else(|| {
+                anyhow::anyhow!("No valid model preset for model {}", self.config.model)
+            })?;
+
+        let available_models = self
+            .model_presets
+            .iter()
+            .map(|preset| ModelInfo {
+                model_id: ModelId(preset.id.into()),
+                name: preset.label.into(),
+                description: Some(
+                    preset
+                        .description
+                        .strip_prefix("— ")
+                        .unwrap_or(preset.description)
+                        .into(),
+                ),
+                meta: None,
+            })
+            .collect();
+
+        Ok(SessionModelState {
+            current_model_id,
+            available_models,
+            meta: None,
+        })
+    }
+
+    async fn handle_load(&mut self) -> Result<LoadSessionResponse, Error> {
+        Ok(LoadSessionResponse {
+            modes: self.modes(),
+            models: Some(self.models()?),
+            meta: None,
+        })
     }
 
     async fn handle_prompt(
@@ -1685,6 +1768,31 @@ impl ConversationActor {
 
         self.config.approval_policy = preset.approval;
         self.config.sandbox_policy = preset.sandbox.clone();
+
+        Ok(())
+    }
+
+    async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
+        let preset = self
+            .model_presets
+            .iter()
+            .find(|p| p.id == model.0.as_ref())
+            .ok_or_else(|| Error::invalid_params().with_data("Model not found"))?;
+
+        self.conversation
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                model: Some(preset.model.into()),
+                effort: Some(preset.effort),
+                summary: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.config.model = preset.model.into();
+        self.config.model_reasoning_effort = preset.effort;
 
         Ok(())
     }
