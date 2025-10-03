@@ -1149,6 +1149,45 @@ impl Agent for CodexAgent {
                             } = event;
                             // Create a new tool call for the command execution
                             let tool_call_id = ToolCallId(call_id.clone().into());
+                            let _call_id_for_meta = call_id.clone();
+                            // Prepare an embedded terminal for this tool call so the client can render it.
+                            if command.is_empty() {
+                                let _ = self
+                                    .send_notification(
+                                        request.session_id.clone(),
+                                        SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                                            id: tool_call_id.clone(),
+                                            fields: ToolCallUpdateFields {
+                                                status: Some(ToolCallStatus::Failed),
+                                                title: Some("No command provided".into()),
+                                                ..Default::default()
+                                            },
+                                            meta: None,
+                                        }),
+                                    )
+                                    .await;
+                                continue;
+                            }
+                            let (cmd, cmd_args) = (command[0].clone(), command[1..].to_vec());
+                            let mut terminal_content: Vec<ToolCallContent> = Vec::new();
+                            if let Ok(resp) = self
+                                .client()
+                                .create_terminal(agent_client_protocol::CreateTerminalRequest {
+                                    session_id: request.session_id.clone(),
+                                    command: cmd,
+                                    args: cmd_args,
+                                    env: vec![],
+                                    cwd: Some(cwd.clone()),
+                                    output_byte_limit: None,
+                                    meta: None,
+                                })
+                                .await
+                            {
+                                terminal_content.push(ToolCallContent::Terminal {
+                                    terminal_id: resp.terminal_id,
+                                });
+                            }
+
                             active_command = Some((call_id, tool_call_id.clone()));
 
                             self.send_notification(
@@ -1158,12 +1197,12 @@ impl Agent for CodexAgent {
                                     title: format!("Running: {}", command.join(" ")),
                                     kind: ToolKind::Execute,
                                     status: ToolCallStatus::InProgress,
-                                    content: vec![],
+                                    content: terminal_content,
                                     locations: if cwd == std::path::PathBuf::from(".") {
                                         vec![]
                                     } else {
                                         vec![ToolCallLocation {
-                                            path: cwd,
+                                            path: cwd.clone(),
                                             line: None,
                                             meta: None,
                                         }]
@@ -1174,43 +1213,12 @@ impl Agent for CodexAgent {
                                 }),
                             )
                             .await;
+
                         }
-                        EventMsg::ExecCommandOutputDelta(delta_event) => {
-                            // Accumulate command output and send the full content
-                            if let Some((ref call_id, ref tool_call_id)) = active_command
-                                && call_id == &delta_event.call_id
-                            {
-                                // Convert the output chunk to a string (best effort)
-                                let output_text = String::from_utf8_lossy(&delta_event.chunk);
-
-                                // Accumulate the output
-                                command_output.push(output_text.to_string());
-
-                                // Send the full accumulated output (content is replaced, not appended)
-                                let accumulated_output = command_output.join("");
-
-                                self.send_notification(request.session_id.clone(), SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                                    id: tool_call_id.clone(),
-                                    fields: ToolCallUpdateFields {
-                                        // Send the full accumulated content
-                                        content: Some(vec![ToolCallContent::Content {
-                                            content: ContentBlock::Text(TextContent {
-                                                text: accumulated_output,
-                                                annotations: None,
-                                                meta: Some(serde_json::json!({
-                                                    "stream": format!("{:?}", delta_event.stream),
-                                                    "streaming": true,
-                                                })),
-                                            }),
-                                        }]),
-                                        ..Default::default()
-                                    },
-                                    meta: None,
-                                })).await;
-                            }
+                        EventMsg::ExecCommandOutputDelta(_delta_event) => {
+                            // Output is streamed by the embedded terminal; no ToolCall update is needed here.
                         }
                         EventMsg::ExecCommandEnd(end_event) => {
-                            let raw_output = serde_json::json!(&end_event);
                             info!(
                                 "Command execution ended: call_id={}, exit_code={}",
                                 end_event.call_id, end_event.exit_code
@@ -1229,28 +1237,6 @@ impl Agent for CodexAgent {
                                         } else {
                                             ToolCallStatus::Failed
                                         }),
-                                        // Send final aggregated output
-                                        content: Some(vec![ToolCallContent::Content {
-                                            content: ContentBlock::Text(TextContent {
-                                                text: if !end_event.formatted_output.is_empty()
-                                                {
-                                                    end_event.formatted_output.clone()
-                                                } else if !end_event
-                                                    .aggregated_output
-                                                    .is_empty()
-                                                {
-                                                    end_event.aggregated_output.clone()
-                                                } else {
-                                                    format!(
-                                                        "stdout:\n{}\n\nstderr:\n{}",
-                                                        end_event.stdout, end_event.stderr
-                                                    )
-                                                },
-                                                annotations: None,
-                                                meta: None,
-                                            }),
-                                        }]),
-                                        raw_output: Some(raw_output),
                                         ..Default::default()
                                     },
                                     meta: None,
