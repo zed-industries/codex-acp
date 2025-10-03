@@ -112,78 +112,6 @@ impl CodexAgent {
         SessionId(conversation_id.to_string().into())
     }
 
-    fn modes(config: &Config) -> Option<SessionModeState> {
-        let current_mode_id = APPROVAL_PRESETS
-            .iter()
-            .find(|preset| {
-                preset.approval == config.approval_policy && preset.sandbox == config.sandbox_policy
-            })
-            .map(|preset| SessionModeId(preset.id.into()))?;
-
-        Some(SessionModeState {
-            current_mode_id,
-            available_modes: APPROVAL_PRESETS
-                .iter()
-                .map(|preset| SessionMode {
-                    id: SessionModeId(preset.id.into()),
-                    name: preset.label.to_owned(),
-                    description: Some(preset.description.to_owned()),
-                    meta: None,
-                })
-                .collect(),
-            meta: None,
-        })
-    }
-
-    fn find_model_preset(&self, config: &Config) -> Option<&ModelPreset> {
-        if let Some(preset) = self.model_presets.iter().find(|preset| {
-            preset.model == config.model && preset.effort == config.model_reasoning_effort
-        }) {
-            return Some(preset);
-        }
-
-        // If we didn't find it, and it is set to none, see if we can find one with the default value
-        if config.model_reasoning_effort.is_none()
-            && let Some(preset) = self.model_presets.iter().find(|preset| {
-                preset.model == config.model && preset.effort == Some(ReasoningEffort::default())
-            })
-        {
-            return Some(preset);
-        }
-
-        None
-    }
-
-    fn models(&self, config: &Config) -> Result<SessionModelState, Error> {
-        let current_model_id = self
-            .find_model_preset(config)
-            .map(|preset| ModelId(preset.id.into()))
-            .ok_or_else(|| anyhow::anyhow!("No valid model preset for model {}", config.model))?;
-
-        let available_models = self
-            .model_presets
-            .iter()
-            .map(|preset| ModelInfo {
-                model_id: ModelId(preset.id.into()),
-                name: preset.label.into(),
-                description: Some(
-                    preset
-                        .description
-                        .strip_prefix("— ")
-                        .unwrap_or(preset.description)
-                        .into(),
-                ),
-                meta: None,
-            })
-            .collect();
-
-        Ok(SessionModelState {
-            current_model_id,
-            available_models,
-            meta: None,
-        })
-    }
-
     async fn get_conversation(
         &self,
         session_id: &SessionId,
@@ -924,9 +852,6 @@ impl Agent for CodexAgent {
 
         let num_mcp_servers = config.mcp_servers.len();
 
-        let modes = Self::modes(&config);
-        let models = self.models(&config)?;
-
         let NewConversation {
             conversation_id,
             conversation,
@@ -942,6 +867,7 @@ impl Agent for CodexAgent {
             config.clone(),
             self.model_presets.clone(),
         ));
+        let load = conversation.load().await?;
         let session_id = Self::session_id_from_conversation_id(conversation_id);
 
         self.sessions
@@ -952,8 +878,8 @@ impl Agent for CodexAgent {
 
         Ok(NewSessionResponse {
             session_id,
-            modes,
-            models: Some(models),
+            modes: load.modes,
+            models: load.models,
             meta: None,
         })
     }
