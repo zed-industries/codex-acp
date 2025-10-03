@@ -1149,8 +1149,32 @@ impl Agent for CodexAgent {
                             } = event;
                             // Create a new tool call for the command execution
                             let tool_call_id = ToolCallId(call_id.clone().into());
-                            let tool_call_id_for_update = tool_call_id.clone();
                             let _call_id_for_meta = call_id.clone();
+                            // Prepare an embedded terminal for this tool call so the client can render it.
+                            let (cmd, cmd_args) = if command.is_empty() {
+                                ("sh".to_string(), vec![])
+                            } else {
+                                (command[0].clone(), command[1..].to_vec())
+                            };
+                            let mut terminal_content: Vec<ToolCallContent> = Vec::new();
+                            if let Ok(resp) = self
+                                .client()
+                                .create_terminal(agent_client_protocol::CreateTerminalRequest {
+                                    session_id: request.session_id.clone(),
+                                    command: cmd,
+                                    args: cmd_args,
+                                    env: vec![],
+                                    cwd: Some(cwd.clone()),
+                                    output_byte_limit: None,
+                                    meta: None,
+                                })
+                                .await
+                            {
+                                terminal_content.push(ToolCallContent::Terminal {
+                                    terminal_id: resp.terminal_id,
+                                });
+                            }
+
                             active_command = Some((call_id, tool_call_id.clone()));
 
                             self.send_notification(
@@ -1160,7 +1184,7 @@ impl Agent for CodexAgent {
                                     title: format!("Running: {}", command.join(" ")),
                                     kind: ToolKind::Execute,
                                     status: ToolCallStatus::InProgress,
-                                    content: vec![],
+                                    content: terminal_content,
                                     locations: if cwd == std::path::PathBuf::from(".") {
                                         vec![]
                                     } else {
@@ -1177,43 +1201,6 @@ impl Agent for CodexAgent {
                             )
                             .await;
 
-                            // Create a terminal in the client and embed it in the tool call so Zed renders it.
-                            let (cmd, cmd_args) = if command.is_empty() {
-                                ("sh".to_string(), vec![])
-                            } else {
-                                (command[0].clone(), command[1..].to_vec())
-                            };
-
-                            if let Ok(resp) = self
-                                .client()
-                                .create_terminal(agent_client_protocol::CreateTerminalRequest {
-                                    session_id: request.session_id.clone(),
-                                    command: cmd,
-                                    args: cmd_args,
-                                    env: vec![],
-                                    cwd: Some(cwd.clone()),
-                                    output_byte_limit: None,
-                                    meta: None,
-                                })
-                                .await
-                            {
-                                // Replace tool call content with an embedded terminal
-                                let _ = self
-                                    .send_notification(
-                                        request.session_id.clone(),
-                                        SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                                            id: tool_call_id_for_update,
-                                            fields: ToolCallUpdateFields {
-                                                content: Some(vec![ToolCallContent::Terminal {
-                                                    terminal_id: resp.terminal_id,
-                                                }]),
-                                                ..Default::default()
-                                            },
-                                            meta: None,
-                                        }),
-                                    )
-                                    .await;
-                            }
                         }
                         EventMsg::ExecCommandOutputDelta(delta_event) => {
                             // Output is streamed by the embedded terminal; no ToolCall update is needed here.
