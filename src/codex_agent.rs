@@ -1224,7 +1224,6 @@ impl Agent for CodexAgent {
                             }
                         }
                         EventMsg::ExecCommandEnd(end_event) => {
-                            let raw_output = serde_json::json!(&end_event);
                             info!(
                                 "Command execution ended: call_id={}, exit_code={}",
                                 end_event.call_id, end_event.exit_code
