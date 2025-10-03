@@ -1,11 +1,11 @@
 use agent_client_protocol::{
     Agent, AgentCapabilities, AgentSideConnection, Annotations, AudioContent, AuthenticateRequest,
     AuthenticateResponse, BlobResourceContents, CancelNotification, Client, ContentBlock, Diff,
-    EmbeddedResource, EmbeddedResourceResource, Error, ExtNotification, ExtRequest, ExtResponse,
-    ImageContent, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
-    McpCapabilities, McpServer, ModelId, ModelInfo, NewSessionRequest, NewSessionResponse,
-    PermissionOption, PermissionOptionId, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
+    EmbeddedResource, EmbeddedResourceResource, Error, ImageContent, InitializeRequest,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
+    ModelId, ModelInfo, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionId, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
     RequestPermissionOutcome, RequestPermissionRequest, ResourceLink, SessionId, SessionMode,
     SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate,
     SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
@@ -18,7 +18,7 @@ use codex_common::{
     model_presets::{ModelPreset, builtin_model_presets},
 };
 use codex_core::{
-    CodexConversation, ConversationManager,
+    CodexConversation, ConversationManager, NewConversation,
     auth::{AuthManager, CodexAuth, login_with_api_key},
     config::Config,
     config_types::{McpServerConfig, McpServerTransportConfig},
@@ -26,7 +26,7 @@ use codex_core::{
     protocol::{
         AgentMessageDeltaEvent, AgentMessageEvent, AgentReasoningDeltaEvent, AgentReasoningEvent,
         AgentReasoningRawContentDeltaEvent, AgentReasoningRawContentEvent,
-        AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ErrorEvent,
+        AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ErrorEvent, Event,
         ExecApprovalRequestEvent, ExecCommandBeginEvent, FileChange, McpInvocation,
         McpToolCallBeginEvent, McpToolCallEndEvent, PatchApplyBeginEvent, PatchApplyEndEvent,
         ReviewDecision, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent,
@@ -47,6 +47,7 @@ use std::{
     rc::Rc,
     sync::{Arc, LazyLock, OnceLock},
 };
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
@@ -62,17 +63,9 @@ pub struct CodexAgent {
     /// Conversation manager for handling sessions
     conversation_manager: ConversationManager,
     /// Active sessions mapped by `SessionId`
-    sessions: Rc<RefCell<HashMap<SessionId, SessionState>>>,
+    sessions: Rc<RefCell<HashMap<SessionId, Arc<ConversationHandle>>>>,
     /// Default model presets for a given auth mode
-    model_presets: Vec<ModelPreset>,
-}
-
-/// State for an individual session
-struct SessionState {
-    /// The conversation ID in the conversation manager
-    conversation_id: ConversationId,
-    /// The config used for this session
-    config: Config,
+    model_presets: Arc<Vec<ModelPreset>>,
 }
 
 impl CodexAgent {
@@ -91,7 +84,9 @@ impl CodexAgent {
         }
         let auth_manager = AuthManager::shared(config.codex_home.clone());
 
-        let model_presets = builtin_model_presets(auth_manager.auth().map(|auth| auth.mode));
+        let model_presets = Arc::new(builtin_model_presets(
+            auth_manager.auth().map(|auth| auth.mode),
+        ));
         let local_spawner = LocalSpawner::new();
         let conversation_manager =
             ConversationManager::new(auth_manager).with_fs(Box::new(move |conversation_id| {
@@ -117,94 +112,16 @@ impl CodexAgent {
         SessionId(conversation_id.to_string().into())
     }
 
-    fn modes(config: &Config) -> Option<SessionModeState> {
-        let current_mode_id = APPROVAL_PRESETS
-            .iter()
-            .find(|preset| {
-                preset.approval == config.approval_policy && preset.sandbox == config.sandbox_policy
-            })
-            .map(|preset| SessionModeId(preset.id.into()))?;
-
-        Some(SessionModeState {
-            current_mode_id,
-            available_modes: APPROVAL_PRESETS
-                .iter()
-                .map(|preset| SessionMode {
-                    id: SessionModeId(preset.id.into()),
-                    name: preset.label.to_owned(),
-                    description: Some(preset.description.to_owned()),
-                    meta: None,
-                })
-                .collect(),
-            meta: None,
-        })
-    }
-
-    fn find_model_preset(&self, config: &Config) -> Option<&ModelPreset> {
-        if let Some(preset) = self.model_presets.iter().find(|preset| {
-            preset.model == config.model && preset.effort == config.model_reasoning_effort
-        }) {
-            return Some(preset);
-        }
-
-        // If we didn't find it, and it is set to none, see if we can find one with the default value
-        if config.model_reasoning_effort.is_none()
-            && let Some(preset) = self.model_presets.iter().find(|preset| {
-                preset.model == config.model && preset.effort == Some(ReasoningEffort::default())
-            })
-        {
-            return Some(preset);
-        }
-
-        None
-    }
-
-    fn models(&self, config: &Config) -> Result<SessionModelState, Error> {
-        let current_model_id = self
-            .find_model_preset(config)
-            .map(|preset| ModelId(preset.id.into()))
-            .ok_or_else(|| anyhow::anyhow!("No valid model preset for model {}", config.model))?;
-
-        let available_models = self
-            .model_presets
-            .iter()
-            .map(|preset| ModelInfo {
-                model_id: ModelId(preset.id.into()),
-                name: preset.label.into(),
-                description: Some(
-                    preset
-                        .description
-                        .strip_prefix("— ")
-                        .unwrap_or(preset.description)
-                        .into(),
-                ),
-                meta: None,
-            })
-            .collect();
-
-        Ok(SessionModelState {
-            current_model_id,
-            available_models,
-            meta: None,
-        })
-    }
-
     async fn get_conversation(
         &self,
         session_id: &SessionId,
-    ) -> Result<Arc<CodexConversation>, Error> {
-        // Get the session to find the conversation ID
-        let conversation_id = self
+    ) -> Result<Arc<ConversationHandle>, Error> {
+        Ok(self
             .sessions
             .borrow()
             .get(session_id)
             .ok_or_else(Error::invalid_request)?
-            .conversation_id;
-
-        self.conversation_manager
-            .get_conversation(conversation_id)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).into())
+            .clone())
     }
 
     async fn send_notification(&self, session_id: SessionId, update: SessionUpdate) {
@@ -543,13 +460,7 @@ impl CodexAgent {
             },
         };
 
-        conversation
-            .submit(Op::ExecApproval {
-                id: submission_id,
-                decision,
-            })
-            .await
-            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        conversation.exec_approval(submission_id, decision).await?;
         Ok(())
     }
 
@@ -617,13 +528,7 @@ impl CodexAgent {
                 _ => ReviewDecision::Abort,
             },
         };
-        conversation
-            .submit(Op::PatchApproval {
-                id: submission_id,
-                decision,
-            })
-            .await
-            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        conversation.patch_approval(submission_id, decision).await?;
         Ok(())
     }
 
@@ -727,65 +632,65 @@ impl CodexAgent {
                 }),
         )
     }
+}
 
-    fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<InputItem> {
-        prompt
-            .into_iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text(text_block) => Some(InputItem::Text {
-                    text: text_block.text.clone(),
-                }),
-                ContentBlock::Image(image_block) => {
-                    // Convert to data URI if needed
-                    if let Some(uri) = &image_block.uri {
-                        Some(InputItem::Image {
-                            image_url: uri.clone(),
-                        })
-                    } else {
-                        // Base64 data
-                        let data_uri = format!(
-                            "data:{};base64,{}",
-                            image_block.mime_type.clone(),
-                            image_block.data.clone()
-                        );
-                        Some(InputItem::Image {
-                            image_url: data_uri,
-                        })
-                    }
+fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<InputItem> {
+    prompt
+        .into_iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text_block) => Some(InputItem::Text {
+                text: text_block.text.clone(),
+            }),
+            ContentBlock::Image(image_block) => {
+                // Convert to data URI if needed
+                if let Some(uri) = &image_block.uri {
+                    Some(InputItem::Image {
+                        image_url: uri.clone(),
+                    })
+                } else {
+                    // Base64 data
+                    let data_uri = format!(
+                        "data:{};base64,{}",
+                        image_block.mime_type.clone(),
+                        image_block.data.clone()
+                    );
+                    Some(InputItem::Image {
+                        image_url: data_uri,
+                    })
                 }
-                ContentBlock::ResourceLink(ResourceLink {
-                    annotations: _,
-                    description: _,
-                    mime_type: _,
-                    name,
-                    size: _,
-                    title: _,
-                    uri,
-                    meta: _,
-                }) => Some(InputItem::Text {
-                    text: format_uri_as_link(Some(name), uri),
-                }),
-                ContentBlock::Resource(EmbeddedResource {
-                    annotations: _,
-                    resource:
-                        EmbeddedResourceResource::TextResourceContents(TextResourceContents {
-                            mime_type: _,
-                            text,
-                            uri,
-                            meta: _,
-                        }),
-                    meta: _,
-                }) => Some(InputItem::Text {
-                    text: format!(
-                        "{}\n<context ref=\"{uri}\">\n${text}\n</context>",
-                        format_uri_as_link(None, uri.clone())
-                    ),
-                }),
-                // Skip other content types for now
-                ContentBlock::Audio(..) | ContentBlock::Resource(..) => None,
-            })
-            .collect()
-    }
+            }
+            ContentBlock::ResourceLink(ResourceLink {
+                annotations: _,
+                description: _,
+                mime_type: _,
+                name,
+                size: _,
+                title: _,
+                uri,
+                meta: _,
+            }) => Some(InputItem::Text {
+                text: format_uri_as_link(Some(name), uri),
+            }),
+            ContentBlock::Resource(EmbeddedResource {
+                annotations: _,
+                resource:
+                    EmbeddedResourceResource::TextResourceContents(TextResourceContents {
+                        mime_type: _,
+                        text,
+                        uri,
+                        meta: _,
+                    }),
+                meta: _,
+            }) => Some(InputItem::Text {
+                text: format!(
+                    "{}\n<context ref=\"{uri}\">\n${text}\n</context>",
+                    format_uri_as_link(None, uri.clone())
+                ),
+            }),
+            // Skip other content types for now
+            ContentBlock::Audio(..) | ContentBlock::Resource(..) => None,
+        })
+        .collect()
 }
 
 fn format_uri_as_link(name: Option<String>, uri: String) -> String {
@@ -947,31 +852,34 @@ impl Agent for CodexAgent {
 
         let num_mcp_servers = config.mcp_servers.len();
 
-        let modes = Self::modes(&config);
-        let models = self.models(&config)?;
-
-        let new_conversation = self
+        let NewConversation {
+            conversation_id,
+            conversation,
+            session_configured: _,
+        } = self
             .conversation_manager
             .new_conversation(config.clone())
             .await
             .map_err(|_e| Error::internal_error())?;
 
-        let session_state = SessionState {
-            conversation_id: new_conversation.conversation_id,
-            config,
-        };
-        let session_id = Self::session_id_from_conversation_id(new_conversation.conversation_id);
+        let conversation = Arc::new(ConversationHandle::new(
+            conversation,
+            config.clone(),
+            self.model_presets.clone(),
+        ));
+        let load = conversation.load().await?;
+        let session_id = Self::session_id_from_conversation_id(conversation_id);
 
         self.sessions
             .borrow_mut()
-            .insert(session_id.clone(), session_state);
+            .insert(session_id.clone(), conversation);
 
         debug!("Created new session with {} MCP servers", num_mcp_servers);
 
         Ok(NewSessionResponse {
             session_id,
-            modes,
-            models: Some(models),
+            modes: load.modes,
+            models: load.models,
             meta: None,
         })
     }
@@ -983,19 +891,14 @@ impl Agent for CodexAgent {
         info!("Loading session: {}", request.session_id);
 
         // Check if we have this session already
-        if let Some(session_state) = self.sessions.borrow().get(&request.session_id) {
-            // Session already loaded
-            return Ok(LoadSessionResponse {
-                modes: Self::modes(&session_state.config),
-                models: Some(self.models(&session_state.config)?),
-                meta: None,
-            });
-        }
+        let Some(conversation) = self.sessions.borrow().get(&request.session_id).cloned() else {
+            // For now, we can't actually load sessions from disk
+            // The conversation manager doesn't have a direct load method
+            // We would need to use resume_conversation_from_rollout with a rollout path
+            return Err(Error::invalid_request());
+        };
 
-        // For now, we can't actually load sessions from disk
-        // The conversation manager doesn't have a direct load method
-        // We would need to use resume_conversation_from_rollout with a rollout path
-        return Err(Error::invalid_request());
+        Ok(conversation.load().await?)
     }
 
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {
@@ -1024,23 +927,14 @@ impl Agent for CodexAgent {
 
         // Get the session state
         let conversation = self.get_conversation(&request.session_id).await?;
+        let session_id = request.session_id.clone();
 
-        // Convert ACP prompt format to codex format
-        let items = Self::build_prompt_items(request.prompt);
-        let items_len = items.len();
+        let (submission_id, mut event_rx) = conversation.prompt(request).await?;
 
-        let submission_id = conversation
-            .submit(Op::UserInput { items })
-            .await
-            .map_err(|e| {
-                error!("Failed to submit prompt: {e:?}");
-                Error::internal_error()
-            })?;
-
-        info!("Submitted prompt with submission_id: {submission_id}, {items_len} input items");
+        info!("Submitted prompt with submission_id: {submission_id}");
 
         // Wait for the conversation to complete (TaskComplete or TurnAborted)
-        let stop_reason;
+        let mut stop_reason = StopReason::EndTurn;
 
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
 
@@ -1048,294 +942,278 @@ impl Agent for CodexAgent {
         let mut active_web_search: Option<String> = None;
         let mut active_command: Option<(String, ToolCallId)> = None;
         let mut command_output: Vec<String> = Vec::new();
-        loop {
+        while let Some(event) = event_rx.recv().await {
             event_count += 1;
-            match conversation.next_event().await {
-                Ok(event) => {
+            // Complete any previous web search before starting a new one
+            match &event {
+                EventMsg::Error(..)
+                | EventMsg::StreamError(..)
+                | EventMsg::WebSearchBegin(..)
+                | EventMsg::UserMessage(..)
+                | EventMsg::ExecApprovalRequest(..)
+                | EventMsg::ExecCommandBegin(..)
+                | EventMsg::ExecCommandOutputDelta(..)
+                | EventMsg::ExecCommandEnd(..)
+                | EventMsg::McpToolCallBegin(..)
+                | EventMsg::McpToolCallEnd(..)
+                | EventMsg::ApplyPatchApprovalRequest(..)
+                | EventMsg::PatchApplyBegin(..)
+                | EventMsg::PatchApplyEnd(..)
+                | EventMsg::TaskComplete(..)
+                | EventMsg::TokenCount(..)
+                | EventMsg::TurnDiff(..)
+                | EventMsg::TurnAborted(..)
+                | EventMsg::ShutdownComplete => {
+                    self.complete_web_search(session_id.clone(), &mut active_web_search)
+                        .await;
+                }
+                _ => {}
+            }
+
+            match event {
+                EventMsg::TaskStarted(TaskStartedEvent { model_context_window }) => {
+                    info!("Task started with context window of {model_context_window:?}");
+                }
+                EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
+                    info!("User message echoed: {message:?}");
+                }
+                EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
+                    // Send this to the client via session/update notification
+                    info!("Agent message received: {delta:?}");
+                    self.send_agent_text(session_id.clone(), delta).await;
+                }
+                EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent { delta })
+                | EventMsg::AgentReasoningRawContentDelta(
+                    AgentReasoningRawContentDeltaEvent { delta },
+                ) => {
+                    // Send this to the client via session/update notification
+                    info!("Agent reasoning message received: {:?}", delta);
+                    self.send_agent_thought(session_id.clone(), delta).await;
+                }
+                EventMsg::AgentReasoningSectionBreak(
+                    AgentReasoningSectionBreakEvent {},
+                ) => {
+                    // Make sure the section heading actually get spacing
+                    self.send_agent_thought(session_id.clone(), "\n\n").await;
+                }
+                EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
+                    // Send this to the client via session/update notification
+                    info!("Agent plan updated. Explanation: {:?}", explanation);
+                    self.update_plan(session_id.clone(), plan).await;
+                }
+                EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id }) => {
+                    info!("Web search started: call_id={}", call_id);
+                    // Create a ToolCall notification for the search beginning
+                    self.start_web_search(session_id.clone(), call_id, &mut active_web_search).await;
+                }
+                EventMsg::WebSearchEnd(WebSearchEndEvent { call_id, query }) => {
+                    info!("Web search query received: call_id={call_id}, query={query}");
+                    // Send update that the search is in progress with the query
+                    // (WebSearchEnd just means we have the query, not that results are ready)
+                    self.update_web_search_query(session_id.clone(), call_id, query).await;
+                    // The actual search results will come through AgentMessage events
+                    // We mark as completed when a new tool call begins
+                }
+                EventMsg::ExecApprovalRequest(event) => {
+                    info!("Command execution started: call_id={}, command={:?}", event.call_id, event.command);
+                    self.exec_approval(session_id.clone(), submission_id.clone(), event, &mut active_command).await?;
+                }
+                EventMsg::ExecCommandBegin(event) => {
                     info!(
-                        "Received event #{event_count}: {:?} (id: {})",
-                        event.msg, event.id
+                        "Command execution started: call_id={}, command={:?}",
+                        event.call_id, event.command
                     );
 
-                    // Complete any previous web search before starting a new one
-                    match &event.msg {
-                        EventMsg::Error(..)
-                        | EventMsg::StreamError(..)
-                        | EventMsg::WebSearchBegin(..)
-                        | EventMsg::UserMessage(..)
-                        | EventMsg::ExecApprovalRequest(..)
-                        | EventMsg::ExecCommandBegin(..)
-                        | EventMsg::ExecCommandOutputDelta(..)
-                        | EventMsg::ExecCommandEnd(..)
-                        | EventMsg::McpToolCallBegin(..)
-                        | EventMsg::McpToolCallEnd(..)
-                        | EventMsg::ApplyPatchApprovalRequest(..)
-                        | EventMsg::PatchApplyBegin(..)
-                        | EventMsg::PatchApplyEnd(..)
-                        | EventMsg::TaskComplete(..)
-                        | EventMsg::TokenCount(..)
-                        | EventMsg::TurnDiff(..)
-                        | EventMsg::TurnAborted(..)
-                        | EventMsg::ShutdownComplete => {
-                            self.complete_web_search(
-                                request.session_id.clone(),
-                                &mut active_web_search,
-                            )
-                            .await;
-                        }
-                        _ => {}
-                    }
+                    let raw_input = serde_json::json!(&event);
+                    let ExecCommandBeginEvent {
+                        call_id,
+                        command,
+                        cwd,
+                        parsed_cmd: _,
+                    } = event;
+                    // Create a new tool call for the command execution
+                    let tool_call_id = ToolCallId(call_id.clone().into());
+                    active_command = Some((call_id, tool_call_id.clone()));
 
-                    match event.msg {
-                        EventMsg::TaskStarted(TaskStartedEvent { model_context_window }) => {
-                            info!("Task started with context window of {model_context_window:?}");
-                        }
-                        EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
-                            info!("User message echoed: {message:?}");
-                        }
-                        EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
-                            // Send this to the client via session/update notification
-                            info!("Agent message received: {delta:?}");
-                            self.send_agent_text(request.session_id.clone(), delta).await;
-                        }
-                        EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent { delta })
-                        | EventMsg::AgentReasoningRawContentDelta(
-                            AgentReasoningRawContentDeltaEvent { delta },
-                        ) => {
-                            // Send this to the client via session/update notification
-                            info!("Agent reasoning message received: {:?}", delta);
-                            self.send_agent_thought(request.session_id.clone(), delta).await;
-                        }
-                        EventMsg::AgentReasoningSectionBreak(
-                            AgentReasoningSectionBreakEvent {},
-                        ) => {
-                            // Make sure the section heading actually get spacing
-                            self.send_agent_thought(request.session_id.clone(), "\n\n").await;
-                        }
-                        EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
-                            // Send this to the client via session/update notification
-                            info!("Agent plan updated. Explanation: {:?}", explanation);
-                            self.update_plan(request.session_id.clone(), plan).await;
-                        }
-                        EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id }) => {
-                            info!("Web search started: call_id={}", call_id);
-                            // Create a ToolCall notification for the search beginning
-                            self.start_web_search(request.session_id.clone(), call_id, &mut active_web_search).await;
-                        }
-                        EventMsg::WebSearchEnd(WebSearchEndEvent { call_id, query }) => {
-                            info!("Web search query received: call_id={call_id}, query={query}");
-                            // Send update that the search is in progress with the query
-                            // (WebSearchEnd just means we have the query, not that results are ready)
-                            self.update_web_search_query(request.session_id.clone(), call_id, query).await;
-                            // The actual search results will come through AgentMessage events
-                            // We mark as completed when a new tool call begins
-                        }
-                        EventMsg::ExecApprovalRequest(event) => {
-                            info!("Command execution started: call_id={}, command={:?}", event.call_id, event.command);
-                            self.exec_approval(request.session_id.clone(), submission_id.clone(), event, &mut active_command).await?;
-                        }
-                        EventMsg::ExecCommandBegin(event) => {
-                            info!(
-                                "Command execution started: call_id={}, command={:?}",
-                                event.call_id, event.command
-                            );
-
-                            let raw_input = serde_json::json!(&event);
-                            let ExecCommandBeginEvent {
-                                call_id,
-                                command,
-                                cwd,
-                                parsed_cmd: _,
-                            } = event;
-                            // Create a new tool call for the command execution
-                            let tool_call_id = ToolCallId(call_id.clone().into());
-                            active_command = Some((call_id, tool_call_id.clone()));
-
-                            self.send_notification(
-                                request.session_id.clone(),
-                                SessionUpdate::ToolCall(ToolCall {
-                                    id: tool_call_id,
-                                    title: format!("Running: {}", command.join(" ")),
-                                    kind: ToolKind::Execute,
-                                    status: ToolCallStatus::InProgress,
-                                    content: vec![],
-                                    locations: if cwd == std::path::PathBuf::from(".") {
-                                        vec![]
-                                    } else {
-                                        vec![ToolCallLocation {
-                                            path: cwd,
-                                            line: None,
-                                            meta: None,
-                                        }]
-                                    },
-                                    raw_input: Some(raw_input),
-                                    raw_output: None,
+                    self.send_notification(
+                        session_id.clone(),
+                        SessionUpdate::ToolCall(ToolCall {
+                            id: tool_call_id,
+                            title: format!("Running: {}", command.join(" ")),
+                            kind: ToolKind::Execute,
+                            status: ToolCallStatus::InProgress,
+                            content: vec![],
+                            locations: if cwd == std::path::PathBuf::from(".") {
+                                vec![]
+                            } else {
+                                vec![ToolCallLocation {
+                                    path: cwd,
+                                    line: None,
                                     meta: None,
+                                }]
+                            },
+                            raw_input: Some(raw_input),
+                            raw_output: None,
+                            meta: None,
+                        }),
+                    )
+                    .await;
+                }
+                EventMsg::ExecCommandOutputDelta(delta_event) => {
+                    // Accumulate command output and send the full content
+                    if let Some((ref call_id, ref tool_call_id)) = active_command
+                        && call_id == &delta_event.call_id
+                    {
+                        // Convert the output chunk to a string (best effort)
+                        let output_text = String::from_utf8_lossy(&delta_event.chunk);
+
+                        // Accumulate the output
+                        command_output.push(output_text.to_string());
+
+                        // Send the full accumulated output (content is replaced, not appended)
+                        let accumulated_output = command_output.join("");
+
+                        self.send_notification(session_id.clone(), SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                            id: tool_call_id.clone(),
+                            fields: ToolCallUpdateFields {
+                                // Send the full accumulated content
+                                content: Some(vec![ToolCallContent::Content {
+                                    content: ContentBlock::Text(TextContent {
+                                        text: accumulated_output,
+                                        annotations: None,
+                                        meta: Some(serde_json::json!({
+                                            "stream": format!("{:?}", delta_event.stream),
+                                            "streaming": true,
+                                        })),
+                                    }),
+                                }]),
+                                ..Default::default()
+                            },
+                            meta: None,
+                        })).await;
+                    }
+                }
+                EventMsg::ExecCommandEnd(end_event) => {
+                    let raw_output = serde_json::json!(&end_event);
+                    info!(
+                        "Command execution ended: call_id={}, exit_code={}",
+                        end_event.call_id, end_event.exit_code
+                    );
+
+                    if let Some((call_id, tool_call_id)) = active_command.take()
+                        && call_id == end_event.call_id
+                    {
+                        let is_success = end_event.exit_code == 0;
+
+                        let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                            id: tool_call_id,
+                            fields: ToolCallUpdateFields {
+                                status: Some(if is_success {
+                                    ToolCallStatus::Completed
+                                } else {
+                                    ToolCallStatus::Failed
                                 }),
-                            )
-                            .await;
-                        }
-                        EventMsg::ExecCommandOutputDelta(delta_event) => {
-                            // Accumulate command output and send the full content
-                            if let Some((ref call_id, ref tool_call_id)) = active_command
-                                && call_id == &delta_event.call_id
-                            {
-                                // Convert the output chunk to a string (best effort)
-                                let output_text = String::from_utf8_lossy(&delta_event.chunk);
-
-                                // Accumulate the output
-                                command_output.push(output_text.to_string());
-
-                                // Send the full accumulated output (content is replaced, not appended)
-                                let accumulated_output = command_output.join("");
-
-                                self.send_notification(request.session_id.clone(), SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                                    id: tool_call_id.clone(),
-                                    fields: ToolCallUpdateFields {
-                                        // Send the full accumulated content
-                                        content: Some(vec![ToolCallContent::Content {
-                                            content: ContentBlock::Text(TextContent {
-                                                text: accumulated_output,
-                                                annotations: None,
-                                                meta: Some(serde_json::json!({
-                                                    "stream": format!("{:?}", delta_event.stream),
-                                                    "streaming": true,
-                                                })),
-                                            }),
-                                        }]),
-                                        ..Default::default()
-                                    },
-                                    meta: None,
-                                })).await;
-                            }
-                        }
-                        EventMsg::ExecCommandEnd(end_event) => {
-                            let raw_output = serde_json::json!(&end_event);
-                            info!(
-                                "Command execution ended: call_id={}, exit_code={}",
-                                end_event.call_id, end_event.exit_code
-                            );
-
-                            if let Some((call_id, tool_call_id)) = active_command.take()
-                                && call_id == end_event.call_id
-                            {
-                                let is_success = end_event.exit_code == 0;
-
-                                let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                                    id: tool_call_id,
-                                    fields: ToolCallUpdateFields {
-                                        status: Some(if is_success {
-                                            ToolCallStatus::Completed
+                                // Send final aggregated output
+                                content: Some(vec![ToolCallContent::Content {
+                                    content: ContentBlock::Text(TextContent {
+                                        text: if !end_event.formatted_output.is_empty()
+                                        {
+                                            end_event.formatted_output.clone()
+                                        } else if !end_event
+                                            .aggregated_output
+                                            .is_empty()
+                                        {
+                                            end_event.aggregated_output.clone()
                                         } else {
-                                            ToolCallStatus::Failed
-                                        }),
-                                        // Send final aggregated output
-                                        content: Some(vec![ToolCallContent::Content {
-                                            content: ContentBlock::Text(TextContent {
-                                                text: if !end_event.formatted_output.is_empty()
-                                                {
-                                                    end_event.formatted_output.clone()
-                                                } else if !end_event
-                                                    .aggregated_output
-                                                    .is_empty()
-                                                {
-                                                    end_event.aggregated_output.clone()
-                                                } else {
-                                                    format!(
-                                                        "stdout:\n{}\n\nstderr:\n{}",
-                                                        end_event.stdout, end_event.stderr
-                                                    )
-                                                },
-                                                annotations: None,
-                                                meta: None,
-                                            }),
-                                        }]),
-                                        raw_output: Some(raw_output),
-                                        ..Default::default()
-                                    },
-                                    meta: None,
-                                });
-                                self.send_notification(request.session_id.clone(), update).await;
+                                            format!(
+                                                "stdout:\n{}\n\nstderr:\n{}",
+                                                end_event.stdout, end_event.stderr
+                                            )
+                                        },
+                                        annotations: None,
+                                        meta: None,
+                                    }),
+                                }]),
+                                raw_output: Some(raw_output),
+                                ..Default::default()
+                            },
+                            meta: None,
+                        });
+                        self.send_notification(session_id.clone(), update).await;
 
-                                // Clear accumulated output since we're done
-                                command_output.clear();
-                            }
-                        }
-                        EventMsg::McpToolCallBegin(McpToolCallBeginEvent { call_id, invocation }) => {
-                            info!("MCP tool call begin: call_id={call_id}, invocation={} {}", invocation.server, invocation.tool);
-                            self.start_mcp_tool_call(request.session_id.clone(), call_id, invocation).await;
-                        }
-                        EventMsg::McpToolCallEnd(McpToolCallEndEvent { call_id, invocation, duration, result }) => {
-                            info!("MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}", invocation.server, invocation.tool);
-                            self.end_mcp_tool_call(request.session_id.clone(), call_id, result).await;
-                        }
-                        // File based events
-                        EventMsg::ApplyPatchApprovalRequest(event) => {
-                            info!("Apply patch approval request: call_id={}, reason={:?}", event.call_id, event.reason);
-                            self.patch_approval(request.session_id.clone(), submission_id.clone(), event).await?;
-                        }
-                        EventMsg::PatchApplyBegin(event) => {
-                            info!("Patch apply begin: call_id={}, auto_approved={}", event.call_id,event.auto_approved);
-                            self.start_patch_apply(request.session_id.clone(), event).await;
-                        }
-                        EventMsg::PatchApplyEnd(event) => {
-                            info!("Patch apply end: call_id={}, success={}", event.call_id, event.success);
-                            self.end_patch_apply(request.session_id.clone(), event).await;
-                        }
-                        EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message}) => {
-                            info!(
-                                "Task completed successfully after {event_count} events. Last agent message: {last_agent_message:?}",
-                            );
-                            stop_reason = StopReason::EndTurn;
-                            break;
-                        }
-                        EventMsg::Error(ErrorEvent { message })
-                        | EventMsg::StreamError(StreamErrorEvent { message }) => {
-                            error!("Error during turn: {}", message);
-                            return Err(Error::internal_error().with_data(message));
-                        }
-                        EventMsg::TurnAborted(TurnAbortedEvent { reason }) => {
-                            info!("Turn aborted: {reason:?}");
-                            stop_reason = StopReason::Cancelled;
-                            break;
-                        }
-                        EventMsg::ShutdownComplete => {
-                            info!("Agent shutting down");
-                            stop_reason = StopReason::Cancelled;
-                            break;
-                        }
-
-                        // Since we are getting the deltas, we can ignore these events
-                        EventMsg::AgentReasoning(AgentReasoningEvent { .. })
-                        | EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent {
-                            ..
-                        })
-                        | EventMsg::AgentMessage(AgentMessageEvent { .. })
-                        // In the future we can use this to update usage stats
-                        | EventMsg::TokenCount(..)
-                        // we already have a way to diff the turn, so ignore
-                        | EventMsg::TurnDiff(..)
-                        // returned from Op::ListMcpTools, ignore
-                        | EventMsg::McpListToolsResponse(..)
-                        // returned from Op::ListCustomPrompts, ignore
-                        | EventMsg::ListCustomPromptsResponse(..)
-                        // returned from Op::GetPath, ignore
-                        | EventMsg::ConversationPath(..)
-                        // Used for returning a single history entry
-                        | EventMsg::GetHistoryEntryResponse(..)
-                        // Used for session loading and replay
-                        | EventMsg::SessionConfigured(..)
-                        // used when requesting a code review, ignore for now
-                        | EventMsg::EnteredReviewMode(..)
-                        | EventMsg::ExitedReviewMode(..)
-                        // Revisit when we can emit status updates
-                        | EventMsg::BackgroundEvent(..) => {}
+                        // Clear accumulated output since we're done
+                        command_output.clear();
                     }
                 }
-                Err(e) => {
-                    error!("Error getting next event: {:?}", e);
-                    return Err(Error::internal_error());
+                EventMsg::McpToolCallBegin(McpToolCallBeginEvent { call_id, invocation }) => {
+                    info!("MCP tool call begin: call_id={call_id}, invocation={} {}", invocation.server, invocation.tool);
+                    self.start_mcp_tool_call(session_id.clone(), call_id, invocation).await;
                 }
+                EventMsg::McpToolCallEnd(McpToolCallEndEvent { call_id, invocation, duration, result }) => {
+                    info!("MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}", invocation.server, invocation.tool);
+                    self.end_mcp_tool_call(session_id.clone(), call_id, result).await;
+                }
+                // File based events
+                EventMsg::ApplyPatchApprovalRequest(event) => {
+                    info!("Apply patch approval request: call_id={}, reason={:?}", event.call_id, event.reason);
+                    self.patch_approval(session_id.clone(), submission_id.clone(), event).await?;
+                }
+                EventMsg::PatchApplyBegin(event) => {
+                    info!("Patch apply begin: call_id={}, auto_approved={}", event.call_id,event.auto_approved);
+                    self.start_patch_apply(session_id.clone(), event).await;
+                }
+                EventMsg::PatchApplyEnd(event) => {
+                    info!("Patch apply end: call_id={}, success={}", event.call_id, event.success);
+                    self.end_patch_apply(session_id.clone(), event).await;
+                }
+                EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message}) => {
+                    info!(
+                        "Task completed successfully after {event_count} events. Last agent message: {last_agent_message:?}",
+                    );
+                    stop_reason = StopReason::EndTurn;
+                    break;
+                }
+                EventMsg::Error(ErrorEvent { message })
+                | EventMsg::StreamError(StreamErrorEvent { message }) => {
+                    error!("Error during turn: {}", message);
+                    return Err(Error::internal_error().with_data(message));
+                }
+                EventMsg::TurnAborted(TurnAbortedEvent { reason }) => {
+                    info!("Turn aborted: {reason:?}");
+                    stop_reason = StopReason::Cancelled;
+                    break;
+                }
+                EventMsg::ShutdownComplete => {
+                    info!("Agent shutting down");
+                    stop_reason = StopReason::Cancelled;
+                    break;
+                }
+
+                // Since we are getting the deltas, we can ignore these events
+                EventMsg::AgentReasoning(AgentReasoningEvent { .. })
+                | EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent {
+                    ..
+                })
+                | EventMsg::AgentMessage(AgentMessageEvent { .. })
+                // In the future we can use this to update usage stats
+                | EventMsg::TokenCount(..)
+                // we already have a way to diff the turn, so ignore
+                | EventMsg::TurnDiff(..)
+                // returned from Op::ListMcpTools, ignore
+                | EventMsg::McpListToolsResponse(..)
+                // returned from Op::ListCustomPrompts, ignore
+                | EventMsg::ListCustomPromptsResponse(..)
+                // returned from Op::GetPath, ignore
+                | EventMsg::ConversationPath(..)
+                // Used for returning a single history entry
+                | EventMsg::GetHistoryEntryResponse(..)
+                // Used for session loading and replay
+                | EventMsg::SessionConfigured(..)
+                // used when requesting a code review, ignore for now
+                | EventMsg::EnteredReviewMode(..)
+                | EventMsg::ExitedReviewMode(..)
+                // Revisit when we can emit status updates
+                | EventMsg::BackgroundEvent(..) => {}
             }
         }
 
@@ -1354,13 +1232,10 @@ impl Agent for CodexAgent {
 
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
         info!("Cancelling operations for session: {}", args.session_id);
-
         self.get_conversation(&args.session_id)
             .await?
-            .submit(Op::Interrupt)
-            .await
-            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-
+            .cancel()
+            .await?;
         Ok(())
     }
 
@@ -1369,31 +1244,10 @@ impl Agent for CodexAgent {
         args: SetSessionModeRequest,
     ) -> Result<SetSessionModeResponse, Error> {
         info!("Setting session mode for session: {}", args.session_id);
-
-        let preset = APPROVAL_PRESETS
-            .iter()
-            .find(|preset| args.mode_id.0.as_ref() == preset.id)
-            .ok_or_else(Error::invalid_params)?;
-
-        let conversation = self.get_conversation(&args.session_id).await?;
-
-        conversation
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: Some(preset.approval),
-                sandbox_policy: Some(preset.sandbox.clone()),
-                model: None,
-                effort: None,
-                summary: None,
-            })
-            .await
-            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-
-        if let Some(session_state) = self.sessions.borrow_mut().get_mut(&args.session_id) {
-            session_state.config.approval_policy = preset.approval;
-            session_state.config.sandbox_policy = preset.sandbox.clone();
-        }
-
+        self.get_conversation(&args.session_id)
+            .await?
+            .set_mode(args.mode_id)
+            .await?;
         Ok(SetSessionModeResponse::default())
     }
 
@@ -1403,40 +1257,12 @@ impl Agent for CodexAgent {
     ) -> Result<SetSessionModelResponse, Error> {
         info!("Setting session model for session: {}", args.session_id);
 
-        let conversation = self.get_conversation(&args.session_id).await?;
-
-        let preset = self
-            .model_presets
-            .iter()
-            .find(|p| p.id == args.model_id.0.as_ref())
-            .ok_or_else(|| Error::invalid_params().with_data("Model not found"))?;
-
-        conversation
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                sandbox_policy: None,
-                model: Some(preset.model.into()),
-                effort: Some(preset.effort),
-                summary: None,
-            })
-            .await
-            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-
-        if let Some(session_state) = self.sessions.borrow_mut().get_mut(&args.session_id) {
-            session_state.config.model = preset.model.into();
-            session_state.config.model_reasoning_effort = preset.effort;
-        }
+        self.get_conversation(&args.session_id)
+            .await?
+            .set_model(args.model_id)
+            .await?;
 
         Ok(SetSessionModelResponse::default())
-    }
-
-    async fn ext_method(&self, _args: ExtRequest) -> Result<ExtResponse, Error> {
-        Err(Error::method_not_found())
-    }
-
-    async fn ext_notification(&self, _args: ExtNotification) -> Result<(), Error> {
-        Err(Error::method_not_found())
     }
 }
 
@@ -1454,6 +1280,455 @@ fn convert_annotations(annotations: mcp_types::Annotations) -> Annotations {
         last_modified: annotations.last_modified,
         priority: annotations.priority,
         meta: None,
+    }
+}
+
+enum ConversationMessage {
+    Load {
+        response_tx: oneshot::Sender<Result<LoadSessionResponse, Error>>,
+    },
+    Prompt {
+        request: PromptRequest,
+        response_tx: oneshot::Sender<Result<(String, mpsc::UnboundedReceiver<EventMsg>), Error>>,
+    },
+    ExecApproval {
+        submission_id: String,
+        decision: ReviewDecision,
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
+    PatchApproval {
+        submission_id: String,
+        decision: ReviewDecision,
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
+    SetMode {
+        mode: SessionModeId,
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
+    SetModel {
+        model: ModelId,
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
+    Cancel {
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
+}
+
+struct ConversationHandle {
+    /// A sender for interacting with the conversation.
+    message_tx: mpsc::UnboundedSender<ConversationMessage>,
+    /// A handle to the spawned task.
+    _handle: tokio::task::JoinHandle<()>,
+}
+
+impl ConversationHandle {
+    fn new(
+        conversation: Arc<CodexConversation>,
+        config: Config,
+        model_presets: Arc<Vec<ModelPreset>>,
+    ) -> Self {
+        let (message_tx, message_rx) = mpsc::unbounded_channel();
+
+        let actor = ConversationActor::new(conversation.clone(), config, model_presets, message_rx);
+        let handle = tokio::spawn(actor.spawn());
+
+        Self {
+            message_tx,
+            _handle: handle,
+        }
+    }
+
+    async fn load(&self) -> Result<LoadSessionResponse, Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ConversationMessage::Load { response_tx };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
+    }
+
+    async fn prompt(
+        &self,
+        request: PromptRequest,
+    ) -> Result<(String, mpsc::UnboundedReceiver<EventMsg>), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ConversationMessage::Prompt {
+            request,
+            response_tx,
+        };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
+    }
+
+    async fn exec_approval(
+        &self,
+        submission_id: String,
+        decision: ReviewDecision,
+    ) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ConversationMessage::ExecApproval {
+            submission_id,
+            decision,
+            response_tx,
+        };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
+    }
+
+    async fn patch_approval(
+        &self,
+        submission_id: String,
+        decision: ReviewDecision,
+    ) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ConversationMessage::PatchApproval {
+            submission_id,
+            decision,
+            response_tx,
+        };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
+    }
+
+    async fn set_mode(&self, mode: SessionModeId) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ConversationMessage::SetMode { mode, response_tx };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
+    }
+
+    async fn set_model(&self, model: ModelId) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ConversationMessage::SetModel { model, response_tx };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
+    }
+
+    async fn cancel(&self) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ConversationMessage::Cancel { response_tx };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
+    }
+}
+
+struct ConversationActor {
+    /// The conversation associated with this task.
+    conversation: Arc<CodexConversation>,
+    /// The configuration for the conversation.
+    config: Config,
+    /// The model presets for the conversation.
+    model_presets: Arc<Vec<ModelPreset>>,
+    /// A sender for each interested `Op` submission that needs events routed.
+    submissions: HashMap<String, mpsc::UnboundedSender<EventMsg>>,
+    /// A receiver for incoming conversation messages.
+    message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
+}
+
+impl ConversationActor {
+    fn new(
+        conversation: Arc<CodexConversation>,
+        config: Config,
+        model_presets: Arc<Vec<ModelPreset>>,
+        message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
+    ) -> Self {
+        Self {
+            conversation,
+            config,
+            model_presets,
+            submissions: HashMap::new(),
+            message_rx,
+        }
+    }
+
+    async fn spawn(mut self) {
+        loop {
+            tokio::select! {
+                biased;
+                message = self.message_rx.recv() => match message {
+                    Some(message) => self.handle_message(message).await,
+                    None => break,
+                },
+                event = self.conversation.next_event() => match event {
+                    Ok(event) => self.handle_event(event),
+                    Err(e) => {
+                        error!("Error getting next event: {:?}", e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_event(&mut self, Event { id, msg }: Event) {
+        if let Some(sender) = self.submissions.get(&id) {
+            sender.send(msg).ok();
+        } else {
+            error!("Received event for unknown submission ID: {}", id);
+        }
+    }
+
+    async fn handle_message(&mut self, message: ConversationMessage) {
+        match message {
+            ConversationMessage::Load { response_tx } => {
+                let result = self.handle_load().await;
+                drop(response_tx.send(result));
+            }
+            ConversationMessage::Prompt {
+                request,
+                response_tx,
+            } => {
+                let result = self.handle_prompt(request).await;
+                drop(response_tx.send(result));
+            }
+            ConversationMessage::ExecApproval {
+                submission_id,
+                decision,
+                response_tx,
+            } => {
+                let result = self.handle_exec_approval(submission_id, decision).await;
+                drop(response_tx.send(result));
+            }
+            ConversationMessage::PatchApproval {
+                submission_id,
+                decision,
+                response_tx,
+            } => {
+                let result = self.handle_patch_approval(submission_id, decision).await;
+                drop(response_tx.send(result));
+            }
+            ConversationMessage::SetMode { mode, response_tx } => {
+                let result = self.handle_set_mode(mode).await;
+                drop(response_tx.send(result));
+            }
+            ConversationMessage::SetModel { model, response_tx } => {
+                let result = self.handle_set_model(model).await;
+                drop(response_tx.send(result));
+            }
+            ConversationMessage::Cancel { response_tx } => {
+                let result = self.handle_cancel().await;
+                drop(response_tx.send(result));
+            }
+        }
+        // Litter collection of senders with no receivers
+        self.submissions.retain(|_, sender| !sender.is_closed());
+    }
+
+    fn modes(&self) -> Option<SessionModeState> {
+        let current_mode_id = APPROVAL_PRESETS
+            .iter()
+            .find(|preset| {
+                preset.approval == self.config.approval_policy
+                    && preset.sandbox == self.config.sandbox_policy
+            })
+            .map(|preset| SessionModeId(preset.id.into()))?;
+
+        Some(SessionModeState {
+            current_mode_id,
+            available_modes: APPROVAL_PRESETS
+                .iter()
+                .map(|preset| SessionMode {
+                    id: SessionModeId(preset.id.into()),
+                    name: preset.label.to_owned(),
+                    description: Some(preset.description.to_owned()),
+                    meta: None,
+                })
+                .collect(),
+            meta: None,
+        })
+    }
+
+    fn find_model_preset(&self) -> Option<&ModelPreset> {
+        if let Some(preset) = self.model_presets.iter().find(|preset| {
+            preset.model == self.config.model && preset.effort == self.config.model_reasoning_effort
+        }) {
+            return Some(preset);
+        }
+
+        // If we didn't find it, and it is set to none, see if we can find one with the default value
+        if self.config.model_reasoning_effort.is_none()
+            && let Some(preset) = self.model_presets.iter().find(|preset| {
+                preset.model == self.config.model
+                    && preset.effort == Some(ReasoningEffort::default())
+            })
+        {
+            return Some(preset);
+        }
+
+        None
+    }
+
+    fn models(&self) -> Result<SessionModelState, Error> {
+        let current_model_id = self
+            .find_model_preset()
+            .map(|preset| ModelId(preset.id.into()))
+            .ok_or_else(|| {
+                anyhow::anyhow!("No valid model preset for model {}", self.config.model)
+            })?;
+
+        let available_models = self
+            .model_presets
+            .iter()
+            .map(|preset| ModelInfo {
+                model_id: ModelId(preset.id.into()),
+                name: preset.label.into(),
+                description: Some(
+                    preset
+                        .description
+                        .strip_prefix("— ")
+                        .unwrap_or(preset.description)
+                        .into(),
+                ),
+                meta: None,
+            })
+            .collect();
+
+        Ok(SessionModelState {
+            current_model_id,
+            available_models,
+            meta: None,
+        })
+    }
+
+    async fn handle_load(&mut self) -> Result<LoadSessionResponse, Error> {
+        Ok(LoadSessionResponse {
+            modes: self.modes(),
+            models: Some(self.models()?),
+            meta: None,
+        })
+    }
+
+    async fn handle_prompt(
+        &mut self,
+        request: PromptRequest,
+    ) -> Result<(String, mpsc::UnboundedReceiver<EventMsg>), Error> {
+        let (session_tx, session_rx) = mpsc::unbounded_channel();
+        let items = build_prompt_items(request.prompt);
+
+        let submission_id = match self.conversation.submit(Op::UserInput { items }).await {
+            Ok(submission_id) => submission_id,
+            Err(e) => {
+                error!("Failed to submit prompt: {e:?}");
+                return Err(Error::internal_error());
+            }
+        };
+
+        self.submissions.insert(submission_id.clone(), session_tx);
+
+        Ok((submission_id, session_rx))
+    }
+
+    async fn handle_exec_approval(
+        &mut self,
+        submission_id: String,
+        decision: ReviewDecision,
+    ) -> Result<(), Error> {
+        self.conversation
+            .submit(Op::ExecApproval {
+                id: submission_id,
+                decision,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        Ok(())
+    }
+
+    async fn handle_patch_approval(
+        &mut self,
+        submission_id: String,
+        decision: ReviewDecision,
+    ) -> Result<(), Error> {
+        self.conversation
+            .submit(Op::PatchApproval {
+                id: submission_id,
+                decision,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        Ok(())
+    }
+
+    async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
+        let preset = APPROVAL_PRESETS
+            .iter()
+            .find(|preset| mode.0.as_ref() == preset.id)
+            .ok_or_else(Error::invalid_params)?;
+
+        self.conversation
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: Some(preset.approval),
+                sandbox_policy: Some(preset.sandbox.clone()),
+                model: None,
+                effort: None,
+                summary: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.config.approval_policy = preset.approval;
+        self.config.sandbox_policy = preset.sandbox.clone();
+
+        Ok(())
+    }
+
+    async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
+        let preset = self
+            .model_presets
+            .iter()
+            .find(|p| p.id == model.0.as_ref())
+            .ok_or_else(|| Error::invalid_params().with_data("Model not found"))?;
+
+        self.conversation
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                model: Some(preset.model.into()),
+                effort: Some(preset.effort),
+                summary: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.config.model = preset.model.into();
+        self.config.model_reasoning_effort = preset.effort;
+
+        Ok(())
+    }
+
+    async fn handle_cancel(&mut self) -> Result<(), Error> {
+        self.conversation
+            .submit(Op::Interrupt)
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        Ok(())
     }
 }
 
@@ -1563,12 +1838,12 @@ impl codex_apply_patch::Fs for AcpFs {
 
 #[derive(Clone)]
 struct LocalSpawner {
-    send: tokio::sync::mpsc::UnboundedSender<FsTask>,
+    send: mpsc::UnboundedSender<FsTask>,
 }
 
 impl LocalSpawner {
     pub fn new() -> Self {
-        let (send, mut recv) = tokio::sync::mpsc::unbounded_channel::<FsTask>();
+        let (send, mut recv) = mpsc::unbounded_channel::<FsTask>();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
