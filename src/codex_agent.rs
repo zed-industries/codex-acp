@@ -1151,11 +1151,24 @@ impl Agent for CodexAgent {
                             let tool_call_id = ToolCallId(call_id.clone().into());
                             let _call_id_for_meta = call_id.clone();
                             // Prepare an embedded terminal for this tool call so the client can render it.
-                            let (cmd, cmd_args) = if command.is_empty() {
-                                ("sh".to_string(), vec![])
-                            } else {
-                                (command[0].clone(), command[1..].to_vec())
-                            };
+                            if command.is_empty() {
+                                let _ = self
+                                    .send_notification(
+                                        request.session_id.clone(),
+                                        SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                                            id: tool_call_id.clone(),
+                                            fields: ToolCallUpdateFields {
+                                                status: Some(ToolCallStatus::Failed),
+                                                title: Some("No command provided".into()),
+                                                ..Default::default()
+                                            },
+                                            meta: None,
+                                        }),
+                                    )
+                                    .await;
+                                continue;
+                            }
+                            let (cmd, cmd_args) = (command[0].clone(), command[1..].to_vec());
                             let mut terminal_content: Vec<ToolCallContent> = Vec::new();
                             if let Ok(resp) = self
                                 .client()
