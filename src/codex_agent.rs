@@ -1202,7 +1202,7 @@ impl Agent for CodexAgent {
                             .await;
 
                         }
-                        EventMsg::ExecCommandOutputDelta(delta_event) => {
+                        EventMsg::ExecCommandOutputDelta(_delta_event) => {
                             // Output is streamed by the embedded terminal; no ToolCall update is needed here.
                         }
                         EventMsg::ExecCommandEnd(end_event) => {
