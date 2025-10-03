@@ -1333,12 +1333,10 @@ impl Agent for CodexAgent {
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
         info!("Cancelling operations for session: {}", args.session_id);
 
-        self.get_conversation(&args.session_id)
+        self.get_conversation_handle(&args.session_id)
             .await?
-            .submit(Op::Interrupt)
-            .await
-            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-
+            .interrupt()
+            .await?;
         Ok(())
     }
 
@@ -1436,6 +1434,10 @@ fn convert_annotations(annotations: mcp_types::Annotations) -> Annotations {
 }
 
 enum ConversationMessage {
+    Prompt {
+        request: PromptRequest,
+        response_tx: oneshot::Sender<Result<(String, mpsc::UnboundedReceiver<EventMsg>), Error>>,
+    },
     ExecApproval {
         submission_id: String,
         decision: ReviewDecision,
@@ -1446,9 +1448,8 @@ enum ConversationMessage {
         decision: ReviewDecision,
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
-    Prompt {
-        request: PromptRequest,
-        response_tx: oneshot::Sender<Result<(String, mpsc::UnboundedReceiver<EventMsg>), Error>>,
+    Interrupt {
+        response_tx: oneshot::Sender<Result<(), Error>>,
     },
 }
 
@@ -1470,6 +1471,23 @@ impl ConversationHandle {
             message_tx,
             _handle: handle,
         }
+    }
+
+    async fn prompt(
+        &self,
+        request: PromptRequest,
+    ) -> Result<(String, mpsc::UnboundedReceiver<EventMsg>), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ConversationMessage::Prompt {
+            request,
+            response_tx,
+        };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
     }
 
     async fn exec_approval(
@@ -1510,16 +1528,10 @@ impl ConversationHandle {
             .map_err(|e| Error::internal_error().with_data(e.to_string()))?
     }
 
-    async fn prompt(
-        &self,
-        request: PromptRequest,
-    ) -> Result<(String, mpsc::UnboundedReceiver<EventMsg>), Error> {
+    async fn interrupt(&self) -> Result<(), Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let message = ConversationMessage::Prompt {
-            request,
-            response_tx,
-        };
+        let message = ConversationMessage::Interrupt { response_tx };
         drop(self.message_tx.send(message));
 
         response_rx
@@ -1578,6 +1590,13 @@ impl ConversationActor {
 
     async fn handle_message(&mut self, message: ConversationMessage) {
         match message {
+            ConversationMessage::Prompt {
+                request,
+                response_tx,
+            } => {
+                let result = self.handle_prompt(request).await;
+                drop(response_tx.send(result));
+            }
             ConversationMessage::ExecApproval {
                 submission_id,
                 decision,
@@ -1594,16 +1613,33 @@ impl ConversationActor {
                 let result = self.handle_patch_approval(submission_id, decision).await;
                 drop(response_tx.send(result));
             }
-            ConversationMessage::Prompt {
-                request,
-                response_tx,
-            } => {
-                let result = self.handle_prompt(request).await;
+            ConversationMessage::Interrupt { response_tx } => {
+                let result = self.handle_interrupt().await;
                 drop(response_tx.send(result));
             }
         }
         // Litter collection of senders with no receivers
         self.submissions.retain(|_, sender| !sender.is_closed());
+    }
+
+    async fn handle_prompt(
+        &mut self,
+        request: PromptRequest,
+    ) -> Result<(String, mpsc::UnboundedReceiver<EventMsg>), Error> {
+        let (session_tx, session_rx) = mpsc::unbounded_channel();
+        let items = build_prompt_items(request.prompt);
+
+        let submission_id = match self.conversation.submit(Op::UserInput { items }).await {
+            Ok(submission_id) => submission_id,
+            Err(e) => {
+                error!("Failed to submit prompt: {e:?}");
+                return Err(Error::internal_error());
+            }
+        };
+
+        self.submissions.insert(submission_id.clone(), session_tx);
+
+        Ok((submission_id, session_rx))
     }
 
     async fn handle_exec_approval(
@@ -1636,24 +1672,12 @@ impl ConversationActor {
         Ok(())
     }
 
-    async fn handle_prompt(
-        &mut self,
-        request: PromptRequest,
-    ) -> Result<(String, mpsc::UnboundedReceiver<EventMsg>), Error> {
-        let (session_tx, session_rx) = mpsc::unbounded_channel();
-        let items = build_prompt_items(request.prompt);
-
-        let submission_id = match self.conversation.submit(Op::UserInput { items }).await {
-            Ok(submission_id) => submission_id,
-            Err(e) => {
-                error!("Failed to submit prompt: {e:?}");
-                return Err(Error::internal_error());
-            }
-        };
-
-        self.submissions.insert(submission_id.clone(), session_tx);
-
-        Ok((submission_id, session_rx))
+    async fn handle_interrupt(&mut self) -> Result<(), Error> {
+        self.conversation
+            .submit(Op::Interrupt)
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        Ok(())
     }
 }
 
