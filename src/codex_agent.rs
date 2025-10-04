@@ -1416,6 +1416,38 @@ impl ConversationHandle {
     }
 }
 
+enum Submission {
+    Prompt(PromptSubmission),
+}
+
+impl Submission {
+    fn is_active(&self) -> bool {
+        match self {
+            Submission::Prompt(submission) => !submission.sender.is_closed(),
+        }
+    }
+
+    fn handle_event(&mut self, event: EventMsg) {
+        match self {
+            Submission::Prompt(submission) => submission.handle_event(event),
+        }
+    }
+}
+
+struct PromptSubmission {
+    sender: mpsc::UnboundedSender<EventMsg>,
+}
+
+impl PromptSubmission {
+    fn new(sender: mpsc::UnboundedSender<EventMsg>) -> Self {
+        Self { sender }
+    }
+
+    fn handle_event(&mut self, event: EventMsg) {
+        self.sender.send(event).ok();
+    }
+}
+
 struct ConversationActor {
     /// The conversation associated with this task.
     conversation: Arc<CodexConversation>,
@@ -1424,7 +1456,7 @@ struct ConversationActor {
     /// The model presets for the conversation.
     model_presets: Arc<Vec<ModelPreset>>,
     /// A sender for each interested `Op` submission that needs events routed.
-    submissions: HashMap<String, mpsc::UnboundedSender<EventMsg>>,
+    submissions: HashMap<String, Submission>,
     /// A receiver for incoming conversation messages.
     message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
 }
@@ -1461,14 +1493,8 @@ impl ConversationActor {
                     }
                 }
             }
-        }
-    }
-
-    fn handle_event(&mut self, Event { id, msg }: Event) {
-        if let Some(sender) = self.submissions.get(&id) {
-            sender.send(msg).ok();
-        } else {
-            error!("Received event for unknown submission ID: {}", id);
+            // Litter collection of senders with no receivers
+            self.submissions.retain(|_, sender| sender.is_active());
         }
     }
 
@@ -1514,8 +1540,6 @@ impl ConversationActor {
                 drop(response_tx.send(result));
             }
         }
-        // Litter collection of senders with no receivers
-        self.submissions.retain(|_, sender| !sender.is_closed());
     }
 
     fn modes(&self) -> Option<SessionModeState> {
@@ -1617,7 +1641,10 @@ impl ConversationActor {
             }
         };
 
-        self.submissions.insert(submission_id.clone(), session_tx);
+        self.submissions.insert(
+            submission_id.clone(),
+            Submission::Prompt(PromptSubmission::new(session_tx)),
+        );
 
         Ok((submission_id, session_rx))
     }
@@ -1707,6 +1734,14 @@ impl ConversationActor {
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
         Ok(())
+    }
+
+    fn handle_event(&mut self, Event { id, msg }: Event) {
+        if let Some(submission) = self.submissions.get_mut(&id) {
+            submission.handle_event(msg);
+        } else {
+            error!("Received event for unknown submission ID: {}", id);
+        }
     }
 }
 
