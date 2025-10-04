@@ -28,9 +28,9 @@ use codex_core::{
         AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ErrorEvent, Event,
         EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent,
         ExecCommandOutputDeltaEvent, FileChange, InputItem, McpInvocation, McpToolCallBeginEvent,
-        McpToolCallEndEvent, Op, ReviewDecision, StreamErrorEvent, TaskCompleteEvent,
-        TaskStartedEvent, TurnAbortedEvent, UserMessageEvent, WebSearchBeginEvent,
-        WebSearchEndEvent,
+        McpToolCallEndEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReviewDecision,
+        StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent, UserMessageEvent,
+        WebSearchBeginEvent, WebSearchEndEvent,
     },
 };
 use codex_protocol::config_types::ReasoningEffort;
@@ -39,7 +39,7 @@ use mcp_types::CallToolResult;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 
-use crate::codex_agent::ACP_CLIENT;
+use crate::ACP_CLIENT;
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 
@@ -320,12 +320,12 @@ impl PromptState {
                 }
             }
             EventMsg::PatchApplyBegin(event) => {
-                // info!("Patch apply begin: call_id={}, auto_approved={}", event.call_id,event.auto_approved);
-                // self.start_patch_apply(session_id.clone(), event).await;
+                info!("Patch apply begin: call_id={}, auto_approved={}", event.call_id,event.auto_approved);
+                self.start_patch_apply(client, event).await;
             }
             EventMsg::PatchApplyEnd(event) => {
-                // info!("Patch apply end: call_id={}, success={}", event.call_id, event.success);
-                // self.end_patch_apply(session_id.clone(), event).await;
+                info!("Patch apply end: call_id={}, success={}", event.call_id, event.success);
+                self.end_patch_apply(client, event).await;
             }
             EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message}) => {
                 info!(
@@ -448,6 +448,57 @@ impl PromptState {
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
         Ok(())
+    }
+
+    async fn start_patch_apply(&self, client: &Client, event: PatchApplyBeginEvent) {
+        let raw_input = serde_json::json!(&event);
+        let PatchApplyBeginEvent {
+            call_id,
+            auto_approved: _,
+            changes,
+        } = event;
+
+        let (title, locations, content) = extract_tool_call_content_from_changes(changes);
+
+        client
+            .send_notification(SessionUpdate::ToolCall(ToolCall {
+                id: ToolCallId(call_id.into()),
+                title,
+                kind: ToolKind::Edit,
+                status: ToolCallStatus::InProgress,
+                locations,
+                content: content.collect(),
+                raw_input: Some(raw_input),
+                raw_output: None,
+                meta: None,
+            }))
+            .await;
+    }
+
+    async fn end_patch_apply(&self, client: &Client, event: PatchApplyEndEvent) {
+        let raw_output = serde_json::json!(&event);
+        let PatchApplyEndEvent {
+            call_id,
+            stdout: _,
+            stderr: _,
+            success,
+        } = event;
+
+        client
+            .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                id: ToolCallId(call_id.into()),
+                fields: ToolCallUpdateFields {
+                    status: Some(if success {
+                        ToolCallStatus::Completed
+                    } else {
+                        ToolCallStatus::Failed
+                    }),
+                    raw_output: Some(raw_output),
+                    ..Default::default()
+                },
+                meta: None,
+            }))
+            .await;
     }
 
     async fn start_mcp_tool_call(

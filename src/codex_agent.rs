@@ -1,11 +1,9 @@
 use agent_client_protocol::{
-    Agent, AgentCapabilities, AgentSideConnection, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, Client, Diff, Error, InitializeRequest, InitializeResponse,
-    LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, NewSessionRequest,
-    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, SessionId,
-    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse,
-    SetSessionModelRequest, SetSessionModelResponse, ToolCall, ToolCallContent, ToolCallId,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
+    Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification, Error,
+    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
+    McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse, PromptCapabilities,
+    PromptRequest, PromptResponse, SessionId, SetSessionModeRequest, SetSessionModeResponse,
+    SetSessionModelRequest, SetSessionModelResponse, V1,
 };
 use codex_common::model_presets::{ModelPreset, builtin_model_presets};
 use codex_core::{
@@ -13,25 +11,15 @@ use codex_core::{
     auth::{AuthManager, CodexAuth, login_with_api_key},
     config::Config,
     config_types::{McpServerConfig, McpServerTransportConfig},
-    protocol::{FileChange, PatchApplyBeginEvent, PatchApplyEndEvent},
 };
 use codex_protocol::ConversationId;
-use itertools::Itertools;
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    path::PathBuf,
-    rc::Rc,
-    sync::{Arc, OnceLock},
-};
-use tracing::{debug, error, info};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+use tracing::{debug, info};
 
 use crate::{
     conversation::ConversationHandle,
     local_spawner::{AcpFs, LocalSpawner},
 };
-
-pub static ACP_CLIENT: OnceLock<AgentSideConnection> = OnceLock::new();
 
 /// The Codex implementation of the ACP Agent trait.
 ///
@@ -84,10 +72,6 @@ impl CodexAgent {
         }
     }
 
-    fn client(&self) -> &'static AgentSideConnection {
-        ACP_CLIENT.get().expect("Client should be set")
-    }
-
     fn session_id_from_conversation_id(conversation_id: ConversationId) -> SessionId {
         SessionId(conversation_id.to_string().into())
     }
@@ -102,119 +86,6 @@ impl CodexAgent {
             .get(session_id)
             .ok_or_else(Error::invalid_request)?
             .clone())
-    }
-
-    async fn send_notification(&self, session_id: SessionId, update: SessionUpdate) {
-        let notification = SessionNotification {
-            session_id,
-            update,
-            meta: None,
-        };
-
-        if let Err(e) = self.client().session_notification(notification).await {
-            error!("Failed to send session notification: {:?}", e);
-        }
-    }
-
-    async fn start_patch_apply(&self, session_id: SessionId, event: PatchApplyBeginEvent) {
-        let raw_input = serde_json::json!(&event);
-        let PatchApplyBeginEvent {
-            call_id,
-            auto_approved: _,
-            changes,
-        } = event;
-
-        let (title, locations, content) = Self::extract_tool_call_content_from_changes(changes);
-
-        let update = SessionUpdate::ToolCall(ToolCall {
-            id: ToolCallId(call_id.into()),
-            title,
-            kind: ToolKind::Edit,
-            status: ToolCallStatus::InProgress,
-            locations,
-            content: content.collect(),
-            raw_input: Some(raw_input),
-            raw_output: None,
-            meta: None,
-        });
-        self.send_notification(session_id, update).await;
-    }
-
-    async fn end_patch_apply(&self, session_id: SessionId, event: PatchApplyEndEvent) {
-        let raw_output = serde_json::json!(&event);
-        let PatchApplyEndEvent {
-            call_id,
-            stdout: _,
-            stderr: _,
-            success,
-        } = event;
-
-        let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-            id: ToolCallId(call_id.into()),
-            fields: ToolCallUpdateFields {
-                status: Some(if success {
-                    ToolCallStatus::Completed
-                } else {
-                    ToolCallStatus::Failed
-                }),
-                raw_output: Some(raw_output),
-                ..Default::default()
-            },
-            meta: None,
-        });
-        self.send_notification(session_id, update).await;
-    }
-
-    fn extract_tool_call_content_from_changes(
-        changes: HashMap<PathBuf, FileChange>,
-    ) -> (
-        String,
-        Vec<ToolCallLocation>,
-        impl Iterator<Item = ToolCallContent>,
-    ) {
-        (
-            format!(
-                "Edit {}",
-                changes.keys().map(|p| p.display().to_string()).join(", ")
-            ),
-            changes
-                .keys()
-                .map(|p| ToolCallLocation {
-                    path: p.clone(),
-                    line: None,
-                    meta: None,
-                })
-                .collect(),
-            changes
-                .into_iter()
-                .map(|(path, change)| ToolCallContent::Diff {
-                    diff: match change {
-                        codex_core::protocol::FileChange::Add { content } => Diff {
-                            path,
-                            old_text: None,
-                            new_text: content,
-                            meta: None,
-                        },
-                        codex_core::protocol::FileChange::Delete { content } => Diff {
-                            path,
-                            old_text: Some(content),
-                            new_text: String::new(),
-                            meta: None,
-                        },
-                        codex_core::protocol::FileChange::Update {
-                            unified_diff: _,
-                            move_path,
-                            old_content,
-                            new_content,
-                        } => Diff {
-                            path: move_path.unwrap_or(path),
-                            old_text: Some(old_content),
-                            new_text: new_content,
-                            meta: None,
-                        },
-                    },
-                }),
-        )
     }
 }
 

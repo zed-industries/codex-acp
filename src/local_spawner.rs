@@ -5,7 +5,7 @@ use agent_client_protocol::{
 };
 use tokio::sync::mpsc;
 
-use crate::codex_agent::ACP_CLIENT;
+use crate::ACP_CLIENT;
 
 #[derive(Debug)]
 pub enum FsTask {

@@ -5,16 +5,17 @@ use agent_client_protocol::AgentSideConnection;
 use codex_common::CliConfigOverrides;
 use codex_core::config::{Config, ConfigOverrides};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::{io::Result as IoResult, rc::Rc};
 use tokio::task::LocalSet;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::EnvFilter;
 
-use crate::codex_agent::ACP_CLIENT;
-
 mod codex_agent;
 mod conversation;
 mod local_spawner;
+
+pub static ACP_CLIENT: OnceLock<AgentSideConnection> = OnceLock::new();
 
 /// Run the Codex ACP agent.
 ///
