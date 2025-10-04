@@ -9,8 +9,9 @@ use agent_client_protocol::{
     PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
     SessionId, SessionMode, SessionModeId, SessionModeState, SessionModelState,
-    SessionNotification, SessionUpdate, StopReason, TextContent, TextResourceContents, ToolCall,
-    ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    SessionNotification, SessionUpdate, StopReason, TerminalId, TextContent, TextResourceContents,
+    ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind,
 };
 use codex_common::{
     approval_presets::{ApprovalPreset, builtin_approval_presets},
@@ -22,7 +23,8 @@ use codex_core::{
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
         AgentMessageDeltaEvent, AgentReasoningDeltaEvent, AgentReasoningRawContentDeltaEvent,
-        AgentReasoningSectionBreakEvent, Event, EventMsg, ExecApprovalRequestEvent, InputItem, Op,
+        AgentReasoningSectionBreakEvent, Event, EventMsg, ExecApprovalRequestEvent,
+        ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, InputItem, Op,
         ReviewDecision, TaskStartedEvent, UserMessageEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
 };
@@ -303,112 +305,23 @@ impl PromptState {
                     drop(response_tx.send(Err(err)));
                 }
             }
-            // EventMsg::ExecCommandBegin(event) => {
-            //     info!(
-            //         "Command execution started: call_id={}, command={:?}",
-            //         event.call_id, event.command
-            //     );
-
-            //     let raw_input = serde_json::json!(&event);
-            //     let ExecCommandBeginEvent {
-            //         call_id,
-            //         command,
-            //         cwd,
-            //         parsed_cmd: _,
-            //     } = event;
-            //     // Create a new tool call for the command execution
-            //     let tool_call_id = ToolCallId(call_id.clone().into());
-            //     let terminal_id_for_meta = call_id.clone();
-            //     let terminal_content: Vec<ToolCallContent> = vec![ToolCallContent::Terminal {
-            //         terminal_id: TerminalId(terminal_id_for_meta.clone().into()),
-            //     }];
-
-            //     active_command = Some((call_id, tool_call_id.clone()));
-
-            //     self.send_notification(
-            //         session_id.clone(),
-            //         SessionUpdate::ToolCall(ToolCall {
-            //             id: tool_call_id,
-            //             title: command.join(" "),
-            //             kind: ToolKind::Execute,
-            //             status: ToolCallStatus::InProgress,
-            //             content: terminal_content,
-            //             locations: if cwd == std::path::PathBuf::from(".") {
-            //                 vec![]
-            //             } else {
-            //                 vec![ToolCallLocation {
-            //                     path: cwd.clone(),
-            //                     line: None,
-            //                     meta: None,
-            //                 }]
-            //             },
-            //             raw_input: Some(raw_input),
-            //             raw_output: None,
-            //             meta: Some(serde_json::json!({
-            //                 "terminal_info": {
-            //                     "terminal_id": terminal_id_for_meta,
-            //                     "cwd": cwd
-            //                 }
-            //             })),
-            //         }),
-            //     )
-            //     .await;
-            // }
-            // EventMsg::ExecCommandOutputDelta(delta_event) => {
-            //     // Stream output bytes to the display-only terminal via ToolCallUpdate meta.
-            //     if let Some((active_call_id, active_tool_call_id)) = &active_command
-            //         && *active_call_id == delta_event.call_id
-            //     {
-            //         let data_str =
-            //             String::from_utf8_lossy(&delta_event.chunk).to_string();
-            //         self.send_notification(
-            //             session_id.clone(),
-            //             SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-            //                 id: active_tool_call_id.clone(),
-            //                 fields: ToolCallUpdateFields { ..Default::default() },
-            //                 meta: Some(serde_json::json!({
-            //                     "terminal_output": {
-            //                         "terminal_id": delta_event.call_id,
-            //                         "data": data_str
-            //                     }
-            //                 })),
-            //             }),
-            //         )
-            //         .await;
-            //     }
-            // }
-            // EventMsg::ExecCommandEnd(end_event) => {
-            //     info!(
-            //         "Command execution ended: call_id={}, exit_code={}",
-            //         end_event.call_id, end_event.exit_code
-            //     );
-
-            //     if let Some((call_id, tool_call_id)) = active_command.take()
-            //         && call_id == end_event.call_id
-            //     {
-            //         let is_success = end_event.exit_code == 0;
-
-            //         let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-            //             id: tool_call_id,
-            //             fields: ToolCallUpdateFields {
-            //                 status: Some(if is_success {
-            //                     ToolCallStatus::Completed
-            //                 } else {
-            //                     ToolCallStatus::Failed
-            //                 }),
-            //                 ..Default::default()
-            //             },
-            //             meta: Some(serde_json::json!({
-            //                 "terminal_exit": {
-            //                     "terminal_id": end_event.call_id,
-            //                     "exit_code": end_event.exit_code,
-            //                     "signal": null
-            //                 }
-            //             })),
-            //         });
-            //         self.send_notification(session_id.clone(), update).await;
-            //     }
-            // }
+            EventMsg::ExecCommandBegin(event) => {
+                info!(
+                    "Command execution started: call_id={}, command={:?}",
+                    event.call_id, event.command
+                );
+                self.exec_command_begin(client, event).await;
+            }
+            EventMsg::ExecCommandOutputDelta(delta_event) => {
+                self.exec_command_output_delta(client, delta_event).await;
+            }
+            EventMsg::ExecCommandEnd(end_event) => {
+                info!(
+                    "Command execution ended: call_id={}, exit_code={}",
+                    end_event.call_id, end_event.exit_code
+                );
+                self.exec_command_end(client, end_event).await;
+            }
             // EventMsg::McpToolCallBegin(McpToolCallBeginEvent { call_id, invocation }) => {
             //     info!("MCP tool call begin: call_id={call_id}, invocation={} {}", invocation.server, invocation.tool);
             //     self.start_mcp_tool_call(session_id.clone(), call_id, invocation).await;
@@ -563,6 +476,119 @@ impl PromptState {
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
         Ok(())
+    }
+
+    async fn exec_command_begin(&mut self, client: &Client, event: ExecCommandBeginEvent) {
+        let raw_input = serde_json::json!(&event);
+        let ExecCommandBeginEvent {
+            call_id,
+            command,
+            cwd,
+            parsed_cmd: _,
+        } = event;
+        // Create a new tool call for the command execution
+        let tool_call_id = ToolCallId(call_id.clone().into());
+        let terminal_id_for_meta = call_id.clone();
+        let terminal_content: Vec<ToolCallContent> = vec![ToolCallContent::Terminal {
+            terminal_id: TerminalId(terminal_id_for_meta.clone().into()),
+        }];
+
+        self.active_command = Some((call_id, tool_call_id.clone()));
+
+        client
+            .send_notification(SessionUpdate::ToolCall(ToolCall {
+                id: tool_call_id,
+                title: command.join(" "),
+                kind: ToolKind::Execute,
+                status: ToolCallStatus::InProgress,
+                content: terminal_content,
+                locations: if cwd == std::path::PathBuf::from(".") {
+                    vec![]
+                } else {
+                    vec![ToolCallLocation {
+                        path: cwd.clone(),
+                        line: None,
+                        meta: None,
+                    }]
+                },
+                raw_input: Some(raw_input),
+                raw_output: None,
+                meta: Some(serde_json::json!({
+                    "terminal_info": {
+                        "terminal_id": terminal_id_for_meta,
+                        "cwd": cwd
+                    }
+                })),
+            }))
+            .await;
+    }
+
+    async fn exec_command_output_delta(&self, client: &Client, event: ExecCommandOutputDeltaEvent) {
+        let ExecCommandOutputDeltaEvent {
+            call_id,
+            chunk,
+            stream: _,
+        } = event;
+        // Stream output bytes to the display-only terminal via ToolCallUpdate meta.
+        if let Some((active_call_id, active_tool_call_id)) = &self.active_command
+            && *active_call_id == call_id
+        {
+            let data_str = String::from_utf8_lossy(&chunk).to_string();
+            client
+                .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                    id: active_tool_call_id.clone(),
+                    fields: ToolCallUpdateFields {
+                        ..Default::default()
+                    },
+                    meta: Some(serde_json::json!({
+                        "terminal_output": {
+                            "terminal_id": call_id,
+                            "data": data_str
+                        }
+                    })),
+                }))
+                .await;
+        }
+    }
+
+    async fn exec_command_end(&mut self, client: &Client, event: ExecCommandEndEvent) {
+        let raw_output = serde_json::json!(&event);
+        let ExecCommandEndEvent {
+            call_id,
+            exit_code,
+            stdout: _,
+            stderr: _,
+            aggregated_output: _,
+            duration: _,
+            formatted_output: _,
+        } = event;
+        if let Some((active_call_id, tool_call_id)) = self.active_command.take()
+            && active_call_id == call_id
+        {
+            let is_success = exit_code == 0;
+
+            client
+                .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                    id: tool_call_id,
+                    fields: ToolCallUpdateFields {
+                        status: Some(if is_success {
+                            ToolCallStatus::Completed
+                        } else {
+                            ToolCallStatus::Failed
+                        }),
+                        raw_output: Some(raw_output),
+                        ..Default::default()
+                    },
+                    meta: Some(serde_json::json!({
+                        "terminal_exit": {
+                            "terminal_id": call_id,
+                            "exit_code": exit_code,
+                            "signal": null
+                        }
+                    })),
+                }))
+                .await;
+        }
     }
 
     async fn start_web_search(&mut self, client: &Client, call_id: String) {
