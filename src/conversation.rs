@@ -33,7 +33,7 @@ enum ConversationMessage {
     },
     Prompt {
         request: PromptRequest,
-        response_tx: oneshot::Sender<Result<(String, mpsc::UnboundedReceiver<EventMsg>), Error>>,
+        response_tx: oneshot::Sender<Result<oneshot::Receiver<Result<StopReason, Error>>, Error>>,
     },
     ExecApproval {
         submission_id: String,
@@ -100,10 +100,7 @@ impl ConversationHandle {
             .map_err(|e| Error::internal_error().with_data(e.to_string()))?
     }
 
-    pub async fn prompt(
-        &self,
-        request: PromptRequest,
-    ) -> Result<(String, mpsc::UnboundedReceiver<EventMsg>), Error> {
+    pub async fn prompt(&self, request: PromptRequest) -> Result<StopReason, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ConversationMessage::Prompt {
@@ -113,6 +110,8 @@ impl ConversationHandle {
         drop(self.message_tx.send(message));
 
         response_rx
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))??
             .await
             .map_err(|e| Error::internal_error().with_data(e.to_string()))?
     }
@@ -196,7 +195,7 @@ enum SubmissionState {
 impl SubmissionState {
     fn is_active(&self) -> bool {
         match self {
-            SubmissionState::Prompt(submission) => !submission.sender.is_closed(),
+            SubmissionState::Prompt(submission) => !submission.response_tx.is_closed(),
         }
     }
 
@@ -211,13 +210,13 @@ struct PromptState {
     active_command: Option<(String, ToolCallId)>,
     active_web_search: Option<String>,
     event_count: usize,
+    response_tx: oneshot::Sender<Result<StopReason, Error>>,
     submission_id: String,
     stop_reason: Option<StopReason>,
-    sender: mpsc::UnboundedSender<EventMsg>,
 }
 
 impl PromptState {
-    fn new(submission_id: String, sender: mpsc::UnboundedSender<EventMsg>) -> Self {
+    fn new(submission_id: String, response_tx: oneshot::Sender<Result<StopReason, Error>>) -> Self {
         info!("Submitted prompt with submission_id: {submission_id}");
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
 
@@ -225,7 +224,7 @@ impl PromptState {
             active_command: None,
             active_web_search: None,
             event_count: 0,
-            sender,
+            response_tx,
             submission_id,
             stop_reason: None,
         }
@@ -235,31 +234,256 @@ impl PromptState {
         self.event_count += 1;
 
         // Complete any previous web search before starting a new one
-        // match &event {
-        //     EventMsg::Error(..)
-        //     | EventMsg::StreamError(..)
-        //     | EventMsg::WebSearchBegin(..)
-        //     | EventMsg::UserMessage(..)
-        //     | EventMsg::ExecApprovalRequest(..)
-        //     | EventMsg::ExecCommandBegin(..)
-        //     | EventMsg::ExecCommandOutputDelta(..)
-        //     | EventMsg::ExecCommandEnd(..)
-        //     | EventMsg::McpToolCallBegin(..)
-        //     | EventMsg::McpToolCallEnd(..)
-        //     | EventMsg::ApplyPatchApprovalRequest(..)
-        //     | EventMsg::PatchApplyBegin(..)
-        //     | EventMsg::PatchApplyEnd(..)
-        //     | EventMsg::TaskComplete(..)
-        //     | EventMsg::TokenCount(..)
-        //     | EventMsg::TurnDiff(..)
-        //     | EventMsg::TurnAborted(..)
-        //     | EventMsg::ShutdownComplete => {
-        //         self.complete_web_search(client).await;
+        match &event {
+            EventMsg::Error(..)
+            | EventMsg::StreamError(..)
+            | EventMsg::WebSearchBegin(..)
+            | EventMsg::UserMessage(..)
+            | EventMsg::ExecApprovalRequest(..)
+            | EventMsg::ExecCommandBegin(..)
+            | EventMsg::ExecCommandOutputDelta(..)
+            | EventMsg::ExecCommandEnd(..)
+            | EventMsg::McpToolCallBegin(..)
+            | EventMsg::McpToolCallEnd(..)
+            | EventMsg::ApplyPatchApprovalRequest(..)
+            | EventMsg::PatchApplyBegin(..)
+            | EventMsg::PatchApplyEnd(..)
+            | EventMsg::TaskComplete(..)
+            | EventMsg::TokenCount(..)
+            | EventMsg::TurnDiff(..)
+            | EventMsg::TurnAborted(..)
+            | EventMsg::ShutdownComplete => {
+                self.complete_web_search(client).await;
+            }
+            _ => {}
+        }
+
+        // match event {
+        //     EventMsg::TaskStarted(TaskStartedEvent { model_context_window }) => {
+        //         info!("Task started with context window of {model_context_window:?}");
         //     }
-        //     _ => {}
+        //     EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
+        //         info!("User message echoed: {message:?}");
+        //     }
+        //     EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
+        //         // Send this to the client via session/update notification
+        //         info!("Agent message received: {delta:?}");
+        //         self.send_agent_text(session_id.clone(), delta).await;
+        //     }
+        //     EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent { delta })
+        //     | EventMsg::AgentReasoningRawContentDelta(
+        //         AgentReasoningRawContentDeltaEvent { delta },
+        //     ) => {
+        //         // Send this to the client via session/update notification
+        //         info!("Agent reasoning message received: {:?}", delta);
+        //         self.send_agent_thought(session_id.clone(), delta).await;
+        //     }
+        //     EventMsg::AgentReasoningSectionBreak(
+        //         AgentReasoningSectionBreakEvent {},
+        //     ) => {
+        //         // Make sure the section heading actually get spacing
+        //         self.send_agent_thought(session_id.clone(), "\n\n").await;
+        //     }
+        //     EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
+        //         // Send this to the client via session/update notification
+        //         info!("Agent plan updated. Explanation: {:?}", explanation);
+        //         self.update_plan(session_id.clone(), plan).await;
+        //     }
+        //     EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id }) => {
+        //         info!("Web search started: call_id={}", call_id);
+        //         // Create a ToolCall notification for the search beginning
+        //         self.start_web_search(session_id.clone(), call_id, &mut active_web_search).await;
+        //     }
+        //     EventMsg::WebSearchEnd(WebSearchEndEvent { call_id, query }) => {
+        //         info!("Web search query received: call_id={call_id}, query={query}");
+        //         // Send update that the search is in progress with the query
+        //         // (WebSearchEnd just means we have the query, not that results are ready)
+        //         self.update_web_search_query(session_id.clone(), call_id, query).await;
+        //         // The actual search results will come through AgentMessage events
+        //         // We mark as completed when a new tool call begins
+        //     }
+        //     EventMsg::ExecApprovalRequest(event) => {
+        //         info!("Command execution started: call_id={}, command={:?}", event.call_id, event.command);
+        //         self.exec_approval(session_id.clone(), submission_id.clone(), event, &mut active_command).await?;
+        //     }
+        //     EventMsg::ExecCommandBegin(event) => {
+        //         info!(
+        //             "Command execution started: call_id={}, command={:?}",
+        //             event.call_id, event.command
+        //         );
+
+        //         let raw_input = serde_json::json!(&event);
+        //         let ExecCommandBeginEvent {
+        //             call_id,
+        //             command,
+        //             cwd,
+        //             parsed_cmd: _,
+        //         } = event;
+        //         // Create a new tool call for the command execution
+        //         let tool_call_id = ToolCallId(call_id.clone().into());
+        //         let terminal_id_for_meta = call_id.clone();
+        //         let terminal_content: Vec<ToolCallContent> = vec![ToolCallContent::Terminal {
+        //             terminal_id: TerminalId(terminal_id_for_meta.clone().into()),
+        //         }];
+
+        //         active_command = Some((call_id, tool_call_id.clone()));
+
+        //         self.send_notification(
+        //             session_id.clone(),
+        //             SessionUpdate::ToolCall(ToolCall {
+        //                 id: tool_call_id,
+        //                 title: command.join(" "),
+        //                 kind: ToolKind::Execute,
+        //                 status: ToolCallStatus::InProgress,
+        //                 content: terminal_content,
+        //                 locations: if cwd == std::path::PathBuf::from(".") {
+        //                     vec![]
+        //                 } else {
+        //                     vec![ToolCallLocation {
+        //                         path: cwd.clone(),
+        //                         line: None,
+        //                         meta: None,
+        //                     }]
+        //                 },
+        //                 raw_input: Some(raw_input),
+        //                 raw_output: None,
+        //                 meta: Some(serde_json::json!({
+        //                     "terminal_info": {
+        //                         "terminal_id": terminal_id_for_meta,
+        //                         "cwd": cwd
+        //                     }
+        //                 })),
+        //             }),
+        //         )
+        //         .await;
+        //     }
+        //     EventMsg::ExecCommandOutputDelta(delta_event) => {
+        //         // Stream output bytes to the display-only terminal via ToolCallUpdate meta.
+        //         if let Some((active_call_id, active_tool_call_id)) = &active_command
+        //             && *active_call_id == delta_event.call_id
+        //         {
+        //             let data_str =
+        //                 String::from_utf8_lossy(&delta_event.chunk).to_string();
+        //             self.send_notification(
+        //                 session_id.clone(),
+        //                 SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+        //                     id: active_tool_call_id.clone(),
+        //                     fields: ToolCallUpdateFields { ..Default::default() },
+        //                     meta: Some(serde_json::json!({
+        //                         "terminal_output": {
+        //                             "terminal_id": delta_event.call_id,
+        //                             "data": data_str
+        //                         }
+        //                     })),
+        //                 }),
+        //             )
+        //             .await;
+        //         }
+        //     }
+        //     EventMsg::ExecCommandEnd(end_event) => {
+        //         info!(
+        //             "Command execution ended: call_id={}, exit_code={}",
+        //             end_event.call_id, end_event.exit_code
+        //         );
+
+        //         if let Some((call_id, tool_call_id)) = active_command.take()
+        //             && call_id == end_event.call_id
+        //         {
+        //             let is_success = end_event.exit_code == 0;
+
+        //             let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+        //                 id: tool_call_id,
+        //                 fields: ToolCallUpdateFields {
+        //                     status: Some(if is_success {
+        //                         ToolCallStatus::Completed
+        //                     } else {
+        //                         ToolCallStatus::Failed
+        //                     }),
+        //                     ..Default::default()
+        //                 },
+        //                 meta: Some(serde_json::json!({
+        //                     "terminal_exit": {
+        //                         "terminal_id": end_event.call_id,
+        //                         "exit_code": end_event.exit_code,
+        //                         "signal": null
+        //                     }
+        //                 })),
+        //             });
+        //             self.send_notification(session_id.clone(), update).await;
+        //         }
+        //     }
+        //     EventMsg::McpToolCallBegin(McpToolCallBeginEvent { call_id, invocation }) => {
+        //         info!("MCP tool call begin: call_id={call_id}, invocation={} {}", invocation.server, invocation.tool);
+        //         self.start_mcp_tool_call(session_id.clone(), call_id, invocation).await;
+        //     }
+        //     EventMsg::McpToolCallEnd(McpToolCallEndEvent { call_id, invocation, duration, result }) => {
+        //         info!("MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}", invocation.server, invocation.tool);
+        //         self.end_mcp_tool_call(session_id.clone(), call_id, result).await;
+        //     }
+        //     // File based events
+        //     EventMsg::ApplyPatchApprovalRequest(event) => {
+        //         info!("Apply patch approval request: call_id={}, reason={:?}", event.call_id, event.reason);
+        //         self.patch_approval(session_id.clone(), submission_id.clone(), event).await?;
+        //     }
+        //     EventMsg::PatchApplyBegin(event) => {
+        //         info!("Patch apply begin: call_id={}, auto_approved={}", event.call_id,event.auto_approved);
+        //         self.start_patch_apply(session_id.clone(), event).await;
+        //     }
+        //     EventMsg::PatchApplyEnd(event) => {
+        //         info!("Patch apply end: call_id={}, success={}", event.call_id, event.success);
+        //         self.end_patch_apply(session_id.clone(), event).await;
+        //     }
+        //     EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message}) => {
+        //         info!(
+        //             "Task completed successfully after {event_count} events. Last agent message: {last_agent_message:?}",
+        //         );
+        //         stop_reason = StopReason::EndTurn;
+        //         break;
+        //     }
+        //     EventMsg::Error(ErrorEvent { message })
+        //     | EventMsg::StreamError(StreamErrorEvent { message }) => {
+        //         error!("Error during turn: {}", message);
+        //         return Err(Error::internal_error().with_data(message));
+        //     }
+        //     EventMsg::TurnAborted(TurnAbortedEvent { reason }) => {
+        //         info!("Turn aborted: {reason:?}");
+        //         stop_reason = StopReason::Cancelled;
+        //         break;
+        //     }
+        //     EventMsg::ShutdownComplete => {
+        //         info!("Agent shutting down");
+        //         stop_reason = StopReason::Cancelled;
+        //         break;
+        //     }
+
+        //     // Since we are getting the deltas, we can ignore these events
+        //     EventMsg::AgentReasoning(AgentReasoningEvent { .. })
+        //     | EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent {
+        //         ..
+        //     })
+        //     | EventMsg::AgentMessage(AgentMessageEvent { .. })
+        //     // In the future we can use this to update usage stats
+        //     | EventMsg::TokenCount(..)
+        //     // we already have a way to diff the turn, so ignore
+        //     | EventMsg::TurnDiff(..)
+        //     // returned from Op::ListMcpTools, ignore
+        //     | EventMsg::McpListToolsResponse(..)
+        //     // returned from Op::ListCustomPrompts, ignore
+        //     | EventMsg::ListCustomPromptsResponse(..)
+        //     // returned from Op::GetPath, ignore
+        //     | EventMsg::ConversationPath(..)
+        //     // Used for returning a single history entry
+        //     | EventMsg::GetHistoryEntryResponse(..)
+        //     // Used for session loading and replay
+        //     | EventMsg::SessionConfigured(..)
+        //     // used when requesting a code review, ignore for now
+        //     | EventMsg::EnteredReviewMode(..)
+        //     | EventMsg::ExitedReviewMode(..)
+        //     // Revisit when we can emit status updates
+        //     | EventMsg::BackgroundEvent(..) => {}
         // }
 
-        self.sender.send(event).ok();
+        // self.sender.send(event).ok();
     }
 
     async fn complete_web_search(&mut self, client: &Client) {
@@ -490,8 +714,8 @@ impl ConversationActor {
     async fn handle_prompt(
         &mut self,
         request: PromptRequest,
-    ) -> Result<(String, mpsc::UnboundedReceiver<EventMsg>), Error> {
-        let (session_tx, session_rx) = mpsc::unbounded_channel();
+    ) -> Result<oneshot::Receiver<Result<StopReason, Error>>, Error> {
+        let (response_tx, response_rx) = oneshot::channel();
         let items = build_prompt_items(request.prompt);
 
         let submission_id = match self.conversation.submit(Op::UserInput { items }).await {
@@ -504,10 +728,10 @@ impl ConversationActor {
 
         self.submissions.insert(
             submission_id.clone(),
-            SubmissionState::Prompt(PromptState::new(submission_id.clone(), session_tx)),
+            SubmissionState::Prompt(PromptState::new(submission_id, response_tx)),
         );
 
-        Ok((submission_id, session_rx))
+        Ok(response_rx)
     }
 
     async fn handle_exec_approval(
