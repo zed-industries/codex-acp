@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 use crate::codex_agent::ACP_CLIENT;
 
 mod codex_agent;
+mod conversation;
 
 /// Run the Codex ACP agent.
 ///
