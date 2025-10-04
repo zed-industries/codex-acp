@@ -14,6 +14,7 @@ use crate::codex_agent::ACP_CLIENT;
 
 mod codex_agent;
 mod conversation;
+mod local_spawner;
 
 /// Run the Codex ACP agent.
 ///

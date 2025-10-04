@@ -4,9 +4,11 @@ use std::{
 };
 
 use agent_client_protocol::{
-    ContentBlock, EmbeddedResource, EmbeddedResourceResource, Error, LoadSessionResponse, ModelId,
-    ModelInfo, PromptRequest, ResourceLink, SessionMode, SessionModeId, SessionModeState,
-    SessionModelState, TextResourceContents,
+    AgentSideConnection, Client as _, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
+    Error, LoadSessionResponse, ModelId, ModelInfo, PromptRequest, ResourceLink, SessionId,
+    SessionMode, SessionModeId, SessionModeState, SessionModelState, SessionNotification,
+    SessionUpdate, StopReason, TextResourceContents, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields,
 };
 use codex_common::{
     approval_presets::{ApprovalPreset, builtin_approval_presets},
@@ -19,7 +21,9 @@ use codex_core::{
 };
 use codex_protocol::config_types::ReasoningEffort;
 use tokio::sync::{mpsc, oneshot};
-use tracing::error;
+use tracing::{error, info};
+
+use crate::codex_agent::ACP_CLIENT;
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 
@@ -63,14 +67,21 @@ pub struct ConversationHandle {
 
 impl ConversationHandle {
     pub fn new(
+        session_id: SessionId,
         conversation: Arc<CodexConversation>,
         config: Config,
         model_presets: Arc<Vec<ModelPreset>>,
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
 
-        let actor = ConversationActor::new(conversation.clone(), config, model_presets, message_rx);
-        let handle = tokio::spawn(actor.spawn());
+        let actor = ConversationActor::new(
+            session_id,
+            conversation.clone(),
+            config,
+            model_presets,
+            message_rx,
+        );
+        let handle = tokio::task::spawn_local(actor.spawn());
 
         Self {
             message_tx,
@@ -189,28 +200,113 @@ impl SubmissionState {
         }
     }
 
-    fn handle_event(&mut self, event: EventMsg) {
+    async fn handle_event(&mut self, client: &Client, event: EventMsg) {
         match self {
-            SubmissionState::Prompt(submission) => submission.handle_event(event),
+            SubmissionState::Prompt(submission) => submission.handle_event(client, event).await,
         }
     }
 }
 
 struct PromptState {
+    active_command: Option<(String, ToolCallId)>,
+    active_web_search: Option<String>,
+    event_count: usize,
+    submission_id: String,
+    stop_reason: Option<StopReason>,
     sender: mpsc::UnboundedSender<EventMsg>,
 }
 
 impl PromptState {
-    fn new(sender: mpsc::UnboundedSender<EventMsg>) -> Self {
-        Self { sender }
+    fn new(submission_id: String, sender: mpsc::UnboundedSender<EventMsg>) -> Self {
+        info!("Submitted prompt with submission_id: {submission_id}");
+        info!("Starting to wait for conversation events for submission_id: {submission_id}");
+
+        Self {
+            active_command: None,
+            active_web_search: None,
+            event_count: 0,
+            sender,
+            submission_id,
+            stop_reason: None,
+        }
     }
 
-    fn handle_event(&mut self, event: EventMsg) {
+    async fn handle_event(&mut self, client: &Client, event: EventMsg) {
+        self.event_count += 1;
+
+        // Complete any previous web search before starting a new one
+        // match &event {
+        //     EventMsg::Error(..)
+        //     | EventMsg::StreamError(..)
+        //     | EventMsg::WebSearchBegin(..)
+        //     | EventMsg::UserMessage(..)
+        //     | EventMsg::ExecApprovalRequest(..)
+        //     | EventMsg::ExecCommandBegin(..)
+        //     | EventMsg::ExecCommandOutputDelta(..)
+        //     | EventMsg::ExecCommandEnd(..)
+        //     | EventMsg::McpToolCallBegin(..)
+        //     | EventMsg::McpToolCallEnd(..)
+        //     | EventMsg::ApplyPatchApprovalRequest(..)
+        //     | EventMsg::PatchApplyBegin(..)
+        //     | EventMsg::PatchApplyEnd(..)
+        //     | EventMsg::TaskComplete(..)
+        //     | EventMsg::TokenCount(..)
+        //     | EventMsg::TurnDiff(..)
+        //     | EventMsg::TurnAborted(..)
+        //     | EventMsg::ShutdownComplete => {
+        //         self.complete_web_search(client).await;
+        //     }
+        //     _ => {}
+        // }
+
         self.sender.send(event).ok();
+    }
+
+    async fn complete_web_search(&mut self, client: &Client) {
+        if let Some(call_id) = self.active_web_search.take() {
+            client
+                .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                    id: ToolCallId(call_id.into()),
+                    fields: ToolCallUpdateFields {
+                        status: Some(ToolCallStatus::Completed),
+                        ..Default::default()
+                    },
+                    meta: None,
+                }))
+                .await;
+        }
+    }
+}
+
+struct Client {
+    session_id: SessionId,
+}
+
+impl Client {
+    fn new(session_id: SessionId) -> Self {
+        Self { session_id }
+    }
+
+    fn client() -> &'static AgentSideConnection {
+        ACP_CLIENT.get().expect("Client should be set")
+    }
+
+    async fn send_notification(&self, update: SessionUpdate) {
+        let notification = SessionNotification {
+            session_id: self.session_id.clone(),
+            update,
+            meta: None,
+        };
+
+        if let Err(e) = Self::client().session_notification(notification).await {
+            error!("Failed to send session notification: {:?}", e);
+        }
     }
 }
 
 struct ConversationActor {
+    /// Used for sending messages back to the client.
+    client: Client,
     /// The conversation associated with this task.
     conversation: Arc<CodexConversation>,
     /// The configuration for the conversation.
@@ -225,12 +321,14 @@ struct ConversationActor {
 
 impl ConversationActor {
     fn new(
+        session_id: SessionId,
         conversation: Arc<CodexConversation>,
         config: Config,
         model_presets: Arc<Vec<ModelPreset>>,
         message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
     ) -> Self {
         Self {
+            client: Client::new(session_id),
             conversation,
             config,
             model_presets,
@@ -248,7 +346,7 @@ impl ConversationActor {
                     None => break,
                 },
                 event = self.conversation.next_event() => match event {
-                    Ok(event) => self.handle_event(event),
+                    Ok(event) => self.handle_event(event).await,
                     Err(e) => {
                         error!("Error getting next event: {:?}", e);
                         break;
@@ -256,7 +354,8 @@ impl ConversationActor {
                 }
             }
             // Litter collection of senders with no receivers
-            self.submissions.retain(|_, sender| sender.is_active());
+            self.submissions
+                .retain(|_, submission| submission.is_active());
         }
     }
 
@@ -405,7 +504,7 @@ impl ConversationActor {
 
         self.submissions.insert(
             submission_id.clone(),
-            SubmissionState::Prompt(PromptState::new(session_tx)),
+            SubmissionState::Prompt(PromptState::new(submission_id.clone(), session_tx)),
         );
 
         Ok((submission_id, session_rx))
@@ -498,9 +597,9 @@ impl ConversationActor {
         Ok(())
     }
 
-    fn handle_event(&mut self, Event { id, msg }: Event) {
+    async fn handle_event(&mut self, Event { id, msg }: Event) {
         if let Some(submission) = self.submissions.get_mut(&id) {
-            submission.handle_event(msg);
+            submission.handle_event(&self.client, msg).await;
         } else {
             error!("Received event for unknown submission ID: {}", id);
         }
