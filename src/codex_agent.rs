@@ -2,12 +2,10 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AgentSideConnection, AuthenticateRequest, AuthenticateResponse,
     CancelNotification, Client, Diff, Error, InitializeRequest, InitializeResponse,
     LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, NewSessionRequest,
-    NewSessionResponse, PermissionOption, PermissionOptionId, PermissionOptionKind,
-    PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionId, SessionNotification, SessionUpdate, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, V1,
+    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, SessionId,
+    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse,
+    SetSessionModelRequest, SetSessionModelResponse, ToolCall, ToolCallContent, ToolCallId,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
 };
 use codex_common::model_presets::{ModelPreset, builtin_model_presets};
 use codex_core::{
@@ -15,10 +13,7 @@ use codex_core::{
     auth::{AuthManager, CodexAuth, login_with_api_key},
     config::Config,
     config_types::{McpServerConfig, McpServerTransportConfig},
-    protocol::{
-        ApplyPatchApprovalRequestEvent, FileChange, PatchApplyBeginEvent, PatchApplyEndEvent,
-        ReviewDecision,
-    },
+    protocol::{FileChange, PatchApplyBeginEvent, PatchApplyEndEvent},
 };
 use codex_protocol::ConversationId;
 use itertools::Itertools;
@@ -119,74 +114,6 @@ impl CodexAgent {
         if let Err(e) = self.client().session_notification(notification).await {
             error!("Failed to send session notification: {:?}", e);
         }
-    }
-
-    async fn patch_approval(
-        &self,
-        session_id: SessionId,
-        submission_id: String,
-        event: ApplyPatchApprovalRequestEvent,
-    ) -> Result<(), Error> {
-        let raw_input = serde_json::json!(&event);
-        let ApplyPatchApprovalRequestEvent {
-            call_id,
-            changes,
-            reason,
-            // grant_root doesn't seem to be set anywhere on the codex side
-            grant_root: _,
-        } = event;
-        let conversation = self.get_conversation(&session_id).await?;
-        let (title, locations, content) = Self::extract_tool_call_content_from_changes(changes);
-        let response = self
-            .client()
-            .request_permission(RequestPermissionRequest {
-                session_id,
-                tool_call: ToolCallUpdate {
-                    id: ToolCallId(call_id.into()),
-                    fields: ToolCallUpdateFields {
-                        kind: Some(ToolKind::Edit),
-                        status: Some(ToolCallStatus::Pending),
-                        title: Some(title),
-                        locations: Some(locations),
-                        content: Some(
-                            content
-                                .chain(
-                                    reason.map(|r| ToolCallContent::Content { content: r.into() }),
-                                )
-                                .collect(),
-                        ),
-                        raw_input: Some(raw_input),
-                        ..Default::default()
-                    },
-                    meta: None,
-                },
-                options: vec![
-                    PermissionOption {
-                        id: PermissionOptionId("approved".into()),
-                        name: "Yes".into(),
-                        kind: PermissionOptionKind::AllowOnce,
-                        meta: None,
-                    },
-                    PermissionOption {
-                        id: PermissionOptionId("abort".into()),
-                        name: "No, provide feedback".into(),
-                        kind: PermissionOptionKind::RejectOnce,
-                        meta: None,
-                    },
-                ],
-                meta: None,
-            })
-            .await?;
-
-        let decision = match response.outcome {
-            RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
-            RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
-                "approved" => ReviewDecision::Approved,
-                _ => ReviewDecision::Abort,
-            },
-        };
-        conversation.patch_approval(submission_id, decision).await?;
-        Ok(())
     }
 
     async fn start_patch_apply(&self, session_id: SessionId, event: PatchApplyBeginEvent) {

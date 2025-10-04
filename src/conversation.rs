@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, LazyLock},
 };
 
 use agent_client_protocol::{
     AgentSideConnection, Annotations, AudioContent, BlobResourceContents, Client as _,
-    ContentBlock, EmbeddedResource, EmbeddedResourceResource, Error, ImageContent,
+    ContentBlock, Diff, EmbeddedResource, EmbeddedResourceResource, Error, ImageContent,
     LoadSessionResponse, ModelId, ModelInfo, PermissionOption, PermissionOptionId,
     PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
@@ -24,13 +25,16 @@ use codex_core::{
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
         AgentMessageDeltaEvent, AgentReasoningDeltaEvent, AgentReasoningRawContentDeltaEvent,
-        AgentReasoningSectionBreakEvent, Event, EventMsg, ExecApprovalRequestEvent,
-        ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, InputItem,
-        McpInvocation, McpToolCallBeginEvent, McpToolCallEndEvent, Op, ReviewDecision,
-        TaskStartedEvent, UserMessageEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ErrorEvent, Event,
+        EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent,
+        ExecCommandOutputDeltaEvent, FileChange, InputItem, McpInvocation, McpToolCallBeginEvent,
+        McpToolCallEndEvent, Op, ReviewDecision, StreamErrorEvent, TaskCompleteEvent,
+        TaskStartedEvent, TurnAbortedEvent, UserMessageEvent, WebSearchBeginEvent,
+        WebSearchEndEvent,
     },
 };
 use codex_protocol::config_types::ReasoningEffort;
+use itertools::Itertools;
 use mcp_types::CallToolResult;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
@@ -46,11 +50,6 @@ enum ConversationMessage {
     Prompt {
         request: PromptRequest,
         response_tx: oneshot::Sender<Result<oneshot::Receiver<Result<StopReason, Error>>, Error>>,
-    },
-    PatchApproval {
-        submission_id: String,
-        decision: ReviewDecision,
-        response_tx: oneshot::Sender<Result<(), Error>>,
     },
     SetMode {
         mode: SessionModeId,
@@ -119,25 +118,6 @@ impl ConversationHandle {
         response_rx
             .await
             .map_err(|e| Error::internal_error().with_data(e.to_string()))??
-            .await
-            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
-    }
-
-    pub async fn patch_approval(
-        &self,
-        submission_id: String,
-        decision: ReviewDecision,
-    ) -> Result<(), Error> {
-        let (response_tx, response_rx) = oneshot::channel();
-
-        let message = ConversationMessage::PatchApproval {
-            submission_id,
-            decision,
-            response_tx,
-        };
-        drop(self.message_tx.send(message));
-
-        response_rx
             .await
             .map_err(|e| Error::internal_error().with_data(e.to_string()))?
     }
@@ -333,42 +313,47 @@ impl PromptState {
                 info!("MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}", invocation.server, invocation.tool);
                 self.end_mcp_tool_call(client, call_id, result).await;
             }
-            // // File based events
-            // EventMsg::ApplyPatchApprovalRequest(event) => {
-            //     info!("Apply patch approval request: call_id={}, reason={:?}", event.call_id, event.reason);
-            //     self.patch_approval(session_id.clone(), submission_id.clone(), event).await?;
-            // }
-            // EventMsg::PatchApplyBegin(event) => {
-            //     info!("Patch apply begin: call_id={}, auto_approved={}", event.call_id,event.auto_approved);
-            //     self.start_patch_apply(session_id.clone(), event).await;
-            // }
-            // EventMsg::PatchApplyEnd(event) => {
-            //     info!("Patch apply end: call_id={}, success={}", event.call_id, event.success);
-            //     self.end_patch_apply(session_id.clone(), event).await;
-            // }
-            // EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message}) => {
-            //     info!(
-            //         "Task completed successfully after {event_count} events. Last agent message: {last_agent_message:?}",
-            //     );
-            //     stop_reason = StopReason::EndTurn;
-            //     break;
-            // }
-            // EventMsg::Error(ErrorEvent { message })
-            // | EventMsg::StreamError(StreamErrorEvent { message }) => {
-            //     error!("Error during turn: {}", message);
-            //     return Err(Error::internal_error().with_data(message));
-            // }
-            // EventMsg::TurnAborted(TurnAbortedEvent { reason }) => {
-            //     info!("Turn aborted: {reason:?}");
-            //     stop_reason = StopReason::Cancelled;
-            //     break;
-            // }
-            // EventMsg::ShutdownComplete => {
-            //     info!("Agent shutting down");
-            //     stop_reason = StopReason::Cancelled;
-            //     break;
-            // }
-
+            EventMsg::ApplyPatchApprovalRequest(event) => {
+                info!("Apply patch approval request: call_id={}, reason={:?}", event.call_id, event.reason);
+                if let Err(err) = self.patch_approval(client, event).await && let Some(response_tx) = self.response_tx.take() {
+                    drop(response_tx.send(Err(err)));
+                }
+            }
+            EventMsg::PatchApplyBegin(event) => {
+                // info!("Patch apply begin: call_id={}, auto_approved={}", event.call_id,event.auto_approved);
+                // self.start_patch_apply(session_id.clone(), event).await;
+            }
+            EventMsg::PatchApplyEnd(event) => {
+                // info!("Patch apply end: call_id={}, success={}", event.call_id, event.success);
+                // self.end_patch_apply(session_id.clone(), event).await;
+            }
+            EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message}) => {
+                info!(
+                    "Task completed successfully after {} events. Last agent message: {last_agent_message:?}", self.event_count
+                );
+                if let Some(response_tx) = self.response_tx.take() {
+                    response_tx.send(Ok(StopReason::EndTurn)).ok();
+                }
+            }
+            EventMsg::Error(ErrorEvent { message })
+            | EventMsg::StreamError(StreamErrorEvent { message }) => {
+                error!("Error during turn: {}", message);
+                if let Some(response_tx) = self.response_tx.take() {
+                    response_tx.send(Err(Error::internal_error().with_data(message))).ok();
+                }
+            }
+            EventMsg::TurnAborted(TurnAbortedEvent { reason }) => {
+                info!("Turn aborted: {reason:?}");
+                if let Some(response_tx) = self.response_tx.take() {
+                    response_tx.send(Ok(StopReason::Cancelled)).ok();
+                }
+            }
+            EventMsg::ShutdownComplete => {
+                info!("Agent shutting down");
+                if let Some(response_tx) = self.response_tx.take() {
+                    response_tx.send(Ok(StopReason::Cancelled)).ok();
+                }
+            }
             // Since we are getting the deltas, we can ignore these events
             EventMsg::AgentReasoning(..)
             | EventMsg::AgentReasoningRawContent(..)
@@ -392,10 +377,77 @@ impl PromptState {
             | EventMsg::ExitedReviewMode(..)
             // Revisit when we can emit status updates
             | EventMsg::BackgroundEvent(..) => {}
-            _ => {
-                todo!()
-            }
         }
+    }
+
+    async fn patch_approval(
+        &self,
+        client: &Client,
+        event: ApplyPatchApprovalRequestEvent,
+    ) -> Result<(), Error> {
+        let raw_input = serde_json::json!(&event);
+        let ApplyPatchApprovalRequestEvent {
+            call_id,
+            changes,
+            reason,
+            // grant_root doesn't seem to be set anywhere on the codex side
+            grant_root: _,
+        } = event;
+        let (title, locations, content) = extract_tool_call_content_from_changes(changes);
+        let response = client
+            .request_permission(
+                ToolCallUpdate {
+                    id: ToolCallId(call_id.into()),
+                    fields: ToolCallUpdateFields {
+                        kind: Some(ToolKind::Edit),
+                        status: Some(ToolCallStatus::Pending),
+                        title: Some(title),
+                        locations: Some(locations),
+                        content: Some(
+                            content
+                                .chain(
+                                    reason.map(|r| ToolCallContent::Content { content: r.into() }),
+                                )
+                                .collect(),
+                        ),
+                        raw_input: Some(raw_input),
+                        ..Default::default()
+                    },
+                    meta: None,
+                },
+                vec![
+                    PermissionOption {
+                        id: PermissionOptionId("approved".into()),
+                        name: "Yes".into(),
+                        kind: PermissionOptionKind::AllowOnce,
+                        meta: None,
+                    },
+                    PermissionOption {
+                        id: PermissionOptionId("abort".into()),
+                        name: "No, provide feedback".into(),
+                        kind: PermissionOptionKind::RejectOnce,
+                        meta: None,
+                    },
+                ],
+            )
+            .await?;
+
+        let decision = match response.outcome {
+            RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
+            RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
+                "approved" => ReviewDecision::Approved,
+                _ => ReviewDecision::Abort,
+            },
+        };
+
+        self.conversation
+            .submit(Op::PatchApproval {
+                id: self.submission_id.clone(),
+                decision,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        Ok(())
     }
 
     async fn start_mcp_tool_call(
@@ -858,14 +910,6 @@ impl ConversationActor {
                 let result = self.handle_prompt(request).await;
                 drop(response_tx.send(result));
             }
-            ConversationMessage::PatchApproval {
-                submission_id,
-                decision,
-                response_tx,
-            } => {
-                let result = self.handle_patch_approval(submission_id, decision).await;
-                drop(response_tx.send(result));
-            }
             ConversationMessage::SetMode { mode, response_tx } => {
                 let result = self.handle_set_mode(mode).await;
                 drop(response_tx.send(result));
@@ -993,21 +1037,6 @@ impl ConversationActor {
         );
 
         Ok(response_rx)
-    }
-
-    async fn handle_patch_approval(
-        &mut self,
-        submission_id: String,
-        decision: ReviewDecision,
-    ) -> Result<(), Error> {
-        self.conversation
-            .submit(Op::PatchApproval {
-                id: submission_id,
-                decision,
-            })
-            .await
-            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-        Ok(())
     }
 
     async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
@@ -1231,4 +1260,56 @@ fn convert_annotations(annotations: mcp_types::Annotations) -> Annotations {
         priority: annotations.priority,
         meta: None,
     }
+}
+
+fn extract_tool_call_content_from_changes(
+    changes: HashMap<PathBuf, FileChange>,
+) -> (
+    String,
+    Vec<ToolCallLocation>,
+    impl Iterator<Item = ToolCallContent>,
+) {
+    (
+        format!(
+            "Edit {}",
+            changes.keys().map(|p| p.display().to_string()).join(", ")
+        ),
+        changes
+            .keys()
+            .map(|p| ToolCallLocation {
+                path: p.clone(),
+                line: None,
+                meta: None,
+            })
+            .collect(),
+        changes
+            .into_iter()
+            .map(|(path, change)| ToolCallContent::Diff {
+                diff: match change {
+                    codex_core::protocol::FileChange::Add { content } => Diff {
+                        path,
+                        old_text: None,
+                        new_text: content,
+                        meta: None,
+                    },
+                    codex_core::protocol::FileChange::Delete { content } => Diff {
+                        path,
+                        old_text: Some(content),
+                        new_text: String::new(),
+                        meta: None,
+                    },
+                    codex_core::protocol::FileChange::Update {
+                        unified_diff: _,
+                        move_path,
+                        old_content,
+                        new_content,
+                    } => Diff {
+                        path: move_path.unwrap_or(path),
+                        old_text: Some(old_content),
+                        new_text: new_content,
+                        meta: None,
+                    },
+                },
+            }),
+    )
 }
