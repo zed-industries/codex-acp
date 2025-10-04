@@ -18,8 +18,8 @@ use codex_core::{
     config::Config,
     config_types::{McpServerConfig, McpServerTransportConfig},
     protocol::{
-        ApplyPatchApprovalRequestEvent, ExecApprovalRequestEvent, FileChange, McpInvocation,
-        PatchApplyBeginEvent, PatchApplyEndEvent, ReviewDecision,
+        ApplyPatchApprovalRequestEvent, FileChange, McpInvocation, PatchApplyBeginEvent,
+        PatchApplyEndEvent, ReviewDecision,
     },
 };
 use codex_protocol::ConversationId;
@@ -261,88 +261,6 @@ impl CodexAgent {
                 }
             },
         }
-    }
-
-    async fn exec_approval(
-        &self,
-        session_id: SessionId,
-        submission_id: String,
-        event: ExecApprovalRequestEvent,
-        active_command: &mut Option<(String, ToolCallId)>,
-    ) -> Result<(), Error> {
-        let raw_input = serde_json::json!(&event);
-        let ExecApprovalRequestEvent {
-            call_id,
-            command,
-            cwd,
-            reason,
-        } = event;
-        let conversation = self.get_conversation(&session_id).await?;
-
-        // Create a new tool call for the command execution
-        let tool_call_id = ToolCallId(call_id.clone().into());
-        *active_command = Some((call_id, tool_call_id.clone()));
-
-        let response = self
-            .client()
-            .request_permission(RequestPermissionRequest {
-                session_id,
-                tool_call: ToolCallUpdate {
-                    id: tool_call_id,
-                    fields: ToolCallUpdateFields {
-                        kind: Some(ToolKind::Execute),
-                        status: Some(ToolCallStatus::Pending),
-                        title: Some(command.join(" ")),
-                        content: reason.map(|r| vec![r.into()]),
-                        locations: if cwd == std::path::PathBuf::from(".") {
-                            None
-                        } else {
-                            Some(vec![ToolCallLocation {
-                                path: cwd.clone(),
-                                line: None,
-                                meta: None,
-                            }])
-                        },
-                        raw_input: Some(raw_input),
-                        raw_output: None,
-                    },
-                    meta: None,
-                },
-                options: vec![
-                    PermissionOption {
-                        id: PermissionOptionId("approved-for-session".into()),
-                        name: "Always".into(),
-                        kind: PermissionOptionKind::AllowAlways,
-                        meta: None,
-                    },
-                    PermissionOption {
-                        id: PermissionOptionId("approved".into()),
-                        name: "Yes".into(),
-                        kind: PermissionOptionKind::AllowOnce,
-                        meta: None,
-                    },
-                    PermissionOption {
-                        id: PermissionOptionId("abort".into()),
-                        name: "No, provide feedback".into(),
-                        kind: PermissionOptionKind::RejectOnce,
-                        meta: None,
-                    },
-                ],
-                meta: None,
-            })
-            .await?;
-
-        let decision = match response.outcome {
-            RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
-            RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
-                "approved-for-session" => ReviewDecision::ApprovedForSession,
-                "approved" => ReviewDecision::Approved,
-                _ => ReviewDecision::Abort,
-            },
-        };
-
-        conversation.exec_approval(submission_id, decision).await?;
-        Ok(())
     }
 
     async fn patch_approval(

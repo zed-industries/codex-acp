@@ -5,11 +5,12 @@ use std::{
 
 use agent_client_protocol::{
     AgentSideConnection, Client as _, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
-    Error, LoadSessionResponse, ModelId, ModelInfo, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, PromptRequest, ResourceLink, SessionId, SessionMode, SessionModeId,
-    SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason,
-    TextContent, TextResourceContents, ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind,
+    Error, LoadSessionResponse, ModelId, ModelInfo, PermissionOption, PermissionOptionId,
+    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
+    SessionId, SessionMode, SessionModeId, SessionModeState, SessionModelState,
+    SessionNotification, SessionUpdate, StopReason, TextContent, TextResourceContents, ToolCall,
+    ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use codex_common::{
     approval_presets::{ApprovalPreset, builtin_approval_presets},
@@ -21,8 +22,8 @@ use codex_core::{
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
         AgentMessageDeltaEvent, AgentReasoningDeltaEvent, AgentReasoningRawContentDeltaEvent,
-        AgentReasoningSectionBreakEvent, Event, EventMsg, InputItem, Op, ReviewDecision,
-        TaskStartedEvent, UserMessageEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        AgentReasoningSectionBreakEvent, Event, EventMsg, ExecApprovalRequestEvent, InputItem, Op,
+        ReviewDecision, TaskStartedEvent, UserMessageEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
 };
 use codex_protocol::config_types::ReasoningEffort;
@@ -40,11 +41,6 @@ enum ConversationMessage {
     Prompt {
         request: PromptRequest,
         response_tx: oneshot::Sender<Result<oneshot::Receiver<Result<StopReason, Error>>, Error>>,
-    },
-    ExecApproval {
-        submission_id: String,
-        decision: ReviewDecision,
-        response_tx: oneshot::Sender<Result<(), Error>>,
     },
     PatchApproval {
         submission_id: String,
@@ -118,25 +114,6 @@ impl ConversationHandle {
         response_rx
             .await
             .map_err(|e| Error::internal_error().with_data(e.to_string()))??
-            .await
-            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
-    }
-
-    pub async fn exec_approval(
-        &self,
-        submission_id: String,
-        decision: ReviewDecision,
-    ) -> Result<(), Error> {
-        let (response_tx, response_rx) = oneshot::channel();
-
-        let message = ConversationMessage::ExecApproval {
-            submission_id,
-            decision,
-            response_tx,
-        };
-        drop(self.message_tx.send(message));
-
-        response_rx
             .await
             .map_err(|e| Error::internal_error().with_data(e.to_string()))?
     }
@@ -215,24 +192,25 @@ impl SubmissionState {
 struct PromptState {
     active_command: Option<(String, ToolCallId)>,
     active_web_search: Option<String>,
+    conversation: Arc<CodexConversation>,
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     submission_id: String,
-    stop_reason: Option<StopReason>,
 }
 
 impl PromptState {
-    fn new(submission_id: String, response_tx: oneshot::Sender<Result<StopReason, Error>>) -> Self {
-        info!("Submitted prompt with submission_id: {submission_id}");
-        info!("Starting to wait for conversation events for submission_id: {submission_id}");
-
+    fn new(
+        conversation: Arc<CodexConversation>,
+        response_tx: oneshot::Sender<Result<StopReason, Error>>,
+        submission_id: String,
+    ) -> Self {
         Self {
             active_command: None,
             active_web_search: None,
+            conversation,
             event_count: 0,
             response_tx: Some(response_tx),
             submission_id,
-            stop_reason: None,
         }
     }
 
@@ -319,10 +297,12 @@ impl PromptState {
                 // The actual search results will come through AgentMessage events
                 // We mark as completed when a new tool call begins
             }
-            // EventMsg::ExecApprovalRequest(event) => {
-            //     info!("Command execution started: call_id={}, command={:?}", event.call_id, event.command);
-            //     self.exec_approval(session_id.clone(), submission_id.clone(), event, &mut active_command).await?;
-            // }
+            EventMsg::ExecApprovalRequest(event) => {
+                info!("Command execution started: call_id={}, command={:?}", event.call_id, event.command);
+                if let Err(err) = self.exec_approval(client, event).await && let Some(response_tx) = self.response_tx.take() {
+                    drop(response_tx.send(Err(err)));
+                }
+            }
             // EventMsg::ExecCommandBegin(event) => {
             //     info!(
             //         "Command execution started: call_id={}, command={:?}",
@@ -502,6 +482,89 @@ impl PromptState {
         }
     }
 
+    async fn exec_approval(
+        &mut self,
+        client: &Client,
+        event: ExecApprovalRequestEvent,
+    ) -> Result<(), Error> {
+        let raw_input = serde_json::json!(&event);
+        let ExecApprovalRequestEvent {
+            call_id,
+            command,
+            cwd,
+            reason,
+        } = event;
+
+        // Create a new tool call for the command execution
+        let tool_call_id = ToolCallId(call_id.clone().into());
+        self.active_command = Some((call_id, tool_call_id.clone()));
+
+        let response = client
+            .request_permission(
+                ToolCallUpdate {
+                    id: tool_call_id,
+                    fields: ToolCallUpdateFields {
+                        kind: Some(ToolKind::Execute),
+                        status: Some(ToolCallStatus::Pending),
+                        title: Some(command.join(" ")),
+                        content: reason.map(|r| vec![r.into()]),
+                        locations: if cwd == std::path::PathBuf::from(".") {
+                            None
+                        } else {
+                            Some(vec![ToolCallLocation {
+                                path: cwd.clone(),
+                                line: None,
+                                meta: None,
+                            }])
+                        },
+                        raw_input: Some(raw_input),
+                        raw_output: None,
+                    },
+                    meta: None,
+                },
+                vec![
+                    PermissionOption {
+                        id: PermissionOptionId("approved-for-session".into()),
+                        name: "Always".into(),
+                        kind: PermissionOptionKind::AllowAlways,
+                        meta: None,
+                    },
+                    PermissionOption {
+                        id: PermissionOptionId("approved".into()),
+                        name: "Yes".into(),
+                        kind: PermissionOptionKind::AllowOnce,
+                        meta: None,
+                    },
+                    PermissionOption {
+                        id: PermissionOptionId("abort".into()),
+                        name: "No, provide feedback".into(),
+                        kind: PermissionOptionKind::RejectOnce,
+                        meta: None,
+                    },
+                ],
+            )
+            .await?;
+
+        let decision = match response.outcome {
+            RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
+            RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
+                "approved-for-session" => ReviewDecision::ApprovedForSession,
+                "approved" => ReviewDecision::Approved,
+                _ => ReviewDecision::Abort,
+            },
+        };
+
+        self.conversation
+            .submit(Op::ExecApproval {
+                id: self.submission_id.clone(),
+                decision,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        Ok(())
+    }
+
     async fn start_web_search(&mut self, client: &Client, call_id: String) {
         self.active_web_search = Some(call_id.clone());
         client
@@ -618,6 +681,21 @@ impl Client {
         }))
         .await;
     }
+
+    async fn request_permission(
+        &self,
+        tool_call: ToolCallUpdate,
+        options: Vec<PermissionOption>,
+    ) -> Result<RequestPermissionResponse, Error> {
+        Self::client()
+            .request_permission(RequestPermissionRequest {
+                session_id: self.session_id.clone(),
+                tool_call,
+                options,
+                meta: None,
+            })
+            .await
+    }
 }
 
 struct ConversationActor {
@@ -686,14 +764,6 @@ impl ConversationActor {
                 response_tx,
             } => {
                 let result = self.handle_prompt(request).await;
-                drop(response_tx.send(result));
-            }
-            ConversationMessage::ExecApproval {
-                submission_id,
-                decision,
-                response_tx,
-            } => {
-                let result = self.handle_exec_approval(submission_id, decision).await;
                 drop(response_tx.send(result));
             }
             ConversationMessage::PatchApproval {
@@ -818,27 +888,19 @@ impl ConversationActor {
             }
         };
 
+        info!("Submitted prompt with submission_id: {submission_id}");
+        info!("Starting to wait for conversation events for submission_id: {submission_id}");
+
         self.submissions.insert(
             submission_id.clone(),
-            SubmissionState::Prompt(PromptState::new(submission_id, response_tx)),
+            SubmissionState::Prompt(PromptState::new(
+                self.conversation.clone(),
+                response_tx,
+                submission_id,
+            )),
         );
 
         Ok(response_rx)
-    }
-
-    async fn handle_exec_approval(
-        &mut self,
-        submission_id: String,
-        decision: ReviewDecision,
-    ) -> Result<(), Error> {
-        self.conversation
-            .submit(Op::ExecApproval {
-                id: submission_id,
-                decision,
-            })
-            .await
-            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-        Ok(())
     }
 
     async fn handle_patch_approval(
