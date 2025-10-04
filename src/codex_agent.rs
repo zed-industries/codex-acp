@@ -17,7 +17,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use tracing::{debug, info};
 
 use crate::{
-    conversation::ConversationHandle,
+    conversation::Conversation,
     local_spawner::{AcpFs, LocalSpawner},
 };
 
@@ -31,7 +31,7 @@ pub struct CodexAgent {
     /// Conversation manager for handling sessions
     conversation_manager: ConversationManager,
     /// Active sessions mapped by `SessionId`
-    sessions: Rc<RefCell<HashMap<SessionId, Rc<ConversationHandle>>>>,
+    sessions: Rc<RefCell<HashMap<SessionId, Rc<Conversation>>>>,
     /// Default model presets for a given auth mode
     model_presets: Rc<Vec<ModelPreset>>,
 }
@@ -76,10 +76,7 @@ impl CodexAgent {
         SessionId(conversation_id.to_string().into())
     }
 
-    async fn get_conversation(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Rc<ConversationHandle>, Error> {
+    async fn get_conversation(&self, session_id: &SessionId) -> Result<Rc<Conversation>, Error> {
         Ok(self
             .sessions
             .borrow()
@@ -243,7 +240,7 @@ impl Agent for CodexAgent {
             .map_err(|_e| Error::internal_error())?;
 
         let session_id = Self::session_id_from_conversation_id(conversation_id);
-        let conversation = Rc::new(ConversationHandle::new(
+        let conversation = Rc::new(Conversation::new(
             session_id.clone(),
             conversation,
             config.clone(),

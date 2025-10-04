@@ -65,14 +65,14 @@ enum ConversationMessage {
     },
 }
 
-pub struct ConversationHandle {
+pub struct Conversation {
     /// A sender for interacting with the conversation.
     message_tx: mpsc::UnboundedSender<ConversationMessage>,
     /// A handle to the spawned task.
     _handle: tokio::task::JoinHandle<()>,
 }
 
-impl ConversationHandle {
+impl Conversation {
     pub fn new(
         session_id: SessionId,
         conversation: Arc<CodexConversation>,
