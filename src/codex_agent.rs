@@ -1033,10 +1033,9 @@ impl Agent for CodexAgent {
                     // Create a new tool call for the command execution
                     let tool_call_id = ToolCallId(call_id.clone().into());
                     let terminal_id_for_meta = call_id.clone();
-                    let mut terminal_content: Vec<ToolCallContent> = Vec::new();
-                    terminal_content.push(ToolCallContent::Terminal {
+                    let terminal_content: Vec<ToolCallContent> = vec![ToolCallContent::Terminal {
                         terminal_id: TerminalId(terminal_id_for_meta.clone().into()),
-                    });
+                    }];
 
                     active_command = Some((call_id, tool_call_id.clone()));
 
