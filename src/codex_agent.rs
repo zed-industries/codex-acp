@@ -4,12 +4,12 @@ use agent_client_protocol::{
     EmbeddedResource, EmbeddedResourceResource, Error, ImageContent, InitializeRequest,
     InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
     NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionId,
-    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptCapabilities,
-    PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    ResourceLink, SessionId, SessionNotification, SessionUpdate, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, StopReason,
-    TerminalId, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
+    PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, ResourceLink, SessionId,
+    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse,
+    SetSessionModelRequest, SetSessionModelResponse, TextContent, TextResourceContents, ToolCall,
+    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, V1,
 };
 use codex_common::model_presets::{ModelPreset, builtin_model_presets};
 use codex_core::{
@@ -17,18 +17,12 @@ use codex_core::{
     auth::{AuthManager, CodexAuth, login_with_api_key},
     config::Config,
     config_types::{McpServerConfig, McpServerTransportConfig},
-    plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
-        AgentMessageDeltaEvent, AgentMessageEvent, AgentReasoningDeltaEvent, AgentReasoningEvent,
-        AgentReasoningRawContentDeltaEvent, AgentReasoningRawContentEvent,
-        AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ErrorEvent,
-        ExecApprovalRequestEvent, ExecCommandBeginEvent, FileChange, McpInvocation,
-        McpToolCallBeginEvent, McpToolCallEndEvent, PatchApplyBeginEvent, PatchApplyEndEvent,
-        ReviewDecision, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent,
-        UserMessageEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        ApplyPatchApprovalRequestEvent, ExecApprovalRequestEvent, FileChange, McpInvocation,
+        PatchApplyBeginEvent, PatchApplyEndEvent, ReviewDecision,
     },
 };
-use codex_protocol::{ConversationId, protocol::EventMsg};
+use codex_protocol::ConversationId;
 use itertools::Itertools;
 use mcp_types::CallToolResult;
 use std::{
@@ -267,113 +261,6 @@ impl CodexAgent {
                 }
             },
         }
-    }
-
-    async fn start_web_search(
-        &self,
-        session_id: SessionId,
-        call_id: String,
-        active_web_search: &mut Option<String>,
-    ) {
-        *active_web_search = Some(call_id.clone());
-        self.send_notification(
-            session_id,
-            SessionUpdate::ToolCall(ToolCall {
-                id: ToolCallId(call_id.into()),
-                title: "Searching the Web".to_string(),
-                kind: ToolKind::Fetch,
-                status: ToolCallStatus::Pending,
-                content: vec![],
-                locations: vec![],
-                raw_input: None,
-                raw_output: None,
-                meta: None,
-            }),
-        )
-        .await;
-    }
-
-    async fn update_web_search_query(&self, session_id: SessionId, call_id: String, query: String) {
-        self.send_notification(
-            session_id,
-            SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                id: ToolCallId(call_id.into()),
-                fields: ToolCallUpdateFields {
-                    status: Some(ToolCallStatus::InProgress),
-                    title: Some(format!("Searching for: {query}")),
-                    raw_input: Some(serde_json::json!({
-                        "query": query
-                    })),
-                    ..Default::default()
-                },
-                meta: None,
-            }),
-        )
-        .await;
-    }
-
-    /// Complete an active web search by sending a completion notification
-    async fn complete_web_search(
-        &self,
-        session_id: SessionId,
-        active_web_search: &mut Option<String>,
-    ) {
-        if let Some(call_id) = active_web_search.take() {
-            self.send_notification(
-                session_id,
-                SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                    id: ToolCallId(call_id.into()),
-                    fields: ToolCallUpdateFields {
-                        status: Some(ToolCallStatus::Completed),
-                        ..Default::default()
-                    },
-                    meta: None,
-                }),
-            )
-            .await;
-        }
-    }
-
-    async fn send_agent_text(&self, session_id: SessionId, text: impl Into<String>) {
-        let update = SessionUpdate::AgentMessageChunk {
-            content: ContentBlock::Text(TextContent {
-                text: text.into(),
-                annotations: None,
-                meta: None,
-            }),
-        };
-        self.send_notification(session_id, update).await;
-    }
-
-    async fn send_agent_thought(&self, session_id: SessionId, text: impl Into<String>) {
-        let update = SessionUpdate::AgentThoughtChunk {
-            content: ContentBlock::Text(TextContent {
-                text: text.into(),
-                annotations: None,
-                meta: None,
-            }),
-        };
-        self.send_notification(session_id, update).await;
-    }
-
-    async fn update_plan(&self, session_id: SessionId, plan: Vec<PlanItemArg>) {
-        let update = SessionUpdate::Plan(Plan {
-            entries: plan
-                .into_iter()
-                .map(|entry| PlanEntry {
-                    content: entry.step,
-                    priority: PlanEntryPriority::Medium,
-                    status: match entry.status {
-                        StepStatus::Pending => PlanEntryStatus::Pending,
-                        StepStatus::InProgress => PlanEntryStatus::InProgress,
-                        StepStatus::Completed => PlanEntryStatus::Completed,
-                    },
-                    meta: None,
-                })
-                .collect(),
-            meta: None,
-        });
-        self.send_notification(session_id, update).await;
     }
 
     async fn exec_approval(
