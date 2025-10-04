@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
+    rc::Rc,
     sync::{Arc, LazyLock},
 };
 
@@ -76,7 +77,7 @@ impl ConversationHandle {
         session_id: SessionId,
         conversation: Arc<CodexConversation>,
         config: Config,
-        model_presets: Arc<Vec<ModelPreset>>,
+        model_presets: Rc<Vec<ModelPreset>>,
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
 
@@ -901,7 +902,7 @@ struct ConversationActor {
     /// The configuration for the conversation.
     config: Config,
     /// The model presets for the conversation.
-    model_presets: Arc<Vec<ModelPreset>>,
+    model_presets: Rc<Vec<ModelPreset>>,
     /// A sender for each interested `Op` submission that needs events routed.
     submissions: HashMap<String, SubmissionState>,
     /// A receiver for incoming conversation messages.
@@ -913,7 +914,7 @@ impl ConversationActor {
         session_id: SessionId,
         conversation: Arc<CodexConversation>,
         config: Config,
-        model_presets: Arc<Vec<ModelPreset>>,
+        model_presets: Rc<Vec<ModelPreset>>,
         message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
     ) -> Self {
         Self {

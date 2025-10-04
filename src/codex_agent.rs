@@ -13,7 +13,7 @@ use codex_core::{
     config_types::{McpServerConfig, McpServerTransportConfig},
 };
 use codex_protocol::ConversationId;
-use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use tracing::{debug, info};
 
 use crate::{
@@ -33,7 +33,7 @@ pub struct CodexAgent {
     /// Active sessions mapped by `SessionId`
     sessions: Rc<RefCell<HashMap<SessionId, Rc<ConversationHandle>>>>,
     /// Default model presets for a given auth mode
-    model_presets: Arc<Vec<ModelPreset>>,
+    model_presets: Rc<Vec<ModelPreset>>,
 }
 
 impl CodexAgent {
@@ -52,7 +52,7 @@ impl CodexAgent {
         }
         let auth_manager = AuthManager::shared(config.codex_home.clone());
 
-        let model_presets = Arc::new(builtin_model_presets(
+        let model_presets = Rc::new(builtin_model_presets(
             auth_manager.auth().map(|auth| auth.mode),
         ));
         let local_spawner = LocalSpawner::new();
