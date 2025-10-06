@@ -6,15 +6,14 @@ use std::{
 };
 
 use agent_client_protocol::{
-    AgentSideConnection, Annotations, AudioContent, BlobResourceContents, Client as _,
-    ContentBlock, Diff, EmbeddedResource, EmbeddedResourceResource, Error, ImageContent,
-    LoadSessionResponse, ModelId, ModelInfo, PermissionOption, PermissionOptionId,
-    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
-    SessionId, SessionMode, SessionModeId, SessionModeState, SessionModelState,
-    SessionNotification, SessionUpdate, StopReason, TerminalId, TextContent, TextResourceContents,
-    ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind,
+    Annotations, AudioContent, BlobResourceContents, Client, ContentBlock, Diff, EmbeddedResource,
+    EmbeddedResourceResource, Error, ImageContent, LoadSessionResponse, ModelId, ModelInfo,
+    PermissionOption, PermissionOptionId, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, ResourceLink, SessionId, SessionMode, SessionModeId,
+    SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason,
+    TerminalId, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use codex_common::{
     approval_presets::{ApprovalPreset, builtin_approval_presets},
@@ -103,7 +102,7 @@ impl Conversation {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
 
         let actor = ConversationActor::new(
-            session_id,
+            SessionClient::new(session_id),
             conversation.clone(),
             config,
             model_presets,
@@ -189,7 +188,7 @@ impl SubmissionState {
         }
     }
 
-    async fn handle_event(&mut self, client: &Client, event: EventMsg) {
+    async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         match self {
             SubmissionState::Prompt(submission) => submission.handle_event(client, event).await,
         }
@@ -228,7 +227,7 @@ impl PromptState {
         !response_tx.is_closed()
     }
 
-    async fn handle_event(&mut self, client: &Client, event: EventMsg) {
+    async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         self.event_count += 1;
 
         // Complete any previous web search before starting a new one
@@ -436,7 +435,7 @@ impl PromptState {
 
     async fn patch_approval(
         &self,
-        client: &Client,
+        client: &SessionClient,
         event: ApplyPatchApprovalRequestEvent,
     ) -> Result<(), Error> {
         let raw_input = serde_json::json!(&event);
@@ -504,7 +503,7 @@ impl PromptState {
         Ok(())
     }
 
-    async fn start_patch_apply(&self, client: &Client, event: PatchApplyBeginEvent) {
+    async fn start_patch_apply(&self, client: &SessionClient, event: PatchApplyBeginEvent) {
         let raw_input = serde_json::json!(&event);
         let PatchApplyBeginEvent {
             call_id,
@@ -529,7 +528,7 @@ impl PromptState {
             .await;
     }
 
-    async fn end_patch_apply(&self, client: &Client, event: PatchApplyEndEvent) {
+    async fn end_patch_apply(&self, client: &SessionClient, event: PatchApplyEndEvent) {
         let raw_output = serde_json::json!(&event);
         let PatchApplyEndEvent {
             call_id,
@@ -557,7 +556,7 @@ impl PromptState {
 
     async fn start_mcp_tool_call(
         &self,
-        client: &Client,
+        client: &SessionClient,
         call_id: String,
         invocation: McpInvocation,
     ) {
@@ -580,7 +579,7 @@ impl PromptState {
 
     async fn end_mcp_tool_call(
         &self,
-        client: &Client,
+        client: &SessionClient,
         call_id: String,
         result: Result<CallToolResult, String>,
     ) {
@@ -620,7 +619,7 @@ impl PromptState {
 
     async fn exec_approval(
         &mut self,
-        client: &Client,
+        client: &SessionClient,
         event: ExecApprovalRequestEvent,
     ) -> Result<(), Error> {
         let raw_input = serde_json::json!(&event);
@@ -701,7 +700,7 @@ impl PromptState {
         Ok(())
     }
 
-    async fn exec_command_begin(&mut self, client: &Client, event: ExecCommandBeginEvent) {
+    async fn exec_command_begin(&mut self, client: &SessionClient, event: ExecCommandBeginEvent) {
         let raw_input = serde_json::json!(&event);
         let ExecCommandBeginEvent {
             call_id,
@@ -746,7 +745,11 @@ impl PromptState {
             .await;
     }
 
-    async fn exec_command_output_delta(&self, client: &Client, event: ExecCommandOutputDeltaEvent) {
+    async fn exec_command_output_delta(
+        &self,
+        client: &SessionClient,
+        event: ExecCommandOutputDeltaEvent,
+    ) {
         let ExecCommandOutputDeltaEvent {
             call_id,
             chunk,
@@ -774,7 +777,7 @@ impl PromptState {
         }
     }
 
-    async fn exec_command_end(&mut self, client: &Client, event: ExecCommandEndEvent) {
+    async fn exec_command_end(&mut self, client: &SessionClient, event: ExecCommandEndEvent) {
         let raw_output = serde_json::json!(&event);
         let ExecCommandEndEvent {
             call_id,
@@ -814,7 +817,7 @@ impl PromptState {
         }
     }
 
-    async fn start_web_search(&mut self, client: &Client, call_id: String) {
+    async fn start_web_search(&mut self, client: &SessionClient, call_id: String) {
         self.active_web_search = Some(call_id.clone());
         client
             .send_notification(SessionUpdate::ToolCall(ToolCall {
@@ -831,7 +834,12 @@ impl PromptState {
             .await;
     }
 
-    async fn update_web_search_query(&self, client: &Client, call_id: String, query: String) {
+    async fn update_web_search_query(
+        &self,
+        client: &SessionClient,
+        call_id: String,
+        query: String,
+    ) {
         client
             .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
                 id: ToolCallId(call_id.into()),
@@ -848,7 +856,7 @@ impl PromptState {
             .await;
     }
 
-    async fn complete_web_search(&mut self, client: &Client) {
+    async fn complete_web_search(&mut self, client: &SessionClient) {
         if let Some(call_id) = self.active_web_search.take() {
             client
                 .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
@@ -864,17 +872,22 @@ impl PromptState {
     }
 }
 
-struct Client {
+struct SessionClient {
     session_id: SessionId,
+    client: Arc<dyn Client>,
 }
 
-impl Client {
+impl SessionClient {
     fn new(session_id: SessionId) -> Self {
-        Self { session_id }
+        Self {
+            session_id,
+            client: ACP_CLIENT.get().expect("Client should be set").clone(),
+        }
     }
 
-    fn client() -> &'static AgentSideConnection {
-        ACP_CLIENT.get().expect("Client should be set")
+    #[cfg(test)]
+    fn with_client(session_id: SessionId, client: Arc<dyn Client>) -> Self {
+        Self { session_id, client }
     }
 
     async fn send_notification(&self, update: SessionUpdate) {
@@ -884,7 +897,7 @@ impl Client {
             meta: None,
         };
 
-        if let Err(e) = Self::client().session_notification(notification).await {
+        if let Err(e) = self.client.session_notification(notification).await {
             error!("Failed to send session notification: {:?}", e);
         }
     }
@@ -936,7 +949,7 @@ impl Client {
         tool_call: ToolCallUpdate,
         options: Vec<PermissionOption>,
     ) -> Result<RequestPermissionResponse, Error> {
-        Self::client()
+        self.client
             .request_permission(RequestPermissionRequest {
                 session_id: self.session_id.clone(),
                 tool_call,
@@ -949,7 +962,7 @@ impl Client {
 
 struct ConversationActor {
     /// Used for sending messages back to the client.
-    client: Client,
+    client: SessionClient,
     /// The conversation associated with this task.
     conversation: Arc<dyn CodexConversationImpl>,
     /// The configuration for the conversation.
@@ -964,14 +977,14 @@ struct ConversationActor {
 
 impl ConversationActor {
     fn new(
-        session_id: SessionId,
+        client: SessionClient,
         conversation: Arc<dyn CodexConversationImpl>,
         config: Config,
         model_presets: Rc<Vec<ModelPreset>>,
         message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
     ) -> Self {
         Self {
-            client: Client::new(session_id),
+            client,
             conversation,
             config,
             model_presets,
@@ -1428,74 +1441,18 @@ mod tests {
 
     use super::*;
 
-    struct StubCodexConversation {
-        current_id: AtomicUsize,
-        op_tx: mpsc::UnboundedSender<(usize, Op)>,
-        op_rx: Mutex<mpsc::UnboundedReceiver<(usize, Op)>>,
-    }
-
-    impl StubCodexConversation {
-        fn new() -> Self {
-            let (op_tx, op_rx) = mpsc::unbounded_channel();
-            StubCodexConversation {
-                current_id: AtomicUsize::new(0),
-                op_tx,
-                op_rx: Mutex::new(op_rx),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl CodexConversationImpl for StubCodexConversation {
-        async fn submit(&self, op: Op) -> Result<String, CodexErr> {
-            dbg!("submit");
-            let id = self
-                .current_id
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.op_tx.send((id, op)).unwrap();
-            Ok(id.to_string())
-        }
-
-        async fn next_event(&self) -> Result<Event, CodexErr> {
-            dbg!("next_event");
-            let Some((id, op)) = self.op_rx.lock().await.recv().await else {
-                return Err(CodexErr::InternalAgentDied);
-            };
-            dbg!("next_event");
-            match op {
-                Op::UserInput { items } => {
-                    let prompt = items
-                        .into_iter()
-                        .map(|i| match i {
-                            InputItem::Text { text } => text,
-                            _ => unimplemented!(),
-                        })
-                        .join("\n");
-
-                    Ok(Event {
-                        id: id.to_string(),
-                        msg: EventMsg::TaskComplete(TaskCompleteEvent {
-                            last_agent_message: Some(prompt),
-                        }),
-                    })
-                }
-                _ => {
-                    unimplemented!()
-                }
-            }
-        }
-    }
-
     #[tokio::test]
     async fn test_prompt() -> anyhow::Result<()> {
         let session_id = SessionId("test".into());
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id.clone(), client.clone());
         let conversation = Arc::new(StubCodexConversation::new());
         let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default()).await?;
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         let actor = ConversationActor::new(
-            session_id.clone(),
+            session_client,
             conversation.clone(),
             config,
             Default::default(),
@@ -1507,7 +1464,7 @@ mod tests {
         message_tx.send(ConversationMessage::Prompt {
             request: PromptRequest {
                 session_id: session_id.clone(),
-                prompt: vec!["/compact".into()],
+                prompt: vec!["Hi".into()],
                 meta: None,
             },
             response_tx: prompt_response_tx,
@@ -1526,6 +1483,108 @@ mod tests {
             }
         )?;
 
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk {
+                content: ContentBlock::Text(TextContent { text, .. })
+            } if text == "Hi"
+        ));
+
         Ok(())
+    }
+
+    struct StubCodexConversation {
+        current_id: AtomicUsize,
+        op_tx: mpsc::UnboundedSender<Event>,
+        op_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
+    }
+
+    impl StubCodexConversation {
+        fn new() -> Self {
+            let (op_tx, op_rx) = mpsc::unbounded_channel();
+            StubCodexConversation {
+                current_id: AtomicUsize::new(0),
+                op_tx,
+                op_rx: Mutex::new(op_rx),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CodexConversationImpl for StubCodexConversation {
+        async fn submit(&self, op: Op) -> Result<String, CodexErr> {
+            let id = self
+                .current_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            match op {
+                Op::UserInput { items } => {
+                    let prompt = items
+                        .into_iter()
+                        .map(|i| match i {
+                            InputItem::Text { text } => text,
+                            _ => unimplemented!(),
+                        })
+                        .join("\n");
+
+                    self.op_tx
+                        .send(Event {
+                            id: id.to_string(),
+                            msg: EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+                                delta: prompt,
+                            }),
+                        })
+                        .unwrap();
+                    self.op_tx
+                        .send(Event {
+                            id: id.to_string(),
+                            msg: EventMsg::TaskComplete(TaskCompleteEvent {
+                                last_agent_message: None,
+                            }),
+                        })
+                        .unwrap();
+                }
+                _ => {
+                    unimplemented!()
+                }
+            }
+            Ok(id.to_string())
+        }
+
+        async fn next_event(&self) -> Result<Event, CodexErr> {
+            let Some(event) = self.op_rx.lock().await.recv().await else {
+                return Err(CodexErr::InternalAgentDied);
+            };
+            Ok(event)
+        }
+    }
+
+    struct StubClient {
+        notifications: std::sync::Mutex<Vec<SessionNotification>>,
+    }
+
+    impl StubClient {
+        fn new() -> Self {
+            StubClient {
+                notifications: std::sync::Mutex::default(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Client for StubClient {
+        async fn request_permission(
+            &self,
+            _args: RequestPermissionRequest,
+        ) -> Result<RequestPermissionResponse, Error> {
+            unimplemented!()
+        }
+
+        async fn session_notification(&self, args: SessionNotification) -> Result<(), Error> {
+            self.notifications.lock().unwrap().push(args);
+            Ok(())
+        }
     }
 }

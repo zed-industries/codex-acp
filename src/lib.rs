@@ -5,7 +5,7 @@ use agent_client_protocol::AgentSideConnection;
 use codex_common::CliConfigOverrides;
 use codex_core::config::{Config, ConfigOverrides};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::{io::Result as IoResult, rc::Rc};
 use tokio::task::LocalSet;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -15,7 +15,7 @@ mod codex_agent;
 mod conversation;
 mod local_spawner;
 
-pub static ACP_CLIENT: OnceLock<AgentSideConnection> = OnceLock::new();
+pub static ACP_CLIENT: OnceLock<Arc<AgentSideConnection>> = OnceLock::new();
 
 /// Run the Codex ACP agent.
 ///
@@ -63,7 +63,7 @@ pub async fn run_main(
                 tokio::task::spawn_local(fut);
             });
 
-            if ACP_CLIENT.set(client).is_err() {
+            if ACP_CLIENT.set(Arc::new(client)).is_err() {
                 return Err(std::io::Error::other("ACP client already set"));
             }
 
