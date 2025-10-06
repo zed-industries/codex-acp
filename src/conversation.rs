@@ -23,7 +23,6 @@ use codex_common::{
 use codex_core::{
     CodexConversation,
     config::Config,
-    plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
         AgentMessageDeltaEvent, AgentReasoningDeltaEvent, AgentReasoningRawContentDeltaEvent,
         AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ErrorEvent, Event,
@@ -31,10 +30,13 @@ use codex_core::{
         ExecCommandOutputDeltaEvent, FileChange, InputItem, McpInvocation, McpToolCallBeginEvent,
         McpToolCallEndEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReviewDecision,
         StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent, UserMessageEvent,
-        WebSearchBeginEvent, WebSearchEndEvent,
+        ViewImageToolCallEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
 };
-use codex_protocol::config_types::ReasoningEffort;
+use codex_protocol::{
+    config_types::ReasoningEffort,
+    plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
+};
 use itertools::Itertools;
 use mcp_types::CallToolResult;
 use tokio::sync::{mpsc, oneshot};
@@ -354,6 +356,38 @@ impl PromptState {
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
                 }
+            }
+            EventMsg::ViewImageToolCall(ViewImageToolCallEvent { call_id, path }) => {
+                info!("ViewImageToolCallEvent received");
+                let display_path = path.display().to_string();
+                client
+                    .send_notification(SessionUpdate::ToolCall(ToolCall {
+                        id: ToolCallId(call_id.into()),
+                        title: format!("View Image {display_path}"),
+                        kind: ToolKind::Read,
+                        status: ToolCallStatus::Completed,
+                        content: vec![ToolCallContent::Content {
+                            content: ContentBlock::ResourceLink(ResourceLink {
+                                annotations: None,
+                                description: None,
+                                mime_type: None,
+                                name: display_path.clone(),
+                                size: None,
+                                title: None,
+                                uri: display_path.clone(),
+                                meta: None,
+                            }),
+                        }],
+                        locations: vec![ToolCallLocation {
+                            path,
+                            line: None,
+                            meta: None,
+                        }],
+                        raw_input: None,
+                        raw_output: None,
+                        meta: None,
+                    }))
+                    .await;
             }
             // Since we are getting the deltas, we can ignore these events
             EventMsg::AgentReasoning(..)

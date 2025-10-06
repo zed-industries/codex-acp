@@ -8,12 +8,13 @@ use agent_client_protocol::{
 use codex_common::model_presets::{ModelPreset, builtin_model_presets};
 use codex_core::{
     ConversationManager, NewConversation,
-    auth::{AuthManager, CodexAuth, login_with_api_key},
+    auth::{AuthManager, CodexAuth},
     config::Config,
     config_types::{McpServerConfig, McpServerTransportConfig},
+    protocol::SessionSource,
 };
 use codex_protocol::ConversationId;
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 use tracing::{debug, info};
 
 use crate::{
@@ -26,6 +27,8 @@ use crate::{
 /// This bridges the ACP protocol with the existing codex-rs infrastructure,
 /// allowing codex to be used as an ACP agent.
 pub struct CodexAgent {
+    /// Handle to the current authentication
+    auth_manager: Arc<AuthManager>,
     /// The underlying codex configuration
     config: Config,
     /// Conversation manager for handling sessions
@@ -39,32 +42,23 @@ pub struct CodexAgent {
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
     pub fn new(config: Config) -> Self {
-        // Pre-auth from OPENAI_API_KEY before creating the AuthManager, so restored sessions
-        // have API-key auth state ready without surfacing any UI or errors.
-        if CodexAuth::from_codex_home(&config.codex_home)
-            .ok()
-            .flatten()
-            .is_none()
-            && let Ok(api_key) = std::env::var("OPENAI_API_KEY")
-            && !api_key.is_empty()
-        {
-            let _ = login_with_api_key(&config.codex_home, &api_key);
-        }
-        let auth_manager = AuthManager::shared(config.codex_home.clone());
+        let auth_manager = AuthManager::shared(config.codex_home.clone(), true);
 
         let model_presets = Rc::new(builtin_model_presets(
             auth_manager.auth().map(|auth| auth.mode),
         ));
         let local_spawner = LocalSpawner::new();
         let conversation_manager =
-            ConversationManager::new(auth_manager).with_fs(Box::new(move |conversation_id| {
-                Box::new(AcpFs::new(
-                    Self::session_id_from_conversation_id(conversation_id),
-                    local_spawner.clone(),
-                ))
-            }));
-
+            ConversationManager::new(auth_manager.clone(), SessionSource::Unknown).with_fs(
+                Box::new(move |conversation_id| {
+                    Box::new(AcpFs::new(
+                        Self::session_id_from_conversation_id(conversation_id),
+                        local_spawner.clone(),
+                    ))
+                }),
+            );
         Self {
+            auth_manager,
             config,
             conversation_manager,
             sessions: Rc::new(RefCell::new(HashMap::new())),
@@ -281,26 +275,9 @@ impl Agent for CodexAgent {
 
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {
         info!("Processing prompt for session: {}", request.session_id);
-
-        // Preflight auth: ensure credentials exist, or return AUTH_REQUIRED without calling model.
-        // If OPENAI_API_KEY is present and no auth.json exists, persist it silently.
-        match CodexAuth::from_codex_home(&self.config.codex_home) {
-            Ok(Some(_)) => {}
-            _ => {
-                if let Ok(api_key) = std::env::var("OPENAI_API_KEY")
-                    && !api_key.is_empty()
-                {
-                    let _ = login_with_api_key(&self.config.codex_home, &api_key);
-                }
-                // Recheck after potential env pre-auth; if still no creds, ask client to authenticate.
-                if CodexAuth::from_codex_home(&self.config.codex_home)
-                    .ok()
-                    .flatten()
-                    .is_none()
-                {
-                    return Err(Error::auth_required());
-                }
-            }
+        // Check before sending if authentication was successful or not
+        if self.auth_manager.auth().is_none() {
+            return Err(Error::auth_required());
         }
 
         // Get the session state

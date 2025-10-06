@@ -41,6 +41,7 @@ pub async fn run_main(
     })?;
 
     let config = Config::load_with_cli_overrides(cli_kv_overrides, ConfigOverrides::default())
+        .await
         .map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
