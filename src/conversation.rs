@@ -23,6 +23,7 @@ use codex_common::{
 use codex_core::{
     CodexConversation,
     config::Config,
+    error::CodexErr,
     protocol::{
         AgentMessageDeltaEvent, AgentReasoningDeltaEvent, AgentReasoningRawContentDeltaEvent,
         AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ErrorEvent, Event,
@@ -45,6 +46,24 @@ use tracing::{error, info};
 use crate::ACP_CLIENT;
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
+
+/// Trait for abstracting over the CodexConversation to make testing easier.
+#[async_trait::async_trait]
+pub trait CodexConversationImpl {
+    async fn submit(&self, op: Op) -> Result<String, CodexErr>;
+    async fn next_event(&self) -> Result<Event, CodexErr>;
+}
+
+#[async_trait::async_trait]
+impl CodexConversationImpl for CodexConversation {
+    async fn submit(&self, op: Op) -> Result<String, CodexErr> {
+        self.submit(op).await
+    }
+
+    async fn next_event(&self) -> Result<Event, CodexErr> {
+        self.next_event().await
+    }
+}
 
 enum ConversationMessage {
     Load {
@@ -77,7 +96,7 @@ pub struct Conversation {
 impl Conversation {
     pub fn new(
         session_id: SessionId,
-        conversation: Arc<CodexConversation>,
+        conversation: Arc<dyn CodexConversationImpl>,
         config: Config,
         model_presets: Rc<Vec<ModelPreset>>,
     ) -> Self {
@@ -180,7 +199,7 @@ impl SubmissionState {
 struct PromptState {
     active_command: Option<(String, ToolCallId)>,
     active_web_search: Option<String>,
-    conversation: Arc<CodexConversation>,
+    conversation: Arc<dyn CodexConversationImpl>,
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     submission_id: String,
@@ -188,7 +207,7 @@ struct PromptState {
 
 impl PromptState {
     fn new(
-        conversation: Arc<CodexConversation>,
+        conversation: Arc<dyn CodexConversationImpl>,
         response_tx: oneshot::Sender<Result<StopReason, Error>>,
         submission_id: String,
     ) -> Self {
@@ -932,7 +951,7 @@ struct ConversationActor {
     /// Used for sending messages back to the client.
     client: Client,
     /// The conversation associated with this task.
-    conversation: Arc<CodexConversation>,
+    conversation: Arc<dyn CodexConversationImpl>,
     /// The configuration for the conversation.
     config: Config,
     /// The model presets for the conversation.
@@ -946,7 +965,7 @@ struct ConversationActor {
 impl ConversationActor {
     fn new(
         session_id: SessionId,
-        conversation: Arc<CodexConversation>,
+        conversation: Arc<dyn CodexConversationImpl>,
         config: Config,
         model_presets: Rc<Vec<ModelPreset>>,
         message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
@@ -1398,4 +1417,115 @@ fn extract_tool_call_content_from_changes(
                 },
             }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use codex_core::config::ConfigOverrides;
+    use tokio::{sync::Mutex, task::LocalSet};
+
+    use super::*;
+
+    struct StubCodexConversation {
+        current_id: AtomicUsize,
+        op_tx: mpsc::UnboundedSender<(usize, Op)>,
+        op_rx: Mutex<mpsc::UnboundedReceiver<(usize, Op)>>,
+    }
+
+    impl StubCodexConversation {
+        fn new() -> Self {
+            let (op_tx, op_rx) = mpsc::unbounded_channel();
+            StubCodexConversation {
+                current_id: AtomicUsize::new(0),
+                op_tx,
+                op_rx: Mutex::new(op_rx),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CodexConversationImpl for StubCodexConversation {
+        async fn submit(&self, op: Op) -> Result<String, CodexErr> {
+            dbg!("submit");
+            let id = self
+                .current_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.op_tx.send((id, op)).unwrap();
+            Ok(id.to_string())
+        }
+
+        async fn next_event(&self) -> Result<Event, CodexErr> {
+            dbg!("next_event");
+            let Some((id, op)) = self.op_rx.lock().await.recv().await else {
+                return Err(CodexErr::InternalAgentDied);
+            };
+            dbg!("next_event");
+            match op {
+                Op::UserInput { items } => {
+                    let prompt = items
+                        .into_iter()
+                        .map(|i| match i {
+                            InputItem::Text { text } => text,
+                            _ => unimplemented!(),
+                        })
+                        .join("\n");
+
+                    Ok(Event {
+                        id: id.to_string(),
+                        msg: EventMsg::TaskComplete(TaskCompleteEvent {
+                            last_agent_message: Some(prompt),
+                        }),
+                    })
+                }
+                _ => {
+                    unimplemented!()
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prompt() -> anyhow::Result<()> {
+        let session_id = SessionId("test".into());
+        let conversation = Arc::new(StubCodexConversation::new());
+        let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default()).await?;
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        let actor = ConversationActor::new(
+            session_id.clone(),
+            conversation.clone(),
+            config,
+            Default::default(),
+            message_rx,
+        );
+        let local = LocalSet::new();
+        local.spawn_local(actor.spawn());
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest {
+                session_id: session_id.clone(),
+                prompt: vec!["/compact".into()],
+                meta: None,
+            },
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        Ok(())
+    }
 }
