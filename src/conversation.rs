@@ -6,14 +6,14 @@ use std::{
 };
 
 use agent_client_protocol::{
-    Annotations, AudioContent, BlobResourceContents, Client, ContentBlock, Diff, EmbeddedResource,
-    EmbeddedResourceResource, Error, ImageContent, LoadSessionResponse, ModelId, ModelInfo,
-    PermissionOption, PermissionOptionId, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResourceLink, SessionId, SessionMode, SessionModeId,
-    SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason,
-    TerminalId, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    Annotations, AudioContent, AvailableCommand, BlobResourceContents, Client, ContentBlock, Diff,
+    EmbeddedResource, EmbeddedResourceResource, Error, ImageContent, LoadSessionResponse, ModelId,
+    ModelInfo, PermissionOption, PermissionOptionId, PermissionOptionKind, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, PromptRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SessionId, SessionMode,
+    SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate,
+    StopReason, TerminalId, TextContent, TextResourceContents, ToolCall, ToolCallContent,
+    ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use codex_common::{
     approval_presets::{ApprovalPreset, builtin_approval_presets},
@@ -40,7 +40,7 @@ use codex_protocol::{
 use itertools::Itertools;
 use mcp_types::CallToolResult;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::ACP_CLIENT;
 
@@ -179,18 +179,22 @@ impl Conversation {
 
 enum SubmissionState {
     Prompt(PromptState),
+    // Subtask, like /compact
+    Task(TaskState),
 }
 
 impl SubmissionState {
     fn is_active(&self) -> bool {
         match self {
             SubmissionState::Prompt(state) => state.is_active(),
+            SubmissionState::Task(state) => state.is_active(),
         }
     }
 
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         match self {
-            SubmissionState::Prompt(submission) => submission.handle_event(client, event).await,
+            SubmissionState::Prompt(state) => state.handle_event(client, event).await,
+            SubmissionState::Task(state) => state.handle_event(client, event),
         }
     }
 }
@@ -415,8 +419,11 @@ impl PromptState {
             | EventMsg::TokenCount(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
-            // returned from Op::ListMcpTools, ignore
-            | EventMsg::McpListToolsResponse(..)
+            // Revisit when we can emit status updates
+            | EventMsg::BackgroundEvent(..) => {}
+
+            // Unexpected events for this submission
+            e @ (EventMsg::McpListToolsResponse(..)
             // returned from Op::ListCustomPrompts, ignore
             | EventMsg::ListCustomPromptsResponse(..)
             // returned from Op::GetPath, ignore
@@ -427,9 +434,9 @@ impl PromptState {
             | EventMsg::SessionConfigured(..)
             // used when requesting a code review, ignore for now
             | EventMsg::EnteredReviewMode(..)
-            | EventMsg::ExitedReviewMode(..)
-            // Revisit when we can emit status updates
-            | EventMsg::BackgroundEvent(..) => {}
+            | EventMsg::ExitedReviewMode(..)) => {
+                warn!("Unexpected event: {:?}", e);
+            }
         }
     }
 
@@ -872,6 +879,90 @@ impl PromptState {
     }
 }
 
+struct TaskState {
+    response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
+}
+
+impl TaskState {
+    fn new(response_tx: oneshot::Sender<Result<StopReason, Error>>) -> Self {
+        Self {
+            response_tx: Some(response_tx),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.response_tx.is_some()
+    }
+
+    fn handle_event(&mut self, _: &SessionClient, event: EventMsg) {
+        match event {
+            EventMsg::TaskComplete(..) => {
+                if let Some(response_tx) = self.response_tx.take() {
+                    response_tx.send(Ok(StopReason::EndTurn)).ok();
+                }
+            }
+            EventMsg::Error(ErrorEvent { message })
+            | EventMsg::StreamError(StreamErrorEvent { message }) => {
+                error!("Error during turn: {}", message);
+                if let Some(response_tx) = self.response_tx.take() {
+                    response_tx
+                        .send(Err(Error::internal_error().with_data(message)))
+                        .ok();
+                }
+            }
+            EventMsg::TurnAborted(TurnAbortedEvent { reason }) => {
+                info!("Turn aborted: {reason:?}");
+                if let Some(response_tx) = self.response_tx.take() {
+                    response_tx.send(Ok(StopReason::Cancelled)).ok();
+                }
+            }
+            EventMsg::ShutdownComplete => {
+                info!("Agent shutting down");
+                if let Some(response_tx) = self.response_tx.take() {
+                    response_tx.send(Ok(StopReason::Cancelled)).ok();
+                }
+            }
+            // Expected but ignored
+            EventMsg::TaskStarted(..)
+            | EventMsg::TokenCount(..)
+            | EventMsg::AgentMessage(..)
+            | EventMsg::AgentMessageDelta(..)
+            | EventMsg::AgentReasoningDelta(..)
+            | EventMsg::AgentReasoningRawContent(..)
+            | EventMsg::AgentReasoningRawContentDelta(..)
+            | EventMsg::AgentReasoningSectionBreak(..)
+            | EventMsg::AgentReasoning(..)
+            | EventMsg::BackgroundEvent(..) => {}
+            // Unexpected events for this submission
+            e @ (EventMsg::UserMessage(..)
+            | EventMsg::SessionConfigured(..)
+            | EventMsg::McpToolCallBegin(..)
+            | EventMsg::McpToolCallEnd(..)
+            | EventMsg::WebSearchBegin(..)
+            | EventMsg::WebSearchEnd(..)
+            | EventMsg::ExecCommandBegin(..)
+            | EventMsg::ExecCommandOutputDelta(..)
+            | EventMsg::ExecCommandEnd(..)
+            | EventMsg::ViewImageToolCall(..)
+            | EventMsg::ExecApprovalRequest(..)
+            | EventMsg::ApplyPatchApprovalRequest(..)
+            | EventMsg::PatchApplyBegin(..)
+            | EventMsg::PatchApplyEnd(..)
+            | EventMsg::TurnDiff(..)
+            | EventMsg::GetHistoryEntryResponse(..)
+            | EventMsg::McpListToolsResponse(..)
+            | EventMsg::ListCustomPromptsResponse(..)
+            | EventMsg::PlanUpdate(..)
+            | EventMsg::ConversationPath(..)
+            | EventMsg::EnteredReviewMode(..)
+            | EventMsg::ExitedReviewMode(..)) => {
+                warn!("Unexpected event: {:?}", e);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 struct SessionClient {
     session_id: SessionId,
     client: Arc<dyn Client>,
@@ -1020,6 +1111,23 @@ impl ConversationActor {
             ConversationMessage::Load { response_tx } => {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
+                let client = self.client.clone();
+                // Have this happen after the session is loaded by putting it
+                // in a separate task
+                tokio::task::spawn_local(async move {
+                    client
+                        .send_notification(SessionUpdate::AvailableCommandsUpdate {
+                            available_commands: vec![AvailableCommand {
+                                name: "compact".to_string(),
+                                description:
+                                    "summarize conversation to prevent hitting the context limit"
+                                        .into(),
+                                input: None,
+                                meta: None,
+                            }],
+                        })
+                        .await;
+                });
             }
             ConversationMessage::Prompt {
                 request,
@@ -1132,13 +1240,20 @@ impl ConversationActor {
         request: PromptRequest,
     ) -> Result<oneshot::Receiver<Result<StopReason, Error>>, Error> {
         let (response_tx, response_rx) = oneshot::channel();
+
+        // If the response_tx was returned, keep processing the prompt.
+        // Otherwise, return the response_rx because a slash command is handling the turn.
+        let Some(response_tx) = self.handle_slash_command(&request, response_tx).await? else {
+            return Ok(response_rx);
+        };
+
         let items = build_prompt_items(request.prompt);
 
         let submission_id = match self.conversation.submit(Op::UserInput { items }).await {
             Ok(submission_id) => submission_id,
             Err(e) => {
                 error!("Failed to submit prompt: {e:?}");
-                return Err(Error::internal_error());
+                return Err(Error::internal_error().with_data(e.to_string()));
             }
         };
 
@@ -1155,6 +1270,43 @@ impl ConversationActor {
         );
 
         Ok(response_rx)
+    }
+
+    /// Checks if the prompt has a slash command, and processes it.
+    /// Will return the response_tx if not already used by the slash command.
+    async fn handle_slash_command(
+        &mut self,
+        request: &PromptRequest,
+        response_tx: oneshot::Sender<Result<StopReason, Error>>,
+    ) -> Result<Option<oneshot::Sender<Result<StopReason, Error>>>, Error> {
+        if let Some((name, _rest)) = prompt_args::extract_slash_command(&request.prompt) {
+            #[expect(clippy::single_match, clippy::collapsible_match)]
+            match name {
+                "compact" => {
+                    self.handle_compact(response_tx).await?;
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Some(response_tx))
+    }
+
+    async fn handle_compact(
+        &mut self,
+        response_tx: oneshot::Sender<Result<StopReason, Error>>,
+    ) -> Result<(), Error> {
+        let submission_id = self
+            .conversation
+            .submit(Op::Compact)
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))?;
+        self.submissions.insert(
+            submission_id,
+            SubmissionState::Task(TaskState::new(response_tx)),
+        );
+        Ok(())
     }
 
     async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
@@ -1432,34 +1584,57 @@ fn extract_tool_call_content_from_changes(
     )
 }
 
+/// Mostly copied from `codex_tui::bottom_pane::prompt_args`: https://github.com/zed-industries/codex/blob/9baf30493dd9f531af1e4dc49a781654b1b2c966/codex-rs/tui/src/bottom_pane/prompt_args.rs#L1
+mod prompt_args {
+    use agent_client_protocol::{ContentBlock, TextContent};
+
+    /// Checks if a prompt is slash command
+    pub fn extract_slash_command(content: &[ContentBlock]) -> Option<(&str, &str)> {
+        let line = content.first().and_then(|block| match block {
+            ContentBlock::Text(TextContent { text, .. }) => Some(text),
+            _ => None,
+        })?;
+
+        parse_slash_name(line)
+    }
+
+    /// Parse a first-line slash command of the form `/name <rest>`.
+    /// Returns `(name, rest_after_name)` if the line begins with `/` and contains
+    /// a non-empty name; otherwise returns `None`.
+    pub fn parse_slash_name(line: &str) -> Option<(&str, &str)> {
+        let stripped = line.strip_prefix('/')?;
+        let mut name_end = stripped.len();
+        for (idx, ch) in stripped.char_indices() {
+            if ch.is_whitespace() {
+                name_end = idx;
+                break;
+            }
+        }
+        let name = &stripped[..name_end];
+        if name.is_empty() {
+            return None;
+        }
+        let rest = stripped[name_end..].trim_start();
+        Some((name, rest))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
-    use codex_core::config::ConfigOverrides;
-    use tokio::{sync::Mutex, task::LocalSet};
+    use codex_core::{config::ConfigOverrides, protocol::AgentMessageEvent};
+    use tokio::{
+        sync::{Mutex, mpsc::UnboundedSender},
+        task::LocalSet,
+    };
 
     use super::*;
 
     #[tokio::test]
     async fn test_prompt() -> anyhow::Result<()> {
-        let session_id = SessionId("test".into());
-        let client = Arc::new(StubClient::new());
-        let session_client = SessionClient::with_client(session_id.clone(), client.clone());
-        let conversation = Arc::new(StubCodexConversation::new());
-        let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default()).await?;
-        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (session_id, client, _, message_tx, local_set) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
-
-        let actor = ConversationActor::new(
-            session_client,
-            conversation.clone(),
-            config,
-            Default::default(),
-            message_rx,
-        );
-        let local = LocalSet::new();
-        local.spawn_local(actor.spawn());
 
         message_tx.send(ConversationMessage::Prompt {
             request: PromptRequest {
@@ -1478,7 +1653,7 @@ mod tests {
                 anyhow::Ok(())
             },
             async {
-                local.await;
+                local_set.await;
                 anyhow::Ok(())
             }
         )?;
@@ -1495,8 +1670,76 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_compact() -> anyhow::Result<()> {
+        let (session_id, client, conversation, message_tx, local_set) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest {
+                session_id: session_id.clone(),
+                prompt: vec!["/compact".into()],
+                meta: None,
+            },
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.is_empty(),
+            "notifications should be empty {:?}",
+            notifications
+        );
+
+        let ops = conversation.ops.lock().unwrap();
+        assert_eq!(ops.as_slice(), &[Op::Compact]);
+
+        Ok(())
+    }
+
+    async fn setup() -> anyhow::Result<(
+        SessionId,
+        Arc<StubClient>,
+        Arc<StubCodexConversation>,
+        UnboundedSender<ConversationMessage>,
+        LocalSet,
+    )> {
+        let session_id = SessionId("test".into());
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id.clone(), client.clone());
+        let conversation = Arc::new(StubCodexConversation::new());
+        let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default()).await?;
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let actor = ConversationActor::new(
+            session_client,
+            conversation.clone(),
+            config,
+            Default::default(),
+            message_rx,
+        );
+
+        let local_set = LocalSet::new();
+        local_set.spawn_local(actor.spawn());
+        Ok((session_id, client, conversation, message_tx, local_set))
+    }
+
     struct StubCodexConversation {
         current_id: AtomicUsize,
+        ops: std::sync::Mutex<Vec<Op>>,
         op_tx: mpsc::UnboundedSender<Event>,
         op_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
     }
@@ -1506,6 +1749,7 @@ mod tests {
             let (op_tx, op_rx) = mpsc::unbounded_channel();
             StubCodexConversation {
                 current_id: AtomicUsize::new(0),
+                ops: std::sync::Mutex::default(),
                 op_tx,
                 op_rx: Mutex::new(op_rx),
             }
@@ -1518,6 +1762,8 @@ mod tests {
             let id = self
                 .current_id
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            self.ops.lock().unwrap().push(op.clone());
 
             match op {
                 Op::UserInput { items } => {
@@ -1534,6 +1780,32 @@ mod tests {
                             id: id.to_string(),
                             msg: EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
                                 delta: prompt,
+                            }),
+                        })
+                        .unwrap();
+                    self.op_tx
+                        .send(Event {
+                            id: id.to_string(),
+                            msg: EventMsg::TaskComplete(TaskCompleteEvent {
+                                last_agent_message: None,
+                            }),
+                        })
+                        .unwrap();
+                }
+                Op::Compact => {
+                    self.op_tx
+                        .send(Event {
+                            id: id.to_string(),
+                            msg: EventMsg::TaskStarted(TaskStartedEvent {
+                                model_context_window: None,
+                            }),
+                        })
+                        .unwrap();
+                    self.op_tx
+                        .send(Event {
+                            id: id.to_string(),
+                            msg: EventMsg::AgentMessage(AgentMessageEvent {
+                                message: "Compact task completed".to_string(),
                             }),
                         })
                         .unwrap();
