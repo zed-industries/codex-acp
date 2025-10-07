@@ -438,7 +438,8 @@ impl PromptState {
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
             // Revisit when we can emit status updates
-            | EventMsg::BackgroundEvent(..) => {}
+            | EventMsg::BackgroundEvent(..)
+            | EventMsg::SessionConfigured(..) => {}
 
             // Unexpected events for this submission
             e @ (EventMsg::McpListToolsResponse(..)
@@ -447,9 +448,7 @@ impl PromptState {
             // returned from Op::GetPath, ignore
             | EventMsg::ConversationPath(..)
             // Used for returning a single history entry
-            | EventMsg::GetHistoryEntryResponse(..)
-            // Used for session loading and replay
-            | EventMsg::SessionConfigured(..)) => {
+            | EventMsg::GetHistoryEntryResponse(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
