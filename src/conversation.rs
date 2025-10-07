@@ -29,16 +29,17 @@ use codex_core::{
         AgentReasoningRawContentDeltaEvent, AgentReasoningSectionBreakEvent,
         ApplyPatchApprovalRequestEvent, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent,
         ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent,
-        ExitedReviewModeEvent, FileChange, InputItem, McpInvocation, McpToolCallBeginEvent,
-        McpToolCallEndEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReviewDecision,
-        ReviewOutputEvent, ReviewRequest, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent,
-        TurnAbortedEvent, UserMessageEvent, ViewImageToolCallEvent, WebSearchBeginEvent,
-        WebSearchEndEvent,
+        ExitedReviewModeEvent, FileChange, InputItem, ListCustomPromptsResponseEvent,
+        McpInvocation, McpToolCallBeginEvent, McpToolCallEndEvent, Op, PatchApplyBeginEvent,
+        PatchApplyEndEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest, StreamErrorEvent,
+        TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent, UserMessageEvent,
+        ViewImageToolCallEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
 };
 use codex_protocol::{
     config_types::ReasoningEffort,
+    custom_prompts::CustomPrompt,
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
 };
 use itertools::Itertools;
@@ -46,7 +47,10 @@ use mcp_types::CallToolResult;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
-use crate::ACP_CLIENT;
+use crate::{
+    ACP_CLIENT,
+    prompt_args::{expand_custom_prompt, parse_slash_name},
+};
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
@@ -183,23 +187,62 @@ impl Conversation {
 }
 
 enum SubmissionState {
+    /// Loading custom prompts from the project
+    CustomPrompts(CustomPromptsState),
+    /// User prompts + some slash commands like /init or /review
     Prompt(PromptState),
-    // Subtask, like /compact
+    /// Subtask, like /compact
     Task(TaskState),
 }
 
 impl SubmissionState {
     fn is_active(&self) -> bool {
         match self {
-            SubmissionState::Prompt(state) => state.is_active(),
-            SubmissionState::Task(state) => state.is_active(),
+            Self::CustomPrompts(state) => state.is_active(),
+            Self::Prompt(state) => state.is_active(),
+            Self::Task(state) => state.is_active(),
         }
     }
 
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         match self {
-            SubmissionState::Prompt(state) => state.handle_event(client, event).await,
-            SubmissionState::Task(state) => state.handle_event(client, event).await,
+            Self::CustomPrompts(state) => state.handle_event(event),
+            Self::Prompt(state) => state.handle_event(client, event).await,
+            Self::Task(state) => state.handle_event(client, event).await,
+        }
+    }
+}
+
+struct CustomPromptsState {
+    response_tx: Option<oneshot::Sender<Result<Vec<CustomPrompt>, Error>>>,
+}
+
+impl CustomPromptsState {
+    fn new(response_tx: oneshot::Sender<Result<Vec<CustomPrompt>, Error>>) -> Self {
+        Self {
+            response_tx: Some(response_tx),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        let Some(response_tx) = &self.response_tx else {
+            return false;
+        };
+        !response_tx.is_closed()
+    }
+
+    fn handle_event(&mut self, event: EventMsg) {
+        match event {
+            EventMsg::ListCustomPromptsResponse(ListCustomPromptsResponseEvent {
+                custom_prompts,
+            }) => {
+                if let Some(tx) = self.response_tx.take() {
+                    let _ = tx.send(Ok(custom_prompts));
+                }
+            }
+            e => {
+                warn!("Unexpected event: {e:?}");
+            }
         }
     }
 }
@@ -1110,6 +1153,8 @@ struct ConversationActor {
     conversation: Arc<dyn CodexConversationImpl>,
     /// The configuration for the conversation.
     config: Config,
+    /// The custom prompts loaded for this workspace.
+    custom_prompts: Vec<CustomPrompt>,
     /// The model presets for the conversation.
     model_presets: Rc<Vec<ModelPreset>>,
     /// A sender for each interested `Op` submission that needs events routed.
@@ -1130,6 +1175,7 @@ impl ConversationActor {
             client,
             conversation,
             config,
+            custom_prompts: Vec::default(),
             model_presets,
             submissions: HashMap::new(),
             message_rx,
@@ -1164,7 +1210,7 @@ impl ConversationActor {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
                 let client = self.client.clone();
-                let available_commands = self.available_commands();
+                let available_commands = self.available_commands().await;
                 // Have this happen after the session is loaded by putting it
                 // in a separate task
                 tokio::task::spawn_local(async move {
@@ -1197,8 +1243,8 @@ impl ConversationActor {
         }
     }
 
-    fn available_commands(&self) -> Vec<AvailableCommand> {
-        vec![
+    async fn available_commands(&mut self) -> Vec<AvailableCommand> {
+        let mut commands = vec![
             AvailableCommand {
                 name: "review".to_string(),
                 description: "Review my current changes and find issues".into(),
@@ -1235,7 +1281,47 @@ impl ConversationActor {
                 input: None,
                 meta: None,
             },
-        ]
+        ];
+
+        let custom_prompts = self
+            .custom_prompts()
+            .await
+            .inspect_err(|e| error!("Error getting available commands: {:?}", e))
+            .unwrap_or_default();
+
+        for prompt in &custom_prompts {
+            commands.push(AvailableCommand {
+                name: prompt.name.clone(),
+                description: prompt.description.clone().unwrap_or_default(),
+                input: prompt
+                    .argument_hint
+                    .clone()
+                    .map(|hint| AvailableCommandInput::Unstructured { hint }),
+                meta: None,
+            });
+        }
+
+        self.custom_prompts = custom_prompts;
+
+        commands
+    }
+
+    async fn custom_prompts(&mut self) -> Result<Vec<CustomPrompt>, Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+        let submission_id = self
+            .conversation
+            .submit(Op::ListCustomPrompts)
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))?;
+
+        self.submissions.insert(
+            submission_id,
+            SubmissionState::CustomPrompts(CustomPromptsState::new(response_tx)),
+        );
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
     }
 
     fn modes(&self) -> Option<SessionModeState> {
@@ -1330,7 +1416,7 @@ impl ConversationActor {
 
         let items = build_prompt_items(request.prompt);
         let op;
-        if let Some((name, rest)) = prompt_args::extract_slash_command(&items) {
+        if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
                 "compact" => op = Op::Compact,
                 "init" => {
@@ -1382,7 +1468,17 @@ impl ConversationActor {
                         },
                     }
                 }
-                _ => op = Op::UserInput { items },
+                _ => {
+                    if let Some(prompt) = expand_custom_prompt(name, rest, &self.custom_prompts)
+                        .map_err(|e| Error::invalid_params().with_data(e.user_message()))?
+                    {
+                        op = Op::UserInput {
+                            items: vec![InputItem::Text { text: prompt }],
+                        }
+                    } else {
+                        op = Op::UserInput { items }
+                    }
+                }
             }
         } else {
             op = Op::UserInput { items }
@@ -1681,39 +1777,14 @@ fn extract_tool_call_content_from_changes(
     )
 }
 
-/// Mostly copied from `codex_tui::bottom_pane::prompt_args`: https://github.com/zed-industries/codex/blob/9baf30493dd9f531af1e4dc49a781654b1b2c966/codex-rs/tui/src/bottom_pane/prompt_args.rs#L1
-mod prompt_args {
-    use codex_core::protocol::InputItem;
+/// Checks if a prompt is slash command
+fn extract_slash_command(content: &[InputItem]) -> Option<(&str, &str)> {
+    let line = content.first().and_then(|block| match block {
+        InputItem::Text { text, .. } => Some(text),
+        _ => None,
+    })?;
 
-    /// Checks if a prompt is slash command
-    pub fn extract_slash_command(content: &[InputItem]) -> Option<(&str, &str)> {
-        let line = content.first().and_then(|block| match block {
-            InputItem::Text { text, .. } => Some(text),
-            _ => None,
-        })?;
-
-        parse_slash_name(line)
-    }
-
-    /// Parse a first-line slash command of the form `/name <rest>`.
-    /// Returns `(name, rest_after_name)` if the line begins with `/` and contains
-    /// a non-empty name; otherwise returns `None`.
-    pub fn parse_slash_name(line: &str) -> Option<(&str, &str)> {
-        let stripped = line.strip_prefix('/')?;
-        let mut name_end = stripped.len();
-        for (idx, ch) in stripped.char_indices() {
-            if ch.is_whitespace() {
-                name_end = idx;
-                break;
-            }
-        }
-        let name = &stripped[..name_end];
-        if name.is_empty() {
-            return None;
-        }
-        let rest = stripped[name_end..].trim_start();
-        Some((name, rest))
-    }
+    parse_slash_name(line)
 }
 
 #[cfg(test)]
@@ -1730,7 +1801,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prompt() -> anyhow::Result<()> {
-        let (session_id, client, _, message_tx, local_set) = setup().await?;
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ConversationMessage::Prompt {
@@ -1769,7 +1840,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_compact() -> anyhow::Result<()> {
-        let (session_id, client, conversation, message_tx, local_set) = setup().await?;
+        let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ConversationMessage::Prompt {
@@ -1810,7 +1881,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_init() -> anyhow::Result<()> {
-        let (session_id, client, conversation, message_tx, local_set) = setup().await?;
+        let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ConversationMessage::Prompt {
@@ -1862,7 +1933,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_review() -> anyhow::Result<()> {
-        let (session_id, client, conversation, message_tx, local_set) = setup().await?;
+        let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ConversationMessage::Prompt {
@@ -1916,7 +1987,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_custom_review() -> anyhow::Result<()> {
-        let (session_id, client, conversation, message_tx, local_set) = setup().await?;
+        let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ConversationMessage::Prompt {
@@ -1970,7 +2041,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_review() -> anyhow::Result<()> {
-        let (session_id, client, conversation, message_tx, local_set) = setup().await?;
+        let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ConversationMessage::Prompt {
@@ -2024,7 +2095,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_branch_review() -> anyhow::Result<()> {
-        let (session_id, client, conversation, message_tx, local_set) = setup().await?;
+        let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ConversationMessage::Prompt {
@@ -2076,7 +2147,70 @@ mod tests {
         Ok(())
     }
 
-    async fn setup() -> anyhow::Result<(
+    #[tokio::test]
+    async fn test_custom_prompts() -> anyhow::Result<()> {
+        let custom_prompts = vec![CustomPrompt {
+            name: "custom".to_string(),
+            path: "/tmp/custom.md".into(),
+            content: "Custom prompt with $1 arg.".into(),
+            description: None,
+            argument_hint: None,
+        }];
+        let (session_id, client, conversation, message_tx, local_set) =
+            setup(custom_prompts).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest {
+                session_id: session_id.clone(),
+                prompt: vec!["/custom foo".into()],
+                meta: None,
+            },
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(
+            matches!(
+                &notifications[0].update,
+                SessionUpdate::AgentMessageChunk {
+                    content: ContentBlock::Text(TextContent { text, .. })
+                } if text == "Custom prompt with foo arg."
+            ),
+            "notifications don't match {notifications:?}"
+        );
+
+        let ops = conversation.ops.lock().unwrap();
+        assert_eq!(
+            ops.as_slice(),
+            &[Op::UserInput {
+                items: vec![InputItem::Text {
+                    text: "Custom prompt with foo arg.".into()
+                }]
+            }],
+            "ops don't match {ops:?}"
+        );
+
+        Ok(())
+    }
+
+    async fn setup(
+        custom_prompts: Vec<CustomPrompt>,
+    ) -> anyhow::Result<(
         SessionId,
         Arc<StubClient>,
         Arc<StubCodexConversation>,
@@ -2090,13 +2224,14 @@ mod tests {
         let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default()).await?;
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let actor = ConversationActor::new(
+        let mut actor = ConversationActor::new(
             session_client,
             conversation.clone(),
             config,
             Default::default(),
             message_rx,
         );
+        actor.custom_prompts = custom_prompts;
 
         let local_set = LocalSet::new();
         local_set.spawn_local(actor.spawn());
