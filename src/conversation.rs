@@ -1204,7 +1204,7 @@ impl ConversationActor {
                 name: "review".to_string(),
                 description: "Review my current changes and find issues".into(),
                 input: Some(AvailableCommandInput::Unstructured {
-                    hint: "custom review instructions".into(),
+                    hint: "optional custom review instructions".into(),
                 }),
                 meta: None,
             },
@@ -1341,12 +1341,21 @@ impl ConversationActor {
                         }],
                     }
                 }
-                "review" if !rest.is_empty() => {
-                    let trimmed = rest.trim().to_string();
+                "review" => {
+                    let (prompt, user_facing_hint) = if rest.is_empty() {
+                        (
+                            "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.",
+                            "current changes",
+                        )
+                    } else {
+                        let trimmed = rest.trim();
+                        (trimmed, trimmed)
+                    };
+
                     op = Op::Review {
                         review_request: ReviewRequest {
-                            prompt: trimmed.clone(),
-                            user_facing_hint: trimmed,
+                            prompt: prompt.to_string(),
+                            user_facing_hint: user_facing_hint.to_string(),
                         },
                     }
                 }
@@ -1845,6 +1854,60 @@ mod tests {
                 items: vec![InputItem::Text {
                     text: INIT_COMMAND_PROMPT.to_string()
                 }]
+            }],
+            "ops don't match {ops:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_review() -> anyhow::Result<()> {
+        let (session_id, client, conversation, message_tx, local_set) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest {
+                session_id: session_id.clone(),
+                prompt: vec!["/review".into()],
+                meta: None,
+            },
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(
+            matches!(
+                &notifications[0].update,
+                SessionUpdate::AgentMessageChunk {
+                    content: ContentBlock::Text(TextContent { text, .. })
+                } if text == "current changes" // we echo the prompt
+            ),
+            "notifications don't match {notifications:?}"
+        );
+
+        let ops = conversation.ops.lock().unwrap();
+        assert_eq!(
+            ops.as_slice(),
+            &[Op::Review {
+                review_request: ReviewRequest {
+                    prompt: "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.".into(),
+                    user_facing_hint: "current changes".into()
+                }
             }],
             "ops don't match {ops:?}"
         );
