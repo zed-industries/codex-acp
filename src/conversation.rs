@@ -46,6 +46,7 @@ use tracing::{error, info, warn};
 use crate::ACP_CLIENT;
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
+const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 
 /// Trait for abstracting over the CodexConversation to make testing easier.
 #[async_trait::async_trait]
@@ -1119,19 +1120,13 @@ impl ConversationActor {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
                 let client = self.client.clone();
+                let available_commands = self.available_commands();
                 // Have this happen after the session is loaded by putting it
                 // in a separate task
                 tokio::task::spawn_local(async move {
                     client
                         .send_notification(SessionUpdate::AvailableCommandsUpdate {
-                            available_commands: vec![AvailableCommand {
-                                name: "compact".to_string(),
-                                description:
-                                    "summarize conversation to prevent hitting the context limit"
-                                        .into(),
-                                input: None,
-                                meta: None,
-                            }],
+                            available_commands,
                         })
                         .await;
                 });
@@ -1156,6 +1151,23 @@ impl ConversationActor {
                 drop(response_tx.send(result));
             }
         }
+    }
+
+    fn available_commands(&self) -> Vec<AvailableCommand> {
+        vec![
+            AvailableCommand {
+                name: "init".to_string(),
+                description: "create an AGENTS.md file with instructions for Codex".into(),
+                input: None,
+                meta: None,
+            },
+            AvailableCommand {
+                name: "compact".to_string(),
+                description: "summarize conversation to prevent hitting the context limit".into(),
+                input: None,
+                meta: None,
+            },
+        ]
     }
 
     fn modes(&self) -> Option<SessionModeState> {
@@ -1248,13 +1260,21 @@ impl ConversationActor {
     ) -> Result<oneshot::Receiver<Result<StopReason, Error>>, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        // If the response_tx was returned, keep processing the prompt.
-        // Otherwise, return the response_rx because a slash command is handling the turn.
-        let Some(response_tx) = self.handle_slash_command(&request, response_tx).await? else {
-            return Ok(response_rx);
-        };
+        let mut prompt = request.prompt;
+        if let Some((name, _rest)) = prompt_args::extract_slash_command(&prompt) {
+            match name {
+                "compact" => {
+                    self.handle_compact(response_tx).await?;
+                    return Ok(response_rx);
+                }
+                "init" => {
+                    prompt = vec![INIT_COMMAND_PROMPT.into()];
+                }
+                _ => {}
+            }
+        }
 
-        let items = build_prompt_items(request.prompt);
+        let items = build_prompt_items(prompt);
 
         let submission_id = match self.conversation.submit(Op::UserInput { items }).await {
             Ok(submission_id) => submission_id,
@@ -1277,27 +1297,6 @@ impl ConversationActor {
         );
 
         Ok(response_rx)
-    }
-
-    /// Checks if the prompt has a slash command, and processes it.
-    /// Will return the response_tx if not already used by the slash command.
-    async fn handle_slash_command(
-        &mut self,
-        request: &PromptRequest,
-        response_tx: oneshot::Sender<Result<StopReason, Error>>,
-    ) -> Result<Option<oneshot::Sender<Result<StopReason, Error>>>, Error> {
-        if let Some((name, _rest)) = prompt_args::extract_slash_command(&request.prompt) {
-            #[expect(clippy::single_match, clippy::collapsible_match)]
-            match name {
-                "compact" => {
-                    self.handle_compact(response_tx).await?;
-                    return Ok(None);
-                }
-                _ => {}
-            }
-        }
-
-        Ok(Some(response_tx))
     }
 
     async fn handle_compact(
@@ -1714,6 +1713,58 @@ mod tests {
         ));
         let ops = conversation.ops.lock().unwrap();
         assert_eq!(ops.as_slice(), &[Op::Compact]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_init() -> anyhow::Result<()> {
+        let (session_id, client, conversation, message_tx, local_set) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest {
+                session_id: session_id.clone(),
+                prompt: vec!["/init".into()],
+                meta: None,
+            },
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(
+            matches!(
+                &notifications[0].update,
+                SessionUpdate::AgentMessageChunk {
+                    content: ContentBlock::Text(TextContent { text, .. })
+                } if text == INIT_COMMAND_PROMPT // we echo the prompt
+            ),
+            "notifications don't match {notifications:?}"
+        );
+        let ops = conversation.ops.lock().unwrap();
+        assert_eq!(
+            ops.as_slice(),
+            &[Op::UserInput {
+                items: vec![InputItem::Text {
+                    text: INIT_COMMAND_PROMPT.to_string()
+                }]
+            }],
+            "ops don't match {ops:?}"
+        );
 
         Ok(())
     }
