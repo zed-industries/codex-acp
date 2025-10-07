@@ -24,12 +24,13 @@ use codex_core::{
     config::Config,
     error::CodexErr,
     protocol::{
-        AgentMessageDeltaEvent, AgentReasoningDeltaEvent, AgentReasoningRawContentDeltaEvent,
-        AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ErrorEvent, Event,
-        EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent,
-        ExecCommandOutputDeltaEvent, FileChange, InputItem, McpInvocation, McpToolCallBeginEvent,
-        McpToolCallEndEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReviewDecision,
-        StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent, UserMessageEvent,
+        AgentMessageDeltaEvent, AgentMessageEvent, AgentReasoningDeltaEvent, AgentReasoningEvent,
+        AgentReasoningRawContentDeltaEvent, AgentReasoningSectionBreakEvent,
+        ApplyPatchApprovalRequestEvent, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent,
+        ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, FileChange,
+        InputItem, McpInvocation, McpToolCallBeginEvent, McpToolCallEndEvent, Op,
+        PatchApplyBeginEvent, PatchApplyEndEvent, ReviewDecision, StreamErrorEvent,
+        TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent, UserMessageEvent,
         ViewImageToolCallEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
 };
@@ -194,7 +195,7 @@ impl SubmissionState {
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         match self {
             SubmissionState::Prompt(state) => state.handle_event(client, event).await,
-            SubmissionState::Task(state) => state.handle_event(client, event),
+            SubmissionState::Task(state) => state.handle_event(client, event).await,
         }
     }
 }
@@ -894,12 +895,20 @@ impl TaskState {
         self.response_tx.is_some()
     }
 
-    fn handle_event(&mut self, _: &SessionClient, event: EventMsg) {
+    async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         match event {
             EventMsg::TaskComplete(..) => {
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
+            }
+            // Safer to grab the non-streaming version of the events so we don't duplicate
+            // and it is likely these are synthetic events, not from the model
+            EventMsg::AgentMessage(AgentMessageEvent { message }) => {
+                client.send_agent_text(message).await;
+            }
+            EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
+                client.send_agent_thought(text).await;
             }
             EventMsg::Error(ErrorEvent { message })
             | EventMsg::StreamError(StreamErrorEvent { message }) => {
@@ -925,13 +934,11 @@ impl TaskState {
             // Expected but ignored
             EventMsg::TaskStarted(..)
             | EventMsg::TokenCount(..)
-            | EventMsg::AgentMessage(..)
             | EventMsg::AgentMessageDelta(..)
             | EventMsg::AgentReasoningDelta(..)
             | EventMsg::AgentReasoningRawContent(..)
             | EventMsg::AgentReasoningRawContentDelta(..)
             | EventMsg::AgentReasoningSectionBreak(..)
-            | EventMsg::AgentReasoning(..)
             | EventMsg::BackgroundEvent(..) => {}
             // Unexpected events for this submission
             e @ (EventMsg::UserMessage(..)
