@@ -1202,9 +1202,17 @@ impl ConversationActor {
         vec![
             AvailableCommand {
                 name: "review".to_string(),
-                description: "review my current changes and find issues".into(),
+                description: "Review my current changes and find issues".into(),
                 input: Some(AvailableCommandInput::Unstructured {
                     hint: "custom review instructions".into(),
+                }),
+                meta: None,
+            },
+            AvailableCommand {
+                name: "review-commit".to_string(),
+                description: "Review the code changes introduced by a commit".into(),
+                input: Some(AvailableCommandInput::Unstructured {
+                    hint: "commit sha".into(),
                 }),
                 meta: None,
             },
@@ -1331,6 +1339,18 @@ impl ConversationActor {
                         review_request: ReviewRequest {
                             prompt: trimmed.clone(),
                             user_facing_hint: trimmed,
+                        },
+                    }
+                }
+                "review-commit" if !rest.is_empty() => {
+                    let sha = rest.trim();
+                    // https://github.com/zed-industries/codex/blob/9baf30493dd9f531af1e4dc49a781654b1b2c966/codex-rs/tui/src/chatwidget.rs#L2033-L2042
+                    op = Op::Review {
+                        review_request: ReviewRequest {
+                            prompt: format!(
+                                "Review the code changes introduced by commit {sha}. Provide prioritized, actionable findings."
+                            ),
+                            user_facing_hint: format!("commit {sha}"),
                         },
                     }
                 }
@@ -1858,6 +1878,60 @@ mod tests {
                 review_request: ReviewRequest {
                     prompt: "Review what we did in agents.md".into(),
                     user_facing_hint: "Review what we did in agents.md".into()
+                }
+            }],
+            "ops don't match {ops:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_commit_review() -> anyhow::Result<()> {
+        let (session_id, client, conversation, message_tx, local_set) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest {
+                session_id: session_id.clone(),
+                prompt: vec!["/review-commit 123456".into()],
+                meta: None,
+            },
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(
+            matches!(
+                &notifications[0].update,
+                SessionUpdate::AgentMessageChunk {
+                    content: ContentBlock::Text(TextContent { text, .. })
+                } if text == "commit 123456" // we echo the prompt
+            ),
+            "notifications don't match {notifications:?}"
+        );
+
+        let ops = conversation.ops.lock().unwrap();
+        assert_eq!(
+            ops.as_slice(),
+            &[Op::Review {
+                review_request: ReviewRequest {
+                    prompt: "Review the code changes introduced by commit 123456. Provide prioritized, actionable findings.".into(),
+                    user_facing_hint: "commit 123456".into()
                 }
             }],
             "ops don't match {ops:?}"
