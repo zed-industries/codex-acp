@@ -1,5 +1,7 @@
 use std::{
+    cell::RefCell,
     collections::HashMap,
+    ops::DerefMut,
     path::PathBuf,
     rc::Rc,
     sync::{Arc, LazyLock},
@@ -1154,7 +1156,7 @@ struct ConversationActor {
     /// The configuration for the conversation.
     config: Config,
     /// The custom prompts loaded for this workspace.
-    custom_prompts: Vec<CustomPrompt>,
+    custom_prompts: Rc<RefCell<Vec<CustomPrompt>>>,
     /// The model presets for the conversation.
     model_presets: Rc<Vec<ModelPreset>>,
     /// A sender for each interested `Op` submission that needs events routed.
@@ -1175,7 +1177,7 @@ impl ConversationActor {
             client,
             conversation,
             config,
-            custom_prompts: Vec::default(),
+            custom_prompts: Rc::default(),
             model_presets,
             submissions: HashMap::new(),
             message_rx,
@@ -1210,10 +1212,36 @@ impl ConversationActor {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
                 let client = self.client.clone();
-                let available_commands = self.available_commands().await;
+                let mut available_commands = self.builtin_commands();
+                let load_custom_prompts = self.load_custom_prompts().await;
+                let custom_prompts = self.custom_prompts.clone();
+
                 // Have this happen after the session is loaded by putting it
                 // in a separate task
                 tokio::task::spawn_local(async move {
+                    let mut new_custom_prompts = load_custom_prompts
+                        .await
+                        .map_err(|_| Error::internal_error())
+                        .flatten()
+                        .inspect_err(|e| error!("Failed to load custom prompts {e:?}"))
+                        .unwrap_or_default();
+
+                    for prompt in &new_custom_prompts {
+                        available_commands.push(AvailableCommand {
+                            name: prompt.name.clone(),
+                            description: prompt.description.clone().unwrap_or_default(),
+                            input: prompt
+                                .argument_hint
+                                .clone()
+                                .map(|hint| AvailableCommandInput::Unstructured { hint }),
+                            meta: None,
+                        });
+                    }
+                    std::mem::swap(
+                        custom_prompts.borrow_mut().deref_mut(),
+                        &mut new_custom_prompts,
+                    );
+
                     client
                         .send_notification(SessionUpdate::AvailableCommandsUpdate {
                             available_commands,
@@ -1243,8 +1271,8 @@ impl ConversationActor {
         }
     }
 
-    async fn available_commands(&mut self) -> Vec<AvailableCommand> {
-        let mut commands = vec![
+    fn builtin_commands(&mut self) -> Vec<AvailableCommand> {
+        vec![
             AvailableCommand {
                 name: "review".to_string(),
                 description: "Review my current changes and find issues".into(),
@@ -1281,38 +1309,18 @@ impl ConversationActor {
                 input: None,
                 meta: None,
             },
-        ];
-
-        let custom_prompts = self
-            .custom_prompts()
-            .await
-            .inspect_err(|e| error!("Error getting available commands: {:?}", e))
-            .unwrap_or_default();
-
-        for prompt in &custom_prompts {
-            commands.push(AvailableCommand {
-                name: prompt.name.clone(),
-                description: prompt.description.clone().unwrap_or_default(),
-                input: prompt
-                    .argument_hint
-                    .clone()
-                    .map(|hint| AvailableCommandInput::Unstructured { hint }),
-                meta: None,
-            });
-        }
-
-        self.custom_prompts = custom_prompts;
-
-        commands
+        ]
     }
 
-    async fn custom_prompts(&mut self) -> Result<Vec<CustomPrompt>, Error> {
+    async fn load_custom_prompts(&mut self) -> oneshot::Receiver<Result<Vec<CustomPrompt>, Error>> {
         let (response_tx, response_rx) = oneshot::channel();
-        let submission_id = self
-            .conversation
-            .submit(Op::ListCustomPrompts)
-            .await
-            .map_err(|e| Error::internal_error().with_data(e.to_string()))?;
+        let submission_id = match self.conversation.submit(Op::ListCustomPrompts).await {
+            Ok(id) => id,
+            Err(e) => {
+                drop(response_tx.send(Err(Error::internal_error().with_data(e.to_string()))));
+                return response_rx;
+            }
+        };
 
         self.submissions.insert(
             submission_id,
@@ -1320,8 +1328,6 @@ impl ConversationActor {
         );
 
         response_rx
-            .await
-            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
     }
 
     fn modes(&self) -> Option<SessionModeState> {
@@ -1469,8 +1475,9 @@ impl ConversationActor {
                     }
                 }
                 _ => {
-                    if let Some(prompt) = expand_custom_prompt(name, rest, &self.custom_prompts)
-                        .map_err(|e| Error::invalid_params().with_data(e.user_message()))?
+                    if let Some(prompt) =
+                        expand_custom_prompt(name, rest, self.custom_prompts.borrow().as_ref())
+                            .map_err(|e| Error::invalid_params().with_data(e.user_message()))?
                     {
                         op = Op::UserInput {
                             items: vec![InputItem::Text { text: prompt }],
@@ -2231,7 +2238,7 @@ mod tests {
             Default::default(),
             message_rx,
         );
-        actor.custom_prompts = custom_prompts;
+        actor.custom_prompts = Rc::new(RefCell::new(custom_prompts));
 
         let local_set = LocalSet::new();
         local_set.spawn_local(actor.spawn());
