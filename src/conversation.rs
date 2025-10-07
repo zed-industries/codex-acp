@@ -1705,12 +1705,13 @@ mod tests {
         )?;
 
         let notifications = client.notifications.lock().unwrap();
-        assert!(
-            notifications.is_empty(),
-            "notifications should be empty {:?}",
-            notifications
-        );
-
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk {
+                content: ContentBlock::Text(TextContent { text, .. })
+            } if text == "Compact task completed"
+        ));
         let ops = conversation.ops.lock().unwrap();
         assert_eq!(ops.as_slice(), &[Op::Compact]);
 
