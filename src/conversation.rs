@@ -6,14 +6,15 @@ use std::{
 };
 
 use agent_client_protocol::{
-    Annotations, AudioContent, AvailableCommand, BlobResourceContents, Client, ContentBlock, Diff,
-    EmbeddedResource, EmbeddedResourceResource, Error, ImageContent, LoadSessionResponse, ModelId,
-    ModelInfo, PermissionOption, PermissionOptionId, PermissionOptionKind, Plan, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, PromptRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SessionId, SessionMode,
-    SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate,
-    StopReason, TerminalId, TextContent, TextResourceContents, ToolCall, ToolCallContent,
-    ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    Annotations, AudioContent, AvailableCommand, AvailableCommandInput, BlobResourceContents,
+    Client, ContentBlock, Diff, EmbeddedResource, EmbeddedResourceResource, Error, ImageContent,
+    LoadSessionResponse, ModelId, ModelInfo, PermissionOption, PermissionOptionId,
+    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
+    SessionId, SessionMode, SessionModeId, SessionModeState, SessionModelState,
+    SessionNotification, SessionUpdate, StopReason, TerminalId, TextContent, TextResourceContents,
+    ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind,
 };
 use codex_common::{
     approval_presets::{ApprovalPreset, builtin_approval_presets},
@@ -27,12 +28,14 @@ use codex_core::{
         AgentMessageDeltaEvent, AgentMessageEvent, AgentReasoningDeltaEvent, AgentReasoningEvent,
         AgentReasoningRawContentDeltaEvent, AgentReasoningSectionBreakEvent,
         ApplyPatchApprovalRequestEvent, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent,
-        ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, FileChange,
-        InputItem, McpInvocation, McpToolCallBeginEvent, McpToolCallEndEvent, Op,
-        PatchApplyBeginEvent, PatchApplyEndEvent, ReviewDecision, StreamErrorEvent,
-        TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent, UserMessageEvent,
-        ViewImageToolCallEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent,
+        ExitedReviewModeEvent, FileChange, InputItem, McpInvocation, McpToolCallBeginEvent,
+        McpToolCallEndEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReviewDecision,
+        ReviewOutputEvent, ReviewRequest, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent,
+        TurnAbortedEvent, UserMessageEvent, ViewImageToolCallEvent, WebSearchBeginEvent,
+        WebSearchEndEvent,
     },
+    review_format::format_review_findings_block,
 };
 use codex_protocol::{
     config_types::ReasoningEffort,
@@ -251,10 +254,13 @@ impl PromptState {
             | EventMsg::ApplyPatchApprovalRequest(..)
             | EventMsg::PatchApplyBegin(..)
             | EventMsg::PatchApplyEnd(..)
+            | EventMsg::TaskStarted(..)
             | EventMsg::TaskComplete(..)
             | EventMsg::TokenCount(..)
             | EventMsg::TurnDiff(..)
             | EventMsg::TurnAborted(..)
+            | EventMsg::EnteredReviewMode(..)
+            | EventMsg::ExitedReviewMode(..)
             | EventMsg::ShutdownComplete => {
                 self.complete_web_search(client).await;
             }
@@ -413,6 +419,16 @@ impl PromptState {
                     }))
                     .await;
             }
+            EventMsg::EnteredReviewMode(review_request) => {
+                info!("Review begin: request={review_request:?}");
+            }
+            EventMsg::ExitedReviewMode(event) => {
+                info!("Review end: output={event:?}");
+                if let Err(err) = self.review_mode_exit(client, event).await && let Some(response_tx) = self.response_tx.take() {
+                    drop(response_tx.send(Err(err)));
+                }
+            }
+
             // Since we are getting the deltas, we can ignore these events
             EventMsg::AgentReasoning(..)
             | EventMsg::AgentReasoningRawContent(..)
@@ -433,13 +449,42 @@ impl PromptState {
             // Used for returning a single history entry
             | EventMsg::GetHistoryEntryResponse(..)
             // Used for session loading and replay
-            | EventMsg::SessionConfigured(..)
-            // used when requesting a code review, ignore for now
-            | EventMsg::EnteredReviewMode(..)
-            | EventMsg::ExitedReviewMode(..)) => {
+            | EventMsg::SessionConfigured(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
+    }
+
+    async fn review_mode_exit(
+        &self,
+        client: &SessionClient,
+        event: ExitedReviewModeEvent,
+    ) -> Result<(), Error> {
+        let ExitedReviewModeEvent { review_output } = event;
+        let Some(ReviewOutputEvent {
+            findings,
+            overall_correctness: _,
+            overall_explanation,
+            overall_confidence_score: _,
+        }) = review_output
+        else {
+            return Ok(());
+        };
+
+        let text = if findings.is_empty() {
+            let explanation = overall_explanation.trim();
+            if explanation.is_empty() {
+                "Reviewer failed to output a response"
+            } else {
+                explanation
+            }
+            .to_string()
+        } else {
+            format_review_findings_block(&findings, None)
+        };
+
+        client.send_agent_text(&text).await;
+        Ok(())
     }
 
     async fn patch_approval(
@@ -1156,6 +1201,14 @@ impl ConversationActor {
     fn available_commands(&self) -> Vec<AvailableCommand> {
         vec![
             AvailableCommand {
+                name: "review".to_string(),
+                description: "review my current changes and find issues".into(),
+                input: Some(AvailableCommandInput::Unstructured {
+                    hint: "custom review instructions".into(),
+                }),
+                meta: None,
+            },
+            AvailableCommand {
                 name: "init".to_string(),
                 description: "create an AGENTS.md file with instructions for Codex".into(),
                 input: None,
@@ -1260,59 +1313,54 @@ impl ConversationActor {
     ) -> Result<oneshot::Receiver<Result<StopReason, Error>>, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let mut prompt = request.prompt;
-        if let Some((name, _rest)) = prompt_args::extract_slash_command(&prompt) {
+        let items = build_prompt_items(request.prompt);
+        let op;
+        if let Some((name, rest)) = prompt_args::extract_slash_command(&items) {
             match name {
-                "compact" => {
-                    self.handle_compact(response_tx).await?;
-                    return Ok(response_rx);
-                }
+                "compact" => op = Op::Compact,
                 "init" => {
-                    prompt = vec![INIT_COMMAND_PROMPT.into()];
+                    op = Op::UserInput {
+                        items: vec![InputItem::Text {
+                            text: INIT_COMMAND_PROMPT.into(),
+                        }],
+                    }
                 }
-                _ => {}
+                "review" if !rest.is_empty() => {
+                    let trimmed = rest.trim().to_string();
+                    op = Op::Review {
+                        review_request: ReviewRequest {
+                            prompt: trimmed.clone(),
+                            user_facing_hint: trimmed,
+                        },
+                    }
+                }
+                _ => op = Op::UserInput { items },
             }
+        } else {
+            op = Op::UserInput { items }
         }
 
-        let items = build_prompt_items(prompt);
-
-        let submission_id = match self.conversation.submit(Op::UserInput { items }).await {
-            Ok(submission_id) => submission_id,
-            Err(e) => {
-                error!("Failed to submit prompt: {e:?}");
-                return Err(Error::internal_error().with_data(e.to_string()));
-            }
-        };
+        let submission_id = self
+            .conversation
+            .submit(op.clone())
+            .await
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))?;
 
         info!("Submitted prompt with submission_id: {submission_id}");
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
 
-        self.submissions.insert(
-            submission_id.clone(),
-            SubmissionState::Prompt(PromptState::new(
+        let state = match op {
+            Op::Compact => SubmissionState::Task(TaskState::new(response_tx)),
+            _ => SubmissionState::Prompt(PromptState::new(
                 self.conversation.clone(),
                 response_tx,
-                submission_id,
+                submission_id.clone(),
             )),
-        );
+        };
+
+        self.submissions.insert(submission_id, state);
 
         Ok(response_rx)
-    }
-
-    async fn handle_compact(
-        &mut self,
-        response_tx: oneshot::Sender<Result<StopReason, Error>>,
-    ) -> Result<(), Error> {
-        let submission_id = self
-            .conversation
-            .submit(Op::Compact)
-            .await
-            .map_err(|e| Error::internal_error().with_data(e.to_string()))?;
-        self.submissions.insert(
-            submission_id,
-            SubmissionState::Task(TaskState::new(response_tx)),
-        );
-        Ok(())
     }
 
     async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
@@ -1386,21 +1434,16 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<InputItem> {
         .into_iter()
         .filter_map(|block| match block {
             ContentBlock::Text(text_block) => Some(InputItem::Text {
-                text: text_block.text.clone(),
+                text: text_block.text,
             }),
             ContentBlock::Image(image_block) => {
                 // Convert to data URI if needed
-                if let Some(uri) = &image_block.uri {
-                    Some(InputItem::Image {
-                        image_url: uri.clone(),
-                    })
+                if let Some(uri) = image_block.uri {
+                    Some(InputItem::Image { image_url: uri })
                 } else {
                     // Base64 data
-                    let data_uri = format!(
-                        "data:{};base64,{}",
-                        image_block.mime_type.clone(),
-                        image_block.data.clone()
-                    );
+                    let data_uri =
+                        format!("data:{};base64,{}", image_block.mime_type, image_block.data);
                     Some(InputItem::Image {
                         image_url: data_uri,
                     })
@@ -1592,12 +1635,12 @@ fn extract_tool_call_content_from_changes(
 
 /// Mostly copied from `codex_tui::bottom_pane::prompt_args`: https://github.com/zed-industries/codex/blob/9baf30493dd9f531af1e4dc49a781654b1b2c966/codex-rs/tui/src/bottom_pane/prompt_args.rs#L1
 mod prompt_args {
-    use agent_client_protocol::{ContentBlock, TextContent};
+    use codex_core::protocol::InputItem;
 
     /// Checks if a prompt is slash command
-    pub fn extract_slash_command(content: &[ContentBlock]) -> Option<(&str, &str)> {
+    pub fn extract_slash_command(content: &[InputItem]) -> Option<(&str, &str)> {
         let line = content.first().and_then(|block| match block {
-            ContentBlock::Text(TextContent { text, .. }) => Some(text),
+            InputItem::Text { text, .. } => Some(text),
             _ => None,
         })?;
 
@@ -1769,6 +1812,60 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_custom_review() -> anyhow::Result<()> {
+        let (session_id, client, conversation, message_tx, local_set) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest {
+                session_id: session_id.clone(),
+                prompt: vec!["/review Review what we did in agents.md".into()],
+                meta: None,
+            },
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(
+            matches!(
+                &notifications[0].update,
+                SessionUpdate::AgentMessageChunk {
+                    content: ContentBlock::Text(TextContent { text, .. })
+                } if text == "Review what we did in agents.md" // we echo the prompt
+            ),
+            "notifications don't match {notifications:?}"
+        );
+
+        let ops = conversation.ops.lock().unwrap();
+        assert_eq!(
+            ops.as_slice(),
+            &[Op::Review {
+                review_request: ReviewRequest {
+                    prompt: "Review what we did in agents.md".into(),
+                    user_facing_hint: "Review what we did in agents.md".into()
+                }
+            }],
+            "ops don't match {ops:?}"
+        );
+
+        Ok(())
+    }
+
     async fn setup() -> anyhow::Result<(
         SessionId,
         Arc<StubClient>,
@@ -1865,6 +1962,35 @@ mod tests {
                             id: id.to_string(),
                             msg: EventMsg::AgentMessage(AgentMessageEvent {
                                 message: "Compact task completed".to_string(),
+                            }),
+                        })
+                        .unwrap();
+                    self.op_tx
+                        .send(Event {
+                            id: id.to_string(),
+                            msg: EventMsg::TaskComplete(TaskCompleteEvent {
+                                last_agent_message: None,
+                            }),
+                        })
+                        .unwrap();
+                }
+                Op::Review { review_request } => {
+                    self.op_tx
+                        .send(Event {
+                            id: id.to_string(),
+                            msg: EventMsg::EnteredReviewMode(review_request.clone()),
+                        })
+                        .unwrap();
+                    self.op_tx
+                        .send(Event {
+                            id: id.to_string(),
+                            msg: EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+                                review_output: Some(ReviewOutputEvent {
+                                    findings: vec![],
+                                    overall_correctness: String::new(),
+                                    overall_explanation: review_request.user_facing_hint.clone(),
+                                    overall_confidence_score: 1.,
+                                }),
                             }),
                         })
                         .unwrap();
