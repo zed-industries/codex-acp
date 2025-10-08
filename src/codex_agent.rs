@@ -174,21 +174,17 @@ impl Agent for CodexAgent {
             match mcp_server {
                 // Not supported in codex
                 McpServer::Sse { .. } => {}
-                McpServer::Http { name, url, headers } => {
+                McpServer::Http {
+                    name,
+                    url,
+                    headers: _,
+                } => {
                     config.mcp_servers.insert(
                         name,
                         McpServerConfig {
                             transport: McpServerTransportConfig::StreamableHttp {
                                 url,
-                                bearer_token: headers
-                                    .into_iter()
-                                    .find(|header| header.name == "Authorization")
-                                    .and_then(|header| {
-                                        header
-                                            .value
-                                            .strip_prefix("Bearer ")
-                                            .map(std::borrow::ToOwned::to_owned)
-                                    }),
+                                bearer_token_env_var: None,
                             },
                             startup_timeout_sec: None,
                             tool_timeout_sec: None,
