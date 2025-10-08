@@ -51,7 +51,7 @@ impl CodexAgent {
         let conversation_manager =
             ConversationManager::new(auth_manager.clone(), SessionSource::Unknown).with_fs(
                 Box::new(move |conversation_id| {
-                    Box::new(AcpFs::new(
+                    Arc::new(AcpFs::new(
                         Self::session_id_from_conversation_id(conversation_id),
                         local_spawner.clone(),
                     ))

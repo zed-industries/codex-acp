@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{io::Cursor, path::PathBuf};
 
 use agent_client_protocol::{
     AgentSideConnection, Client, ReadTextFileRequest, SessionId, WriteTextFileRequest,
@@ -13,6 +13,12 @@ pub enum FsTask {
         session_id: SessionId,
         path: PathBuf,
         tx: std::sync::mpsc::Sender<std::io::Result<String>>,
+    },
+    ReadFileLimit {
+        session_id: SessionId,
+        path: PathBuf,
+        limit: usize,
+        tx: tokio::sync::oneshot::Sender<std::io::Result<String>>,
     },
     WriteFile {
         session_id: SessionId,
@@ -35,6 +41,25 @@ impl FsTask {
                     path,
                     line: None,
                     limit: None,
+                    meta: None,
+                });
+                let response = read_text_file
+                    .await
+                    .map(|response| response.content)
+                    .map_err(|e| std::io::Error::other(e.to_string()));
+                tx.send(response).ok();
+            }
+            FsTask::ReadFileLimit {
+                session_id,
+                path,
+                limit,
+                tx,
+            } => {
+                let read_text_file = Self::client().read_text_file(ReadTextFileRequest {
+                    session_id,
+                    path,
+                    line: None,
+                    limit: Some(limit.try_into().unwrap_or(u32::MAX)),
                     meta: None,
                 });
                 let response = read_text_file
@@ -108,6 +133,39 @@ impl codex_apply_patch::Fs for AcpFs {
         rx.recv()
             .map_err(|e| std::io::Error::other(e.to_string()))
             .flatten()
+    }
+}
+
+impl codex_core::codex::Fs for AcpFs {
+    fn file_buffer(
+        &self,
+        path: &std::path::Path,
+        limit: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = std::io::Result<Box<dyn tokio::io::AsyncBufRead + Unpin + Send>>>
+                + Send,
+        >,
+    > {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let path = match std::path::absolute(path) {
+            Ok(path) => path,
+            Err(e) => return Box::pin(async move { Err(std::io::Error::other(e.to_string())) }),
+        };
+        self.local_spawner.spawn(FsTask::ReadFileLimit {
+            session_id: self.session_id.clone(),
+            path,
+            limit,
+            tx,
+        });
+        Box::pin(async move {
+            let file = rx
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))
+                .flatten()?;
+
+            Ok(Box::new(tokio::io::BufReader::new(Cursor::new(file.into_bytes()))) as _)
+        })
     }
 }
 
