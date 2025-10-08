@@ -51,7 +51,7 @@ impl CodexAgent {
         let conversation_manager =
             ConversationManager::new(auth_manager.clone(), SessionSource::Unknown).with_fs(
                 Box::new(move |conversation_id| {
-                    Box::new(AcpFs::new(
+                    Arc::new(AcpFs::new(
                         Self::session_id_from_conversation_id(conversation_id),
                         local_spawner.clone(),
                     ))
@@ -167,6 +167,7 @@ impl Agent for CodexAgent {
         config.use_experimental_use_rmcp_client = true;
         // Make sure we are going through the `apply_patch` code path
         config.include_apply_patch_tool = true;
+        config.include_plan_tool = true;
         config.cwd.clone_from(&cwd);
 
         // Propagate any client-provided MCP servers that codex-rs supports.
