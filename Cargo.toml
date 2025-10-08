@@ -20,6 +20,7 @@ path = "src/lib.rs"
 agent-client-protocol = { version = "0.4.5", features = ["unstable"] }
 anyhow = "1"
 async-trait = "0.1"
+clap = "4"
 codex-apply-patch = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-arg0 = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-common = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["cli"] }
@@ -27,6 +28,7 @@ codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-mcp-server = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-protocol = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-login = { git = "https://github.com/zed-industries/codex", branch = "acp" }
+codex-tui = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 itertools = "0.14.0"
 mcp-types = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 serde = { version = "1", features = ["derive"] }
