@@ -10,7 +10,18 @@ This tool implements an ACP adapter around the Codex CLI, supporting:
 - Following
 - Edit review
 - TODO lists
+- Slash commands:
+  - /review (with optional instructions)
+  - /review-branch
+  - /review-commit
+  - /init
+  - /compact
+  - /logout
 - Client MCP servers
+- Auth Methods:
+  - ChatGPT subscription (requires paid subscription and doesn't work in remote projects)
+  - CODEX_API_KEY
+  - OPENAI_API_KEY
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
