@@ -1,18 +1,19 @@
 use agent_client_protocol::{
-    Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification, Error,
-    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
-    McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse, PromptCapabilities,
-    PromptRequest, PromptResponse, SessionId, SetSessionModeRequest, SetSessionModeResponse,
-    SetSessionModelRequest, SetSessionModelResponse, V1,
+    Agent, AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
+    CancelNotification, Error, InitializeRequest, InitializeResponse, LoadSessionRequest,
+    LoadSessionResponse, McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse,
+    PromptCapabilities, PromptRequest, PromptResponse, SessionId, SetSessionModeRequest,
+    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, V1,
 };
 use codex_common::model_presets::{ModelPreset, builtin_model_presets};
 use codex_core::{
     ConversationManager, NewConversation,
-    auth::{AuthManager, CodexAuth},
+    auth::{AuthManager, read_codex_api_key_from_env, read_openai_api_key_from_env},
     config::Config,
     config_types::{McpServerConfig, McpServerTransportConfig},
     protocol::SessionSource,
 };
+use codex_login::{CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
 use codex_protocol::ConversationId;
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 use tracing::{debug, info};
@@ -42,7 +43,7 @@ pub struct CodexAgent {
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
     pub fn new(config: Config) -> Self {
-        let auth_manager = AuthManager::shared(config.codex_home.clone(), true);
+        let auth_manager = AuthManager::shared(config.codex_home.clone(), false);
 
         let model_presets = Rc::new(builtin_model_presets(
             auth_manager.auth().map(|auth| auth.mode),
@@ -106,21 +107,11 @@ impl Agent for CodexAgent {
             meta: None,
         };
 
-        // Hide auth methods when already authenticated, otherwise advertise a single login method.
-        let is_authenticated = matches!(
-            CodexAuth::from_codex_home(&self.config.codex_home),
-            Ok(Some(_))
-        );
-        let auth_methods = if is_authenticated {
-            vec![]
-        } else {
-            vec![agent_client_protocol::AuthMethod {
-                id: agent_client_protocol::AuthMethodId("codex-login".into()),
-                name: "Codex Login".into(),
-                description: Some("Authenticate Codex from the terminal".into()),
-                meta: None,
-            }]
-        };
+        let auth_methods = vec![
+            CodexAuthMethod::ChatGpt.into(),
+            CodexAuthMethod::CodexApiKey.into(),
+            CodexAuthMethod::OpenAiApiKey.into(),
+        ];
 
         Ok(InitializeResponse {
             protocol_version,
@@ -134,27 +125,51 @@ impl Agent for CodexAgent {
         &self,
         request: AuthenticateRequest,
     ) -> Result<AuthenticateResponse, Error> {
-        if request.method_id.0.as_ref() != "codex-login" {
-            return Err(Error::invalid_params().with_data("unsupported authentication method"));
+        let auth_method = CodexAuthMethod::try_from(request.method_id)?;
+
+        match auth_method {
+            CodexAuthMethod::ChatGpt => {
+                // Perform browser/device login via codex-rs, then report success/failure to the client.
+                let opts = codex_login::ServerOptions::new(
+                    self.config.codex_home.clone(),
+                    codex_core::auth::CLIENT_ID.to_string(),
+                );
+
+                let server =
+                    codex_login::run_login_server(opts).map_err(Error::into_internal_error)?;
+
+                server
+                    .block_until_done()
+                    .await
+                    .map_err(Error::into_internal_error)?;
+            }
+            CodexAuthMethod::CodexApiKey => {
+                let api_key = read_codex_api_key_from_env().ok_or_else(|| {
+                    Error::invalid_params().with_data(format!("{CODEX_API_KEY_ENV_VAR} is not set"))
+                })?;
+                codex_login::login_with_api_key(&self.config.codex_home, &api_key)
+                    .map_err(Error::into_internal_error)?;
+            }
+            CodexAuthMethod::OpenAiApiKey => {
+                let api_key = read_openai_api_key_from_env().ok_or_else(|| {
+                    Error::invalid_params()
+                        .with_data(format!("{OPENAI_API_KEY_ENV_VAR} is not set"))
+                })?;
+                codex_login::login_with_api_key(&self.config.codex_home, &api_key)
+                    .map_err(Error::into_internal_error)?;
+            }
         }
 
-        // Perform browser/device login via codex-rs, then report success/failure to the client.
-        let opts = codex_login::ServerOptions::new(
-            self.config.codex_home.clone(),
-            codex_core::auth::CLIENT_ID.to_string(),
-        );
-
-        let server = codex_login::run_login_server(opts).map_err(Error::into_internal_error)?;
-
-        server
-            .block_until_done()
-            .await
-            .map_err(Error::into_internal_error)?;
+        self.auth_manager.reload();
 
         Ok(AuthenticateResponse { meta: None })
     }
 
     async fn new_session(&self, request: NewSessionRequest) -> Result<NewSessionResponse, Error> {
+        // Check before sending if authentication was successful or not
+        if self.auth_manager.auth().is_none() {
+            return Err(Error::auth_required());
+        }
         let NewSessionRequest {
             cwd,
             mcp_servers,
@@ -260,6 +275,10 @@ impl Agent for CodexAgent {
         request: LoadSessionRequest,
     ) -> Result<LoadSessionResponse, Error> {
         info!("Loading session: {}", request.session_id);
+        // Check before sending if authentication was successful or not
+        if self.auth_manager.auth().is_none() {
+            return Err(Error::auth_required());
+        }
 
         // Check if we have this session already
         let Some(conversation) = self.sessions.borrow().get(&request.session_id).cloned() else {
@@ -322,5 +341,70 @@ impl Agent for CodexAgent {
             .await?;
 
         Ok(SetSessionModelResponse::default())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexAuthMethod {
+    ChatGpt,
+    CodexApiKey,
+    OpenAiApiKey,
+}
+
+impl From<CodexAuthMethod> for AuthMethodId {
+    fn from(method: CodexAuthMethod) -> Self {
+        Self(
+            match method {
+                CodexAuthMethod::ChatGpt => "chatgpt",
+                CodexAuthMethod::CodexApiKey => "codex-api-key",
+                CodexAuthMethod::OpenAiApiKey => "openai-api-key",
+            }
+            .into(),
+        )
+    }
+}
+
+impl From<CodexAuthMethod> for AuthMethod {
+    fn from(method: CodexAuthMethod) -> Self {
+        match method {
+            CodexAuthMethod::ChatGpt => Self {
+                id: method.into(),
+                name: "Login with ChatGPT".into(),
+                description: Some(
+                    "Use your ChatGPT login with Codex CLI (requires a paid ChatGPT subscription)"
+                        .into(),
+                ),
+                meta: None,
+            },
+            CodexAuthMethod::CodexApiKey => Self {
+                id: method.into(),
+                name: "Use Codex API Key".into(),
+                description: Some(format!(
+                    "Requires setting the `{CODEX_API_KEY_ENV_VAR}` environment variable."
+                )),
+                meta: None,
+            },
+            CodexAuthMethod::OpenAiApiKey => Self {
+                id: method.into(),
+                name: "Use OpenAI API Key".into(),
+                description: Some(format!(
+                    "Requires setting the `{OPENAI_API_KEY_ENV_VAR}` environment variable."
+                )),
+                meta: None,
+            },
+        }
+    }
+}
+
+impl TryFrom<AuthMethodId> for CodexAuthMethod {
+    type Error = Error;
+
+    fn try_from(value: AuthMethodId) -> Result<Self, Self::Error> {
+        match value.0.as_ref() {
+            "chatgpt" => Ok(CodexAuthMethod::ChatGpt),
+            "codex-api-key" => Ok(CodexAuthMethod::CodexApiKey),
+            "openai-api-key" => Ok(CodexAuthMethod::OpenAiApiKey),
+            _ => Err(Error::invalid_params().with_data("unsupported authentication method")),
+        }
     }
 }
