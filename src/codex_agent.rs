@@ -107,11 +107,15 @@ impl Agent for CodexAgent {
             meta: None,
         };
 
-        let auth_methods = vec![
+        let mut auth_methods = vec![
             CodexAuthMethod::ChatGpt.into(),
             CodexAuthMethod::CodexApiKey.into(),
             CodexAuthMethod::OpenAiApiKey.into(),
         ];
+        // Until codex device code auth works, we can't use this in remote ssh projects
+        if std::env::var("NO_BROWSER").is_ok() {
+            auth_methods.remove(0);
+        }
 
         Ok(InitializeResponse {
             protocol_version,
