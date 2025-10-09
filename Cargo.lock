@@ -613,7 +613,7 @@ dependencies = [
 [[package]]
 name = "codex-app-server-protocol"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#d3a4e7b3e91fe9f3eac664ccced8beb54889cf52"
+source = "git+https://github.com/zed-industries/codex?branch=acp#6f9accef9bff8e344e52e1cd937d93821440033c"
 dependencies = [
  "codex-protocol",
  "paste",
@@ -627,7 +627,7 @@ dependencies = [
 [[package]]
 name = "codex-apply-patch"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#d3a4e7b3e91fe9f3eac664ccced8beb54889cf52"
+source = "git+https://github.com/zed-industries/codex?branch=acp#6f9accef9bff8e344e52e1cd937d93821440033c"
 dependencies = [
  "anyhow",
  "similar",
@@ -639,7 +639,7 @@ dependencies = [
 [[package]]
 name = "codex-arg0"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#d3a4e7b3e91fe9f3eac664ccced8beb54889cf52"
+source = "git+https://github.com/zed-industries/codex?branch=acp#6f9accef9bff8e344e52e1cd937d93821440033c"
 dependencies = [
  "anyhow",
  "codex-apply-patch",
@@ -653,7 +653,7 @@ dependencies = [
 [[package]]
 name = "codex-common"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#d3a4e7b3e91fe9f3eac664ccced8beb54889cf52"
+source = "git+https://github.com/zed-industries/codex?branch=acp#6f9accef9bff8e344e52e1cd937d93821440033c"
 dependencies = [
  "clap",
  "codex-app-server-protocol",
@@ -666,7 +666,7 @@ dependencies = [
 [[package]]
 name = "codex-core"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#d3a4e7b3e91fe9f3eac664ccced8beb54889cf52"
+source = "git+https://github.com/zed-industries/codex?branch=acp#6f9accef9bff8e344e52e1cd937d93821440033c"
 dependencies = [
  "anyhow",
  "askama",
@@ -724,7 +724,7 @@ dependencies = [
 [[package]]
 name = "codex-file-search"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#d3a4e7b3e91fe9f3eac664ccced8beb54889cf52"
+source = "git+https://github.com/zed-industries/codex?branch=acp#6f9accef9bff8e344e52e1cd937d93821440033c"
 dependencies = [
  "anyhow",
  "clap",
@@ -738,7 +738,7 @@ dependencies = [
 [[package]]
 name = "codex-linux-sandbox"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#d3a4e7b3e91fe9f3eac664ccced8beb54889cf52"
+source = "git+https://github.com/zed-industries/codex?branch=acp#6f9accef9bff8e344e52e1cd937d93821440033c"
 dependencies = [
  "clap",
  "codex-core",
@@ -750,7 +750,7 @@ dependencies = [
 [[package]]
 name = "codex-login"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#d3a4e7b3e91fe9f3eac664ccced8beb54889cf52"
+source = "git+https://github.com/zed-industries/codex?branch=acp#6f9accef9bff8e344e52e1cd937d93821440033c"
 dependencies = [
  "base64",
  "chrono",
@@ -772,7 +772,7 @@ dependencies = [
 [[package]]
 name = "codex-mcp-client"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#d3a4e7b3e91fe9f3eac664ccced8beb54889cf52"
+source = "git+https://github.com/zed-industries/codex?branch=acp#6f9accef9bff8e344e52e1cd937d93821440033c"
 dependencies = [
  "anyhow",
  "mcp-types",
@@ -786,7 +786,7 @@ dependencies = [
 [[package]]
 name = "codex-mcp-server"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#d3a4e7b3e91fe9f3eac664ccced8beb54889cf52"
+source = "git+https://github.com/zed-industries/codex?branch=acp#6f9accef9bff8e344e52e1cd937d93821440033c"
 dependencies = [
  "anyhow",
  "codex-arg0",
@@ -807,7 +807,7 @@ dependencies = [
 [[package]]
 name = "codex-otel"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#d3a4e7b3e91fe9f3eac664ccced8beb54889cf52"
+source = "git+https://github.com/zed-industries/codex?branch=acp#6f9accef9bff8e344e52e1cd937d93821440033c"
 dependencies = [
  "chrono",
  "codex-app-server-protocol",
@@ -829,7 +829,7 @@ dependencies = [
 [[package]]
 name = "codex-protocol"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#d3a4e7b3e91fe9f3eac664ccced8beb54889cf52"
+source = "git+https://github.com/zed-industries/codex?branch=acp#6f9accef9bff8e344e52e1cd937d93821440033c"
 dependencies = [
  "base64",
  "icu_decimal",
@@ -850,10 +850,11 @@ dependencies = [
 [[package]]
 name = "codex-rmcp-client"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#d3a4e7b3e91fe9f3eac664ccced8beb54889cf52"
+source = "git+https://github.com/zed-industries/codex?branch=acp#6f9accef9bff8e344e52e1cd937d93821440033c"
 dependencies = [
  "anyhow",
  "axum",
+ "codex-protocol",
  "dirs",
  "futures",
  "keyring",
@@ -874,7 +875,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-json-to-toml"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#d3a4e7b3e91fe9f3eac664ccced8beb54889cf52"
+source = "git+https://github.com/zed-industries/codex?branch=acp#6f9accef9bff8e344e52e1cd937d93821440033c"
 dependencies = [
  "serde_json",
  "toml",
@@ -883,7 +884,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-string"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#d3a4e7b3e91fe9f3eac664ccced8beb54889cf52"
+source = "git+https://github.com/zed-industries/codex?branch=acp#6f9accef9bff8e344e52e1cd937d93821440033c"
 
 [[package]]
 name = "colorchoice"
@@ -2110,7 +2111,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 [[package]]
 name = "mcp-types"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#d3a4e7b3e91fe9f3eac664ccced8beb54889cf52"
+source = "git+https://github.com/zed-industries/codex?branch=acp#6f9accef9bff8e344e52e1cd937d93821440033c"
 dependencies = [
  "serde",
  "serde_json",
@@ -3628,9 +3629,9 @@ dependencies = [
 
 [[package]]
 name = "stable_deref_trait"
-version = "1.2.0"
+version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
+checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "static_assertions"

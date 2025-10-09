@@ -187,6 +187,7 @@ impl Agent for CodexAgent {
                                 url,
                                 bearer_token_env_var: None,
                             },
+                            enabled: true,
                             startup_timeout_sec: None,
                             tool_timeout_sec: None,
                         },
@@ -210,6 +211,7 @@ impl Agent for CodexAgent {
                                     Some(env.into_iter().map(|env| (env.name, env.value)).collect())
                                 },
                             },
+                            enabled: true,
                             startup_timeout_sec: None,
                             tool_timeout_sec: None,
                         },
