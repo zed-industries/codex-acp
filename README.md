@@ -17,6 +17,7 @@ This tool implements an ACP adapter around the Codex CLI, supporting:
   - /init
   - /compact
   - /logout
+  - Custom Prompts
 - Client MCP servers
 - Auth Methods:
   - ChatGPT subscription (requires paid subscription and doesn't work in remote projects)
