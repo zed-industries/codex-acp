@@ -251,6 +251,7 @@ impl Agent for CodexAgent {
         let conversation = Rc::new(Conversation::new(
             session_id.clone(),
             conversation,
+            self.auth_manager.clone(),
             config.clone(),
             self.model_presets.clone(),
         ));

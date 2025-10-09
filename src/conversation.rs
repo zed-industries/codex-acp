@@ -23,7 +23,7 @@ use codex_common::{
     model_presets::ModelPreset,
 };
 use codex_core::{
-    CodexConversation,
+    AuthManager, CodexConversation,
     config::Config,
     error::CodexErr,
     protocol::{
@@ -75,6 +75,18 @@ impl CodexConversationImpl for CodexConversation {
     }
 }
 
+pub trait Auth {
+    fn logout(&self) -> Result<bool, Error>;
+}
+
+impl Auth for Arc<AuthManager> {
+    fn logout(&self) -> Result<bool, Error> {
+        self.as_ref()
+            .logout()
+            .map_err(|e| Error::internal_error().with_data(e.to_string()))
+    }
+}
+
 enum ConversationMessage {
     Load {
         response_tx: oneshot::Sender<Result<LoadSessionResponse, Error>>,
@@ -107,12 +119,14 @@ impl Conversation {
     pub fn new(
         session_id: SessionId,
         conversation: Arc<dyn CodexConversationImpl>,
+        auth: Arc<AuthManager>,
         config: Config,
         model_presets: Rc<Vec<ModelPreset>>,
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
 
         let actor = ConversationActor::new(
+            auth,
             SessionClient::new(session_id),
             conversation.clone(),
             config,
@@ -1148,7 +1162,9 @@ impl SessionClient {
     }
 }
 
-struct ConversationActor {
+struct ConversationActor<A> {
+    /// Allows for logging out from slash commands
+    auth: A,
     /// Used for sending messages back to the client.
     client: SessionClient,
     /// The conversation associated with this task.
@@ -1165,8 +1181,9 @@ struct ConversationActor {
     message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
 }
 
-impl ConversationActor {
+impl<A: Auth> ConversationActor<A> {
     fn new(
+        auth: A,
         client: SessionClient,
         conversation: Arc<dyn CodexConversationImpl>,
         config: Config,
@@ -1174,6 +1191,7 @@ impl ConversationActor {
         message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
     ) -> Self {
         Self {
+            auth,
             client,
             conversation,
             config,
@@ -1306,6 +1324,12 @@ impl ConversationActor {
             AvailableCommand {
                 name: "compact".to_string(),
                 description: "summarize conversation to prevent hitting the context limit".into(),
+                input: None,
+                meta: None,
+            },
+            AvailableCommand {
+                name: "logout".to_string(),
+                description: "logout of Codex".into(),
                 input: None,
                 meta: None,
             },
@@ -1473,6 +1497,10 @@ impl ConversationActor {
                             user_facing_hint: format!("commit {sha}"),
                         },
                     }
+                }
+                "logout" => {
+                    self.auth.logout()?;
+                    return Err(Error::auth_required());
                 }
                 _ => {
                     if let Some(prompt) =
@@ -2232,6 +2260,7 @@ mod tests {
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let mut actor = ConversationActor::new(
+            StubAuth,
             session_client,
             conversation.clone(),
             config,
@@ -2243,6 +2272,14 @@ mod tests {
         let local_set = LocalSet::new();
         local_set.spawn_local(actor.spawn());
         Ok((session_id, client, conversation, message_tx, local_set))
+    }
+
+    struct StubAuth;
+
+    impl Auth for StubAuth {
+        fn logout(&self) -> Result<bool, Error> {
+            Ok(true)
+        }
     }
 
     struct StubCodexConversation {
