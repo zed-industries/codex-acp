@@ -17,7 +17,7 @@ name = "codex_acp"
 path = "src/lib.rs"
 
 [dependencies]
-agent-client-protocol = { version = "0.4.5", features = ["unstable"] }
+agent-client-protocol = { version = "0.4.6", features = ["unstable"] }
 anyhow = "1"
 async-trait = "0.1"
 codex-apply-patch = { git = "https://github.com/zed-industries/codex", branch = "acp" }
