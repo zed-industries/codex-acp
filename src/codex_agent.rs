@@ -149,14 +149,14 @@ impl Agent for CodexAgent {
             }
             CodexAuthMethod::CodexApiKey => {
                 let api_key = read_codex_api_key_from_env().ok_or_else(|| {
-                    Error::invalid_params().with_data(format!("{CODEX_API_KEY_ENV_VAR} is not set"))
+                    Error::internal_error().with_data(format!("{CODEX_API_KEY_ENV_VAR} is not set"))
                 })?;
                 codex_login::login_with_api_key(&self.config.codex_home, &api_key)
                     .map_err(Error::into_internal_error)?;
             }
             CodexAuthMethod::OpenAiApiKey => {
                 let api_key = read_openai_api_key_from_env().ok_or_else(|| {
-                    Error::invalid_params()
+                    Error::internal_error()
                         .with_data(format!("{OPENAI_API_KEY_ENV_VAR} is not set"))
                 })?;
                 codex_login::login_with_api_key(&self.config.codex_home, &api_key)
@@ -383,7 +383,7 @@ impl From<CodexAuthMethod> for AuthMethod {
             },
             CodexAuthMethod::CodexApiKey => Self {
                 id: method.into(),
-                name: "Use Codex API Key".into(),
+                name: format!("Use {CODEX_API_KEY_ENV_VAR}"),
                 description: Some(format!(
                     "Requires setting the `{CODEX_API_KEY_ENV_VAR}` environment variable."
                 )),
@@ -391,7 +391,7 @@ impl From<CodexAuthMethod> for AuthMethod {
             },
             CodexAuthMethod::OpenAiApiKey => Self {
                 id: method.into(),
-                name: "Use OpenAI API Key".into(),
+                name: format!("Use {OPENAI_API_KEY_ENV_VAR}"),
                 description: Some(format!(
                     "Requires setting the `{OPENAI_API_KEY_ENV_VAR}` environment variable."
                 )),
