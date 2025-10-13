@@ -263,8 +263,14 @@ impl CustomPromptsState {
     }
 }
 
+struct ActiveCommand {
+    call_id: String,
+    tool_call_id: ToolCallId,
+    output: String,
+}
+
 struct PromptState {
-    active_command: Option<(String, ToolCallId)>,
+    active_command: Option<ActiveCommand>,
     active_web_search: Option<String>,
     conversation: Arc<dyn CodexConversationImpl>,
     event_count: usize,
@@ -744,7 +750,11 @@ impl PromptState {
 
         // Create a new tool call for the command execution
         let tool_call_id = ToolCallId(call_id.clone().into());
-        self.active_command = Some((call_id, tool_call_id.clone()));
+        self.active_command = Some(ActiveCommand {
+            call_id,
+            tool_call_id: tool_call_id.clone(),
+            output: String::new(),
+        });
 
         let response = client
             .request_permission(
@@ -827,7 +837,11 @@ impl PromptState {
             terminal_id: TerminalId(terminal_id_for_meta.clone().into()),
         }];
 
-        self.active_command = Some((call_id, tool_call_id.clone()));
+        self.active_command = Some(ActiveCommand {
+            call_id,
+            tool_call_id: tool_call_id.clone(),
+            output: String::new(),
+        });
 
         client
             .send_notification(SessionUpdate::ToolCall(ToolCall {
@@ -858,7 +872,7 @@ impl PromptState {
     }
 
     async fn exec_command_output_delta(
-        &self,
+        &mut self,
         client: &SessionClient,
         event: ExecCommandOutputDeltaEvent,
     ) {
@@ -868,14 +882,16 @@ impl PromptState {
             stream: _,
         } = event;
         // Stream output bytes to the display-only terminal via ToolCallUpdate meta.
-        if let Some((active_call_id, active_tool_call_id)) = &self.active_command
-            && *active_call_id == call_id
+        if let Some(active_command) = &mut self.active_command
+            && *active_command.call_id == call_id
         {
             let data_str = String::from_utf8_lossy(&chunk).to_string();
+            active_command.output.push_str(&data_str);
             client
                 .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                    id: active_tool_call_id.clone(),
+                    id: active_command.tool_call_id.clone(),
                     fields: ToolCallUpdateFields {
+                        content: Some(vec![format!("```sh{}```", active_command.output).into()]),
                         ..Default::default()
                     },
                     meta: Some(serde_json::json!({
@@ -900,14 +916,14 @@ impl PromptState {
             duration: _,
             formatted_output: _,
         } = event;
-        if let Some((active_call_id, tool_call_id)) = self.active_command.take()
-            && active_call_id == call_id
+        if let Some(active_command) = self.active_command.take()
+            && active_command.call_id == call_id
         {
             let is_success = exit_code == 0;
 
             client
                 .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                    id: tool_call_id,
+                    id: active_command.tool_call_id,
                     fields: ToolCallUpdateFields {
                         status: Some(if is_success {
                             ToolCallStatus::Completed
