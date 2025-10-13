@@ -9,11 +9,11 @@ use std::{
 
 use agent_client_protocol::{
     Annotations, AudioContent, AvailableCommand, AvailableCommandInput, BlobResourceContents,
-    Client, ContentBlock, Diff, EmbeddedResource, EmbeddedResourceResource, Error, ImageContent,
-    LoadSessionResponse, ModelId, ModelInfo, PermissionOption, PermissionOptionId,
-    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
-    SessionId, SessionMode, SessionModeId, SessionModeState, SessionModelState,
+    Client, ClientCapabilities, ContentBlock, Diff, EmbeddedResource, EmbeddedResourceResource,
+    Error, ImageContent, LoadSessionResponse, ModelId, ModelInfo, PermissionOption,
+    PermissionOptionId, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResourceLink, SessionId, SessionMode, SessionModeId, SessionModeState, SessionModelState,
     SessionNotification, SessionUpdate, StopReason, TerminalId, TextContent, TextResourceContents,
     ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind,
@@ -120,6 +120,7 @@ impl Conversation {
         session_id: SessionId,
         conversation: Arc<dyn CodexConversationImpl>,
         auth: Arc<AuthManager>,
+        client_capabilities: ClientCapabilities,
         config: Config,
         model_presets: Rc<Vec<ModelPreset>>,
     ) -> Self {
@@ -127,7 +128,7 @@ impl Conversation {
 
         let actor = ConversationActor::new(
             auth,
-            SessionClient::new(session_id),
+            SessionClient::new(session_id, client_capabilities),
             conversation.clone(),
             config,
             model_presets,
@@ -832,16 +833,27 @@ impl PromptState {
         } = event;
         // Create a new tool call for the command execution
         let tool_call_id = ToolCallId(call_id.clone().into());
-        let terminal_id_for_meta = call_id.clone();
-        let terminal_content: Vec<ToolCallContent> = vec![ToolCallContent::Terminal {
-            terminal_id: TerminalId(terminal_id_for_meta.clone().into()),
-        }];
 
         self.active_command = Some(ActiveCommand {
-            call_id,
+            call_id: call_id.clone(),
             tool_call_id: tool_call_id.clone(),
             output: String::new(),
         });
+
+        let (content, meta) = if client.supports_terminal_output() {
+            let content = vec![ToolCallContent::Terminal {
+                terminal_id: TerminalId(call_id.clone().into()),
+            }];
+            let meta = Some(serde_json::json!({
+                "terminal_info": {
+                    "terminal_id": call_id,
+                    "cwd": cwd
+                }
+            }));
+            (content, meta)
+        } else {
+            (vec![], None)
+        };
 
         client
             .send_notification(SessionUpdate::ToolCall(ToolCall {
@@ -849,7 +861,7 @@ impl PromptState {
                 title: command.join(" "),
                 kind: ToolKind::Execute,
                 status: ToolCallStatus::InProgress,
-                content: terminal_content,
+                content,
                 locations: if cwd == std::path::PathBuf::from(".") {
                     vec![]
                 } else {
@@ -861,12 +873,7 @@ impl PromptState {
                 },
                 raw_input: Some(raw_input),
                 raw_output: None,
-                meta: Some(serde_json::json!({
-                    "terminal_info": {
-                        "terminal_id": terminal_id_for_meta,
-                        "cwd": cwd
-                    }
-                })),
+                meta,
             }))
             .await;
     }
@@ -886,20 +893,31 @@ impl PromptState {
             && *active_command.call_id == call_id
         {
             let data_str = String::from_utf8_lossy(&chunk).to_string();
-            active_command.output.push_str(&data_str);
-            client
-                .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                    id: active_command.tool_call_id.clone(),
-                    fields: ToolCallUpdateFields {
+
+            let (fields, meta) = if client.supports_terminal_output() {
+                let meta = Some(serde_json::json!({
+                    "terminal_output": {
+                        "terminal_id": call_id,
+                        "data": data_str
+                    }
+                }));
+                (ToolCallUpdateFields::default(), meta)
+            } else {
+                active_command.output.push_str(&data_str);
+                (
+                    ToolCallUpdateFields {
                         content: Some(vec![format!("```sh{}```", active_command.output).into()]),
                         ..Default::default()
                     },
-                    meta: Some(serde_json::json!({
-                        "terminal_output": {
-                            "terminal_id": call_id,
-                            "data": data_str
-                        }
-                    })),
+                    None,
+                )
+            };
+
+            client
+                .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                    id: active_command.tool_call_id.clone(),
+                    fields,
+                    meta,
                 }))
                 .await;
         }
@@ -921,6 +939,16 @@ impl PromptState {
         {
             let is_success = exit_code == 0;
 
+            let meta = client.supports_terminal_output().then(|| {
+                serde_json::json!({
+                    "terminal_exit": {
+                        "terminal_id": call_id,
+                        "exit_code": exit_code,
+                        "signal": null
+                    }
+                })
+            });
+
             client
                 .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
                     id: active_command.tool_call_id,
@@ -933,13 +961,7 @@ impl PromptState {
                         raw_output: Some(raw_output),
                         ..Default::default()
                     },
-                    meta: Some(serde_json::json!({
-                        "terminal_exit": {
-                            "terminal_id": call_id,
-                            "exit_code": exit_code,
-                            "signal": null
-                        }
-                    })),
+                    meta,
                 }))
                 .await;
         }
@@ -1093,19 +1115,36 @@ impl TaskState {
 struct SessionClient {
     session_id: SessionId,
     client: Arc<dyn Client>,
+    client_capabilities: ClientCapabilities,
 }
 
 impl SessionClient {
-    fn new(session_id: SessionId) -> Self {
+    fn new(session_id: SessionId, client_capabilities: ClientCapabilities) -> Self {
         Self {
             session_id,
             client: ACP_CLIENT.get().expect("Client should be set").clone(),
+            client_capabilities,
         }
     }
 
     #[cfg(test)]
-    fn with_client(session_id: SessionId, client: Arc<dyn Client>) -> Self {
-        Self { session_id, client }
+    fn with_client(
+        session_id: SessionId,
+        client: Arc<dyn Client>,
+        client_capabilities: ClientCapabilities,
+    ) -> Self {
+        Self {
+            session_id,
+            client,
+            client_capabilities,
+        }
+    }
+
+    fn supports_terminal_output(&self) -> bool {
+        self.client_capabilities.meta.as_ref().is_some_and(|v| {
+            v.get("terminal_output")
+                .is_some_and(|v| v.as_bool().unwrap_or_default())
+        })
     }
 
     async fn send_notification(&self, update: SessionUpdate) {
@@ -2270,7 +2309,11 @@ mod tests {
     )> {
         let session_id = SessionId("test".into());
         let client = Arc::new(StubClient::new());
-        let session_client = SessionClient::with_client(session_id.clone(), client.clone());
+        let session_client = SessionClient::with_client(
+            session_id.clone(),
+            client.clone(),
+            ClientCapabilities::default(),
+        );
         let conversation = Arc::new(StubCodexConversation::new());
         let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default()).await?;
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();

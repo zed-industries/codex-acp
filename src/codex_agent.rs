@@ -1,9 +1,10 @@
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, Error, InitializeRequest, InitializeResponse, LoadSessionRequest,
-    LoadSessionResponse, McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, SessionId, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, V1,
+    CancelNotification, ClientCapabilities, Error, InitializeRequest, InitializeResponse,
+    LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, NewSessionRequest,
+    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, SessionId,
+    SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
+    V1,
 };
 use codex_common::model_presets::{ModelPreset, builtin_model_presets};
 use codex_core::{
@@ -30,6 +31,8 @@ use crate::{
 pub struct CodexAgent {
     /// Handle to the current authentication
     auth_manager: Arc<AuthManager>,
+    /// Capabilities of the connected client
+    client_capabilities: RefCell<ClientCapabilities>,
     /// The underlying codex configuration
     config: Config,
     /// Conversation manager for handling sessions
@@ -60,9 +63,10 @@ impl CodexAgent {
             );
         Self {
             auth_manager,
+            client_capabilities: RefCell::default(),
             config,
             conversation_manager,
-            sessions: Rc::new(RefCell::new(HashMap::new())),
+            sessions: Rc::default(),
             model_presets,
         }
     }
@@ -88,8 +92,10 @@ impl Agent for CodexAgent {
             "Received initialize request with protocol version {:?}",
             request.protocol_version
         );
-
         let protocol_version = V1;
+
+        self.client_capabilities
+            .replace(request.client_capabilities);
 
         let agent_capabilities = AgentCapabilities {
             load_session: false, // Currently only able to do in-memory... which doesn't help us at the moment
@@ -256,6 +262,7 @@ impl Agent for CodexAgent {
             session_id.clone(),
             conversation,
             self.auth_manager.clone(),
+            self.client_capabilities.borrow().clone(),
             config.clone(),
             self.model_presets.clone(),
         ));
