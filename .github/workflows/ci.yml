@@ -12,7 +12,7 @@ env:
 
 jobs:
   test:
-    name: Test - ${{ matrix.os }}
+    name: Test - ${{ matrix.os }} ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
