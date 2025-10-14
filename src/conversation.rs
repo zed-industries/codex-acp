@@ -906,7 +906,13 @@ impl PromptState {
                 active_command.output.push_str(&data_str);
                 (
                     ToolCallUpdateFields {
-                        content: Some(vec![format!("```sh{}```", active_command.output).into()]),
+                        content: Some(vec![
+                            format!(
+                                "```sh\n{}\n```\n",
+                                active_command.output.trim_end_matches('\n')
+                            )
+                            .into(),
+                        ]),
                         ..Default::default()
                     },
                     None,
