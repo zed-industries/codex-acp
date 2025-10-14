@@ -97,7 +97,7 @@ jobs:
 
           cd target/${{ matrix.target }}/release
 
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+          if [ "${{ matrix.os }}" = "windows-latest" ] || [ "${{ matrix.os }}" = "windows-11-arm" ]; then
             7z a -tzip "${ARCHIVE_NAME}.zip" "${BINARY_NAME}"
             echo "archive_path=${ARCHIVE_NAME}.zip" >> $GITHUB_OUTPUT
             echo "archive_name=${ARCHIVE_NAME}.zip" >> $GITHUB_OUTPUT
