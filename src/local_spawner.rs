@@ -1,8 +1,14 @@
-use std::{io::Cursor, path::PathBuf};
+use std::{
+    io::Cursor,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use agent_client_protocol::{
-    AgentSideConnection, Client, ReadTextFileRequest, SessionId, WriteTextFileRequest,
+    AgentSideConnection, Client, ClientCapabilities, ReadTextFileRequest, SessionId,
+    WriteTextFileRequest,
 };
+use codex_apply_patch::StdFs;
 use tokio::sync::mpsc;
 
 use crate::ACP_CLIENT;
@@ -95,14 +101,20 @@ impl FsTask {
 }
 
 pub struct AcpFs {
-    session_id: SessionId,
+    client_capabilities: Arc<Mutex<ClientCapabilities>>,
     local_spawner: LocalSpawner,
+    session_id: SessionId,
 }
 
 impl AcpFs {
-    pub fn new(session_id: SessionId, local_spawner: LocalSpawner) -> Self {
+    pub fn new(
+        session_id: SessionId,
+        client_capabilities: Arc<Mutex<ClientCapabilities>>,
+        local_spawner: LocalSpawner,
+    ) -> Self {
         Self {
             session_id,
+            client_capabilities,
             local_spawner,
         }
     }
@@ -110,6 +122,9 @@ impl AcpFs {
 
 impl codex_apply_patch::Fs for AcpFs {
     fn read_to_string(&self, path: &std::path::Path) -> std::io::Result<String> {
+        if !self.client_capabilities.lock().unwrap().fs.read_text_file {
+            return StdFs.read_to_string(path);
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         self.local_spawner.spawn(FsTask::ReadFile {
             session_id: self.session_id.clone(),
@@ -122,6 +137,9 @@ impl codex_apply_patch::Fs for AcpFs {
     }
 
     fn write(&self, path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+        if !self.client_capabilities.lock().unwrap().fs.write_text_file {
+            return StdFs.write(path, contents);
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         self.local_spawner.spawn(FsTask::WriteFile {
             session_id: self.session_id.clone(),
@@ -147,6 +165,9 @@ impl codex_core::codex::Fs for AcpFs {
                 + Send,
         >,
     > {
+        if !self.client_capabilities.lock().unwrap().fs.read_text_file {
+            return StdFs.file_buffer(path, limit);
+        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         let path = match std::path::absolute(path) {
             Ok(path) => path,

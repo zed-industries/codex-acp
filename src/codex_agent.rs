@@ -16,7 +16,12 @@ use codex_core::{
 };
 use codex_login::{CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
 use codex_protocol::ConversationId;
-use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 use tracing::{debug, info};
 
 use crate::{
@@ -32,7 +37,7 @@ pub struct CodexAgent {
     /// Handle to the current authentication
     auth_manager: Arc<AuthManager>,
     /// Capabilities of the connected client
-    client_capabilities: RefCell<ClientCapabilities>,
+    client_capabilities: Arc<Mutex<ClientCapabilities>>,
     /// The underlying codex configuration
     config: Config,
     /// Conversation manager for handling sessions
@@ -47,23 +52,26 @@ impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
     pub fn new(config: Config) -> Self {
         let auth_manager = AuthManager::shared(config.codex_home.clone(), false);
+        let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
 
         let model_presets = Rc::new(builtin_model_presets(
             auth_manager.auth().map(|auth| auth.mode),
         ));
         let local_spawner = LocalSpawner::new();
+        let capabilities_clone = client_capabilities.clone();
         let conversation_manager =
             ConversationManager::new(auth_manager.clone(), SessionSource::Unknown).with_fs(
                 Box::new(move |conversation_id| {
                     Arc::new(AcpFs::new(
                         Self::session_id_from_conversation_id(conversation_id),
+                        capabilities_clone.clone(),
                         local_spawner.clone(),
                     ))
                 }),
             );
         Self {
             auth_manager,
-            client_capabilities: RefCell::default(),
+            client_capabilities,
             config,
             conversation_manager,
             sessions: Rc::default(),
@@ -94,8 +102,7 @@ impl Agent for CodexAgent {
         );
         let protocol_version = V1;
 
-        self.client_capabilities
-            .replace(request.client_capabilities);
+        *self.client_capabilities.lock().unwrap() = request.client_capabilities;
 
         let agent_capabilities = AgentCapabilities {
             load_session: false, // Currently only able to do in-memory... which doesn't help us at the moment
@@ -262,7 +269,7 @@ impl Agent for CodexAgent {
             session_id.clone(),
             conversation,
             self.auth_manager.clone(),
-            self.client_capabilities.borrow().clone(),
+            self.client_capabilities.clone(),
             config.clone(),
             self.model_presets.clone(),
         ));

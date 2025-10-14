@@ -4,7 +4,7 @@ use std::{
     ops::DerefMut,
     path::PathBuf,
     rc::Rc,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use agent_client_protocol::{
@@ -120,7 +120,7 @@ impl Conversation {
         session_id: SessionId,
         conversation: Arc<dyn CodexConversationImpl>,
         auth: Arc<AuthManager>,
-        client_capabilities: ClientCapabilities,
+        client_capabilities: Arc<Mutex<ClientCapabilities>>,
         config: Config,
         model_presets: Rc<Vec<ModelPreset>>,
     ) -> Self {
@@ -1121,11 +1121,11 @@ impl TaskState {
 struct SessionClient {
     session_id: SessionId,
     client: Arc<dyn Client>,
-    client_capabilities: ClientCapabilities,
+    client_capabilities: Arc<Mutex<ClientCapabilities>>,
 }
 
 impl SessionClient {
-    fn new(session_id: SessionId, client_capabilities: ClientCapabilities) -> Self {
+    fn new(session_id: SessionId, client_capabilities: Arc<Mutex<ClientCapabilities>>) -> Self {
         Self {
             session_id,
             client: ACP_CLIENT.get().expect("Client should be set").clone(),
@@ -1137,7 +1137,7 @@ impl SessionClient {
     fn with_client(
         session_id: SessionId,
         client: Arc<dyn Client>,
-        client_capabilities: ClientCapabilities,
+        client_capabilities: Arc<Mutex<ClientCapabilities>>,
     ) -> Self {
         Self {
             session_id,
@@ -1147,10 +1147,15 @@ impl SessionClient {
     }
 
     fn supports_terminal_output(&self) -> bool {
-        self.client_capabilities.meta.as_ref().is_some_and(|v| {
-            v.get("terminal_output")
-                .is_some_and(|v| v.as_bool().unwrap_or_default())
-        })
+        self.client_capabilities
+            .lock()
+            .unwrap()
+            .meta
+            .as_ref()
+            .is_some_and(|v| {
+                v.get("terminal_output")
+                    .is_some_and(|v| v.as_bool().unwrap_or_default())
+            })
     }
 
     async fn send_notification(&self, update: SessionUpdate) {
@@ -2315,11 +2320,8 @@ mod tests {
     )> {
         let session_id = SessionId("test".into());
         let client = Arc::new(StubClient::new());
-        let session_client = SessionClient::with_client(
-            session_id.clone(),
-            client.clone(),
-            ClientCapabilities::default(),
-        );
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
         let conversation = Arc::new(StubCodexConversation::new());
         let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default()).await?;
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
