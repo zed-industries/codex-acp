@@ -83,17 +83,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/registry
-          key: ${{ matrix.os }}-${{ matrix.target }}-lint-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-lint-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ matrix.os }}-${{ matrix.target }}-lint-cargo-registry-
+            ${{ runner.os }}-lint-cargo-registry-
 
       - name: Cache cargo index
         uses: actions/cache@v4
         with:
           path: ~/.cargo/git
-          key: ${{ matrix.os }}-${{ matrix.target }}-lint-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-lint-cargo-git-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ matrix.os }}-${{ matrix.target }}-lint-cargo-git-
+            ${{ runner.os }}-lint-cargo-git-
 
       - name: Check formatting
         run: cargo fmt --all -- --check
