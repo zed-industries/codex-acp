@@ -42,6 +42,7 @@ use codex_core::{
 use codex_protocol::{
     config_types::ReasoningEffort,
     custom_prompts::CustomPrompt,
+    parse_command::ParsedCommand,
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
 };
 use itertools::Itertools;
@@ -827,9 +828,9 @@ impl PromptState {
         let raw_input = serde_json::json!(&event);
         let ExecCommandBeginEvent {
             call_id,
-            command,
+            command: _,
             cwd,
-            parsed_cmd: _,
+            parsed_cmd,
         } = event;
         // Create a new tool call for the command execution
         let tool_call_id = ToolCallId(call_id.clone().into());
@@ -839,6 +840,22 @@ impl PromptState {
             tool_call_id: tool_call_id.clone(),
             output: String::new(),
         });
+
+        let title = parsed_cmd
+            .into_iter()
+            .map(|cmd| match cmd {
+                ParsedCommand::Read { cmd: _, name } => format!("Read {name}"),
+                ParsedCommand::ListFiles { cmd, path } => {
+                    format!("List {}", path.as_ref().unwrap_or(&cmd))
+                }
+                ParsedCommand::Search { cmd, query, path } => match (query, path) {
+                    (Some(query), Some(path)) => format!("Search {query} in {path}"),
+                    (Some(query), None) => format!("Search {query}"),
+                    _ => format!("Search {}", cmd),
+                },
+                ParsedCommand::Unknown { cmd } => format!("Run {cmd}"),
+            })
+            .join(", ");
 
         let (content, meta) = if client.supports_terminal_output() {
             let content = vec![ToolCallContent::Terminal {
@@ -858,7 +875,7 @@ impl PromptState {
         client
             .send_notification(SessionUpdate::ToolCall(ToolCall {
                 id: tool_call_id,
-                title: command.join(" "),
+                title,
                 kind: ToolKind::Execute,
                 status: ToolCallStatus::InProgress,
                 content,
