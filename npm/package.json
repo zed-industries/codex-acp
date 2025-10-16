@@ -1,0 +1,37 @@
+{
+  "name": "codex-acp",
+  "version": "0.2.9",
+  "description": "An ACP-compatible coding agent powered by Codex",
+  "license": "Apache-2.0",
+  "author": "Zed <hi@zed.dev>",
+  "homepage": "https://github.com/zed-industries/codex-acp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zed-industries/codex-acp"
+  },
+  "bugs": {
+    "url": "https://github.com/zed-industries/codex-acp/issues"
+  },
+  "keywords": [
+    "codex",
+    "acp",
+    "agent",
+    "coding",
+    "ai",
+    "assistant"
+  ],
+  "bin": {
+    "codex-acp": "./bin/codex-acp.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "optionalDependencies": {
+    "codex-acp-darwin-arm64": "0.2.9",
+    "codex-acp-darwin-x64": "0.2.9",
+    "codex-acp-linux-arm64": "0.2.9",
+    "codex-acp-linux-x64": "0.2.9",
+    "codex-acp-windows-arm64": "0.2.9",
+    "codex-acp-windows-x64": "0.2.9"
+  }
+}

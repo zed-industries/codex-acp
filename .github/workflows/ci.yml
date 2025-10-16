@@ -110,3 +110,21 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+  npm-validation:
+    name: NPM Package Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+
+      - name: Run validation script
+        run: bash npm/testing/validate.sh
+
+      - name: Run platform detection tests
+        run: node npm/testing/test-platform-detection.js
