@@ -1355,14 +1355,6 @@ impl<A: Auth> ConversationActor<A> {
                             available_commands,
                         })
                         .await;
-
-                    // https://github.com/openai/codex/blob/main/docs/faq.md#does-it-work-on-windows
-                    #[cfg(target_os = "windows")]
-                    client
-                        .send_agent_text(
-                            "For best performance, run Codex in Windows Subsystem for Linux (WSL2)",
-                        )
-                        .await;
                 });
             }
             ConversationMessage::Prompt {
