@@ -745,9 +745,10 @@ impl PromptState {
         let raw_input = serde_json::json!(&event);
         let ExecApprovalRequestEvent {
             call_id,
-            command,
+            command: _,
             cwd,
             reason,
+            parsed_cmd,
         } = event;
 
         // Create a new tool call for the command execution
@@ -758,6 +759,8 @@ impl PromptState {
             output: String::new(),
         });
 
+        let title = parsed_command_title(parsed_cmd);
+
         let response = client
             .request_permission(
                 ToolCallUpdate {
@@ -765,7 +768,7 @@ impl PromptState {
                     fields: ToolCallUpdateFields {
                         kind: Some(ToolKind::Execute),
                         status: Some(ToolCallStatus::Pending),
-                        title: Some(command.join(" ")),
+                        title: Some(title),
                         content: reason.map(|r| vec![r.into()]),
                         locations: if cwd == std::path::PathBuf::from(".") {
                             None
@@ -841,21 +844,7 @@ impl PromptState {
             output: String::new(),
         });
 
-        let title = parsed_cmd
-            .into_iter()
-            .map(|cmd| match cmd {
-                ParsedCommand::Read { cmd: _, name } => format!("Read {name}"),
-                ParsedCommand::ListFiles { cmd, path } => {
-                    format!("List {}", path.as_ref().unwrap_or(&cmd))
-                }
-                ParsedCommand::Search { cmd, query, path } => match (query, path) {
-                    (Some(query), Some(path)) => format!("Search {query} in {path}"),
-                    (Some(query), None) => format!("Search {query}"),
-                    _ => format!("Search {}", cmd),
-                },
-                ParsedCommand::Unknown { cmd } => format!("Run {cmd}"),
-            })
-            .join(", ");
+        let title = parsed_command_title(parsed_cmd);
 
         let (content, meta) = if client.supports_terminal_output() {
             let content = vec![ToolCallContent::Terminal {
@@ -1043,6 +1032,24 @@ impl PromptState {
                 .await;
         }
     }
+}
+
+fn parsed_command_title(parsed_cmd: Vec<ParsedCommand>) -> String {
+    parsed_cmd
+        .into_iter()
+        .map(|cmd| match cmd {
+            ParsedCommand::Read { cmd: _, name } => format!("Read {name}"),
+            ParsedCommand::ListFiles { cmd, path } => {
+                format!("List {}", path.as_ref().unwrap_or(&cmd))
+            }
+            ParsedCommand::Search { cmd, query, path } => match (query, path) {
+                (Some(query), Some(path)) => format!("Search {query} in {path}"),
+                (Some(query), None) => format!("Search {query}"),
+                _ => format!("Search {}", cmd),
+            },
+            ParsedCommand::Unknown { cmd } => format!("Run {cmd}"),
+        })
+        .join(", ")
 }
 
 struct TaskState {
