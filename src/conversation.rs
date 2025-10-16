@@ -1713,19 +1713,9 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<InputItem> {
             ContentBlock::Text(text_block) => Some(InputItem::Text {
                 text: text_block.text,
             }),
-            ContentBlock::Image(image_block) => {
-                // Convert to data URI if needed
-                if let Some(uri) = image_block.uri {
-                    Some(InputItem::Image { image_url: uri })
-                } else {
-                    // Base64 data
-                    let data_uri =
-                        format!("data:{};base64,{}", image_block.mime_type, image_block.data);
-                    Some(InputItem::Image {
-                        image_url: data_uri,
-                    })
-                }
-            }
+            ContentBlock::Image(image_block) => Some(InputItem::Image {
+                image_url: format!("data:{};base64,{}", image_block.mime_type, image_block.data),
+            }),
             ContentBlock::ResourceLink(ResourceLink {
                 annotations: _,
                 description: _,
