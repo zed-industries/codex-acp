@@ -136,7 +136,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
 
@@ -157,3 +157,110 @@ jobs:
             artifacts/**/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  npm-packages:
+    name: Create NPM Packages
+    needs: [get-version, build]
+    runs-on: ubuntu-latest
+    outputs:
+      packages: ${{ steps.create_packages.outputs.packages }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "lts/*"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Display structure of downloaded files
+        run: ls -la artifacts/
+
+      - name: Create platform-specific packages
+        run: bash npm/publish/create-platform-packages.sh artifacts npm-packages ${{ needs.get-version.outputs.version }}
+
+      - name: Update base package version
+        run: bash npm/publish/update-base-package.sh ${{ needs.get-version.outputs.version }}
+
+      - name: Upload NPM packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-packages
+          path: npm-packages/
+          retention-days: 1
+
+      - name: Upload base package
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-base-package
+          path: npm/
+          retention-days: 1
+
+  publish-npm-platform:
+    name: Publish NPM Platform Packages
+    needs: [get-version, npm-packages]
+    runs-on: ubuntu-latest
+    if: ${{ !github.event.repository.fork }}
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "lts/*"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download NPM packages
+        uses: actions/download-artifact@v5
+        with:
+          name: npm-packages
+          path: npm-packages
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for pkg in npm-packages/*; do
+            if [ -d "$pkg" ]; then
+              echo "Publishing $(basename $pkg)..."
+              cd "$pkg"
+              npm publish --access public || true
+              cd ../..
+            fi
+          done
+
+  publish-npm-base:
+    name: Publish NPM Base Package
+    needs: [get-version, npm-packages, publish-npm-platform]
+    runs-on: ubuntu-latest
+    if: ${{ !github.event.repository.fork }}
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "lts/*"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download base package
+        uses: actions/download-artifact@v5
+        with:
+          name: npm-base-package
+          path: npm
+
+      - name: Wait for platform packages to be available
+        run: |
+          echo "Waiting 30 seconds for platform packages to be available on npm..."
+          sleep 30
+
+      - name: Publish base package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd npm
+          npm publish --access public
