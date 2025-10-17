@@ -113,7 +113,7 @@ impl Agent for CodexAgent {
                 meta: None,
             },
             mcp_capabilities: McpCapabilities {
-                http: false,
+                http: true,
                 sse: false,
                 meta: None,
             },
