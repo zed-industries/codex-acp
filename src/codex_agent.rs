@@ -207,17 +207,19 @@ impl Agent for CodexAgent {
             match mcp_server {
                 // Not supported in codex
                 McpServer::Sse { .. } => {}
-                McpServer::Http {
-                    name,
-                    url,
-                    headers: _,
-                } => {
+                McpServer::Http { name, url, headers } => {
                     config.mcp_servers.insert(
                         name,
                         McpServerConfig {
                             transport: McpServerTransportConfig::StreamableHttp {
                                 url,
                                 bearer_token_env_var: None,
+                                http_headers: if headers.is_empty() {
+                                    None
+                                } else {
+                                    Some(headers.into_iter().map(|h| (h.name, h.value)).collect())
+                                },
+                                env_http_headers: None,
                             },
                             enabled: true,
                             startup_timeout_sec: None,
@@ -242,6 +244,8 @@ impl Agent for CodexAgent {
                                 } else {
                                     Some(env.into_iter().map(|env| (env.name, env.value)).collect())
                                 },
+                                env_vars: vec![],
+                                cwd: Some(cwd.clone()),
                             },
                             enabled: true,
                             startup_timeout_sec: None,

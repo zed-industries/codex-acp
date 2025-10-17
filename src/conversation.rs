@@ -1038,7 +1038,11 @@ fn parsed_command_title(parsed_cmd: Vec<ParsedCommand>) -> String {
     parsed_cmd
         .into_iter()
         .map(|cmd| match cmd {
-            ParsedCommand::Read { cmd: _, name } => format!("Read {name}"),
+            ParsedCommand::Read {
+                cmd: _,
+                name,
+                path: _,
+            } => format!("Read {name}"),
             ParsedCommand::ListFiles { cmd, path } => {
                 format!("List {}", path.as_ref().unwrap_or(&cmd))
             }
