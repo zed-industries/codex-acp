@@ -2,7 +2,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     ops::DerefMut,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, LazyLock, Mutex},
 };
@@ -268,7 +268,9 @@ impl CustomPromptsState {
 struct ActiveCommand {
     call_id: String,
     tool_call_id: ToolCallId,
+    terminal_output: bool,
     output: String,
+    file_extension: Option<String>,
 }
 
 struct PromptState {
@@ -753,31 +755,34 @@ impl PromptState {
 
         // Create a new tool call for the command execution
         let tool_call_id = ToolCallId(call_id.clone().into());
+        let ParseCommandToolCall {
+            title,
+            terminal_output,
+            file_extension,
+            locations,
+            kind,
+        } = parse_command_tool_call(parsed_cmd, &cwd);
         self.active_command = Some(ActiveCommand {
             call_id,
+            terminal_output,
             tool_call_id: tool_call_id.clone(),
             output: String::new(),
+            file_extension,
         });
-
-        let title = parsed_command_title(parsed_cmd);
 
         let response = client
             .request_permission(
                 ToolCallUpdate {
                     id: tool_call_id,
                     fields: ToolCallUpdateFields {
-                        kind: Some(ToolKind::Execute),
+                        kind: Some(kind),
                         status: Some(ToolCallStatus::Pending),
                         title: Some(title),
                         content: reason.map(|r| vec![r.into()]),
-                        locations: if cwd == std::path::PathBuf::from(".") {
+                        locations: if locations.is_empty() {
                             None
                         } else {
-                            Some(vec![ToolCallLocation {
-                                path: cwd.clone(),
-                                line: None,
-                                meta: None,
-                            }])
+                            Some(locations)
                         },
                         raw_input: Some(raw_input),
                         raw_output: None,
@@ -837,16 +842,23 @@ impl PromptState {
         } = event;
         // Create a new tool call for the command execution
         let tool_call_id = ToolCallId(call_id.clone().into());
+        let ParseCommandToolCall {
+            title,
+            file_extension,
+            locations,
+            terminal_output,
+            kind,
+        } = parse_command_tool_call(parsed_cmd, &cwd);
 
-        self.active_command = Some(ActiveCommand {
+        let active_command = ActiveCommand {
             call_id: call_id.clone(),
             tool_call_id: tool_call_id.clone(),
             output: String::new(),
-        });
+            file_extension,
+            terminal_output,
+        };
 
-        let title = parsed_command_title(parsed_cmd);
-
-        let (content, meta) = if client.supports_terminal_output() {
+        let (content, meta) = if client.supports_terminal_output(&active_command) {
             let content = vec![ToolCallContent::Terminal {
                 terminal_id: TerminalId(call_id.clone().into()),
             }];
@@ -860,23 +872,16 @@ impl PromptState {
         } else {
             (vec![], None)
         };
+        self.active_command = Some(active_command);
 
         client
             .send_notification(SessionUpdate::ToolCall(ToolCall {
                 id: tool_call_id,
                 title,
-                kind: ToolKind::Execute,
+                kind,
                 status: ToolCallStatus::InProgress,
                 content,
-                locations: if cwd == std::path::PathBuf::from(".") {
-                    vec![]
-                } else {
-                    vec![ToolCallLocation {
-                        path: cwd.clone(),
-                        line: None,
-                        meta: None,
-                    }]
-                },
+                locations,
                 raw_input: Some(raw_input),
                 raw_output: None,
                 meta,
@@ -900,7 +905,7 @@ impl PromptState {
         {
             let data_str = String::from_utf8_lossy(&chunk).to_string();
 
-            let (fields, meta) = if client.supports_terminal_output() {
+            let (fields, meta) = if client.supports_terminal_output(active_command) {
                 let meta = Some(serde_json::json!({
                     "terminal_output": {
                         "terminal_id": call_id,
@@ -910,15 +915,20 @@ impl PromptState {
                 (ToolCallUpdateFields::default(), meta)
             } else {
                 active_command.output.push_str(&data_str);
+                let content = match active_command.file_extension.as_deref() {
+                    Some("md") => active_command.output.clone(),
+                    Some(ext) => format!(
+                        "```{ext}\n{}\n```\n",
+                        active_command.output.trim_end_matches('\n')
+                    ),
+                    None => format!(
+                        "```sh\n{}\n```\n",
+                        active_command.output.trim_end_matches('\n')
+                    ),
+                };
                 (
                     ToolCallUpdateFields {
-                        content: Some(vec![
-                            format!(
-                                "```sh\n{}\n```\n",
-                                active_command.output.trim_end_matches('\n')
-                            )
-                            .into(),
-                        ]),
+                        content: Some(vec![content.into()]),
                         ..Default::default()
                     },
                     None,
@@ -951,7 +961,7 @@ impl PromptState {
         {
             let is_success = exit_code == 0;
 
-            let meta = client.supports_terminal_output().then(|| {
+            let meta = (client.supports_terminal_output(&active_command)).then(|| {
                 serde_json::json!({
                     "terminal_exit": {
                         "terminal_id": call_id,
@@ -1034,26 +1044,72 @@ impl PromptState {
     }
 }
 
-fn parsed_command_title(parsed_cmd: Vec<ParsedCommand>) -> String {
-    parsed_cmd
-        .into_iter()
-        .map(|cmd| match cmd {
-            ParsedCommand::Read {
-                cmd: _,
-                name,
-                path: _,
-            } => format!("Read {name}"),
-            ParsedCommand::ListFiles { cmd, path } => {
-                format!("List {}", path.as_ref().unwrap_or(&cmd))
+struct ParseCommandToolCall {
+    title: String,
+    file_extension: Option<String>,
+    terminal_output: bool,
+    locations: Vec<ToolCallLocation>,
+    kind: ToolKind,
+}
+
+fn parse_command_tool_call(parsed_cmd: Vec<ParsedCommand>, cwd: &Path) -> ParseCommandToolCall {
+    let mut titles = Vec::new();
+    let mut locations = Vec::new();
+    let mut file_extension = None;
+    let mut terminal_output = false;
+    let mut kind = ToolKind::Execute;
+
+    for cmd in parsed_cmd {
+        let mut cmd_path = None;
+        match cmd {
+            ParsedCommand::Read { cmd: _, name, path } => {
+                titles.push(format!("Read {name}"));
+                file_extension = path
+                    .extension()
+                    .map(|ext| ext.to_string_lossy().to_string());
+                cmd_path = Some(path);
+                kind = ToolKind::Read;
             }
-            ParsedCommand::Search { cmd, query, path } => match (query, path) {
-                (Some(query), Some(path)) => format!("Search {query} in {path}"),
-                (Some(query), None) => format!("Search {query}"),
-                _ => format!("Search {}", cmd),
-            },
-            ParsedCommand::Unknown { cmd } => format!("Run {cmd}"),
-        })
-        .join(", ")
+            ParsedCommand::ListFiles { cmd, path } => {
+                titles.push(format!("List {}", path.as_ref().unwrap_or(&cmd)));
+                cmd_path = path.map(PathBuf::from);
+                kind = ToolKind::Search;
+            }
+            ParsedCommand::Search { cmd, query, path } => {
+                titles.push(match (query, path.as_ref()) {
+                    (Some(query), Some(path)) => format!("Search {query} in {path}"),
+                    (Some(query), None) => format!("Search {query}"),
+                    _ => format!("Search {}", cmd),
+                });
+                cmd_path = path.map(PathBuf::from);
+                kind = ToolKind::Search;
+            }
+            ParsedCommand::Unknown { cmd } => {
+                titles.push(format!("Run {cmd}"));
+                terminal_output = true;
+            }
+        }
+
+        if let Some(path) = cmd_path {
+            locations.push(ToolCallLocation {
+                path: if path.is_relative() {
+                    cwd.join(&path)
+                } else {
+                    path
+                },
+                line: None,
+                meta: None,
+            });
+        }
+    }
+
+    ParseCommandToolCall {
+        title: titles.join(", "),
+        file_extension,
+        terminal_output,
+        locations,
+        kind,
+    }
 }
 
 struct TaskState {
@@ -1174,16 +1230,18 @@ impl SessionClient {
         }
     }
 
-    fn supports_terminal_output(&self) -> bool {
-        self.client_capabilities
-            .lock()
-            .unwrap()
-            .meta
-            .as_ref()
-            .is_some_and(|v| {
-                v.get("terminal_output")
-                    .is_some_and(|v| v.as_bool().unwrap_or_default())
-            })
+    fn supports_terminal_output(&self, active_command: &ActiveCommand) -> bool {
+        active_command.terminal_output
+            && self
+                .client_capabilities
+                .lock()
+                .unwrap()
+                .meta
+                .as_ref()
+                .is_some_and(|v| {
+                    v.get("terminal_output")
+                        .is_some_and(|v| v.as_bool().unwrap_or_default())
+                })
     }
 
     async fn send_notification(&self, update: SessionUpdate) {
