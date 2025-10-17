@@ -1070,8 +1070,13 @@ fn parse_command_tool_call(parsed_cmd: Vec<ParsedCommand>, cwd: &Path) -> ParseC
                 cmd_path = Some(path);
                 kind = ToolKind::Read;
             }
-            ParsedCommand::ListFiles { cmd, path } => {
-                titles.push(format!("List {}", path.as_ref().unwrap_or(&cmd)));
+            ParsedCommand::ListFiles { cmd: _, path } => {
+                let dir = if let Some(path) = path.as_ref() {
+                    &cwd.join(path)
+                } else {
+                    cwd
+                };
+                titles.push(format!("List {}", dir.display()));
                 cmd_path = path.map(PathBuf::from);
                 kind = ToolKind::Search;
             }
