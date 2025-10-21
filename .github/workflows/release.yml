@@ -127,37 +127,6 @@ jobs:
           path: ${{ steps.create_archive.outputs.archive_path }}
           retention-days: 1
 
-  create-release:
-    name: Create Release
-    needs: [get-version, build]
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v5
-        with:
-          path: artifacts
-
-      - name: Display structure of downloaded files
-        run: ls -la artifacts/
-
-      - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ needs.get-version.outputs.tag_name }}
-          name: Release ${{ needs.get-version.outputs.version }}
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-          files: |
-            artifacts/**/*.tar.gz
-            artifacts/**/*.zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
   npm-packages:
     name: Create NPM Packages
     needs: [get-version, build]
@@ -264,3 +233,34 @@ jobs:
         run: |
           cd npm
           npm publish --access public
+
+  create-release:
+    name: Create Release
+    needs: [get-version, build, publish-npm-base]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Display structure of downloaded files
+        run: ls -la artifacts/
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.get-version.outputs.tag_name }}
+          name: Release ${{ needs.get-version.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
-const { spawnSync } = require("node:child_process");
-const { existsSync } = require("node:fs");
-const path = require("node:path");
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join, dirname } from "node:path";
 
 // Map Node.js platform/arch to package names
 function getPlatformPackage() {
@@ -42,12 +42,13 @@ function getPlatformPackage() {
 // Locate the binary
 function getBinaryPath() {
   const packageName = getPlatformPackage();
-  const binaryName = process.platform === "win32" ? "codex-acp.exe" : "codex-acp";
+  const binaryName =
+    process.platform === "win32" ? "codex-acp.exe" : "codex-acp";
 
   try {
     // Try to resolve the platform-specific package
     const packagePath = require.resolve(`${packageName}/package.json`);
-    const binaryPath = path.join(path.dirname(packagePath), "bin", binaryName);
+    const binaryPath = join(dirname(packagePath), "bin", binaryName);
 
     if (existsSync(binaryPath)) {
       return binaryPath;
@@ -57,7 +58,7 @@ function getBinaryPath() {
   }
 
   console.error(
-    `Failed to locate ${packageName} binary. This usually means the optional dependency was not installed.`
+    `Failed to locate ${packageName} binary. This usually means the optional dependency was not installed.`,
   );
   console.error(`Platform: ${process.platform}, Architecture: ${process.arch}`);
   process.exit(1);

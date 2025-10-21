@@ -1,6 +1,6 @@
 {
-  "name": "codex-acp",
-  "version": "0.2.9",
+  "name": "@zed-industries/codex-acp",
+  "version": "0.3.1",
   "description": "An ACP-compatible coding agent powered by Codex",
   "license": "Apache-2.0",
   "author": "Zed <hi@zed.dev>",
@@ -27,11 +27,11 @@
     "bin"
   ],
   "optionalDependencies": {
-    "codex-acp-darwin-arm64": "0.2.9",
-    "codex-acp-darwin-x64": "0.2.9",
-    "codex-acp-linux-arm64": "0.2.9",
-    "codex-acp-linux-x64": "0.2.9",
-    "codex-acp-windows-arm64": "0.2.9",
-    "codex-acp-windows-x64": "0.2.9"
+    "codex-acp-darwin-arm64": "0.3.1",
+    "codex-acp-darwin-x64": "0.3.1",
+    "codex-acp-linux-arm64": "0.3.1",
+    "codex-acp-linux-x64": "0.3.1",
+    "codex-acp-windows-arm64": "0.3.1",
+    "codex-acp-windows-x64": "0.3.1"
   }
 }
