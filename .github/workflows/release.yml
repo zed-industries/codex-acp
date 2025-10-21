@@ -177,6 +177,10 @@ jobs:
     needs: [get-version, npm-packages]
     runs-on: ubuntu-latest
     if: ${{ !github.event.repository.fork }}
+    environment: release # Optional: for enhanced security
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - name: Setup Node.js
@@ -184,6 +188,8 @@ jobs:
         with:
           node-version: "lts/*"
           registry-url: "https://registry.npmjs.org"
+      - name: Update npm
+        run: npm install -g npm@latest
 
       - name: Download NPM packages
         uses: actions/download-artifact@v5
@@ -192,14 +198,12 @@ jobs:
           path: npm-packages
 
       - name: Publish platform packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for pkg in npm-packages/*; do
             if [ -d "$pkg" ]; then
               echo "Publishing $(basename $pkg)..."
               cd "$pkg"
-              npm publish --access public || true
+              npm publish
               cd ../..
             fi
           done
@@ -209,6 +213,10 @@ jobs:
     needs: [get-version, npm-packages, publish-npm-platform]
     runs-on: ubuntu-latest
     if: ${{ !github.event.repository.fork }}
+    environment: release # Optional: for enhanced security
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - name: Setup Node.js
@@ -216,6 +224,8 @@ jobs:
         with:
           node-version: "lts/*"
           registry-url: "https://registry.npmjs.org"
+      - name: Update npm
+        run: npm install -g npm@latest
 
       - name: Download base package
         uses: actions/download-artifact@v5
@@ -229,11 +239,9 @@ jobs:
           sleep 30
 
       - name: Publish base package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd npm
-          npm publish --access public
+          npm publish
 
   create-release:
     name: Create Release
