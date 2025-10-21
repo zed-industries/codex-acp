@@ -9,6 +9,9 @@
     "type": "git",
     "url": "git+https://github.com/zed-industries/codex-acp.git"
   },
+  "bin": {
+    "${PACKAGE_NAME}": "bin/codex-acp"
+  },
   "os": [
     "${OS}"
   ],

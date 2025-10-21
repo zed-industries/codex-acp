@@ -76,6 +76,13 @@ for target in "${!platforms[@]}"; do
 
   envsubst < "$TEMPLATE_PATH" > "${pkg_dir}/package.json"
 
+  # Update bin field for Windows to include .exe extension
+  if [[ "$os" == "windows" ]]; then
+    # Use sed to update the bin path in package.json
+    sed -i.bak 's|"bin/codex-acp"|"bin/codex-acp.exe"|' "${pkg_dir}/package.json"
+    rm "${pkg_dir}/package.json.bak"
+  fi
+
   echo "   ✓ Created package: ${pkg_name}"
 done
 
