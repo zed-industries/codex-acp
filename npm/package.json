@@ -1,6 +1,7 @@
 {
   "name": "@zed-industries/codex-acp",
   "version": "0.3.3",
+  "type": "module",
   "description": "An ACP-compatible coding agent powered by Codex",
   "license": "Apache-2.0",
   "author": "Zed <hi@zed.dev>",

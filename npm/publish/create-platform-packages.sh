@@ -62,7 +62,7 @@ for target in "${!platforms[@]}"; do
   fi
 
   # Make binary executable (important for Unix-like systems)
-  chmod +x "${pkg_dir}/bin/codex-acp${ext}" 2>/dev/null || true
+  chmod +x "${pkg_dir}/bin/codex-acp${ext}" 2>/dev/null || echo "Failed to make binary executable"
 
   # Create package.json from template
   export PACKAGE_NAME="$pkg_name"
