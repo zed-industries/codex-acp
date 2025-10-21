@@ -1,6 +1,6 @@
 [package]
 name = "codex-acp"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2024"
 authors = ["Zed <hi@zed.dev>"]
 license = "Apache-2.0"
