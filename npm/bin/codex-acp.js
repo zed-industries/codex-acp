@@ -36,7 +36,7 @@ function getPlatformPackage() {
     process.exit(1);
   }
 
-  return packageName;
+  return `@zed-industries/${packageName}`;
 }
 
 // Locate the binary
