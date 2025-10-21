@@ -7,10 +7,10 @@
   "homepage": "https://github.com/zed-industries/codex-acp",
   "repository": {
     "type": "git",
-    "url": "https://github.com/zed-industries/codex-acp"
+    "url": "git+https://github.com/zed-industries/codex-acp.git"
   },
   "bin": {
-    "codex-acp": "./bin/codex-acp"
+    "codex-acp": "bin/codex-acp"
   },
   "os": [
     "${OS}"
