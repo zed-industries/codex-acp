@@ -3,6 +3,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { createRequire } from "node:module";
 
 // Map Node.js platform/arch to package names
 function getPlatformPackage() {
@@ -47,6 +48,7 @@ function getBinaryPath() {
 
   try {
     // Try to resolve the platform-specific package
+    const require = createRequire(import.meta.url);
     const packagePath = require.resolve(`${packageName}/package.json`);
     const binaryPath = join(dirname(packagePath), "bin", binaryName);
 
@@ -54,6 +56,7 @@ function getBinaryPath() {
       return binaryPath;
     }
   } catch (e) {
+    console.error(`Error resolving package: ${e}`);
     // Package not found
   }
 
