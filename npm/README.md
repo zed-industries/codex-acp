@@ -1,67 +1,61 @@
-# NPM Publishing
+# ACP adapter for Codex
 
-This directory contains the setup for publishing `codex-acp` to npm as a native binary package.
+Use [Codex](https://github.com/openai/codex) from [ACP-compatible](https://agentclientprotocol.com) clients such as [Zed](https://zed.dev)!
 
-## Architecture
+This tool implements an ACP adapter around the Codex CLI, supporting:
 
-The npm distribution follows the pattern described in [Packaging Rust for npm](https://blog.orhun.dev/packaging-rust-for-npm/):
+- Context @-mentions
+- Images
+- Tool calls (with permission requests)
+- Following
+- Edit review
+- TODO lists
+- Slash commands:
+  - /review (with optional instructions)
+  - /review-branch
+  - /review-commit
+  - /init
+  - /compact
+  - /logout
+  - Custom Prompts
+- Client MCP servers
+- Auth Methods:
+  - ChatGPT subscription (requires paid subscription and doesn't work in remote projects)
+  - CODEX_API_KEY
+  - OPENAI_API_KEY
 
-1. **Platform-specific packages**: Each supported platform gets its own npm package containing the compiled binary
-   - `codex-acp-darwin-arm64` (macOS Apple Silicon)
-   - `codex-acp-darwin-x64` (macOS Intel)
-   - `codex-acp-linux-arm64` (Linux ARM64)
-   - `codex-acp-linux-x64` (Linux x64)
-   - `codex-acp-windows-arm64` (Windows ARM64)
-   - `codex-acp-windows-x64` (Windows x64)
+Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
-2. **Base package** (`codex-acp`): The main package that:
-   - Declares all platform packages as `optionalDependencies`
-   - Provides a Node.js wrapper script that locates and executes the correct binary
-   - Users install this package, and npm automatically installs the right platform package
+## How to use
 
-### Manual Testing
+### Zed
 
-To test the package structure locally:
+The latest version of Zed can already use this adapter out of the box.
 
-```bash
-# Build a release binary
-cargo build --release
+To use Codex, open the Agent Panel and click "New Codex Thread" from the `+` button menu in the top-right.
 
-# Create a test package
-mkdir -p test-npm/codex-acp-darwin-arm64/bin
-cp target/release/codex-acp test-npm/codex-acp-darwin-arm64/bin/
-export PACKAGE_NAME="codex-acp-darwin-arm64"
-export VERSION="0.2.9"
-export OS="darwin"
-export ARCH="arm64"
-envsubst < npm/template/package.json > test-npm/codex-acp-darwin-arm64/package.json
+Read the docs on [External Agent](https://zed.dev/docs/ai/external-agents) support.
 
-# Test the wrapper
-cd npm
-npm link ../test-npm/codex-acp-darwin-arm64
-npm link
-codex-acp --help
+### Other clients
+
+[Submit a PR](https://github.com/zed-industries/codex-acp/pulls) to add yours!
+
+#### Installation
+
+Install the adapter from the latest release for your architecture and OS: https://github.com/zed-industries/codex-acp/releases
+
+You can then use `codex-acp` as a regular ACP agent:
+
+```
+OPENAI_API_KEY=sk-... codex-acp
 ```
 
-## Usage
+Or via npm:
 
-After publishing, users can install and use the package:
-
-```bash
-# Install globally
-npm install -g codex-acp
-
-# Or run directly with npx
-npx codex-acp
-
-# Use in a project
-npm install codex-acp
-npx codex-acp
+```
+npx @zed-industries/codex-acp
 ```
 
-## Version Management
+## License
 
-Version must be kept in sync between:
-
-- `Cargo.toml` - Source of truth
-- `npm/package.json` - Updated during release workflow
+Apache-2.0
