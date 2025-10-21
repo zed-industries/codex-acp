@@ -152,7 +152,7 @@ jobs:
         run: ls -la artifacts/
 
       - name: Create platform-specific packages
-        run: bash npm/publish/create-platform-packages.sh artifacts npm-packages ${{ needs.get-version.outputs.version }}
+        run: bash npm/publish/create-platform-packages.sh ./artifacts ./npm-packages ${{ needs.get-version.outputs.version }}
 
       - name: Update base package version
         run: bash npm/publish/update-base-package.sh ${{ needs.get-version.outputs.version }}
