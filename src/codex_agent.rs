@@ -175,6 +175,11 @@ impl Agent for CodexAgent {
                 codex_login::login_with_api_key(&self.config.codex_home, &api_key)
                     .map_err(Error::into_internal_error)?;
             }
+            CodexAuthMethod::CustomModelProvider => {
+                // For custom model provider, we assume the user has already set up their credentials
+                // via environment variables or config files as needed.
+                info!("Assuming custom model provider is set up correctly.");
+            }
         }
 
         self.auth_manager.reload();
@@ -372,6 +377,7 @@ enum CodexAuthMethod {
     ChatGpt,
     CodexApiKey,
     OpenAiApiKey,
+    CustomModelProvider,
 }
 
 impl From<CodexAuthMethod> for AuthMethodId {
@@ -381,6 +387,7 @@ impl From<CodexAuthMethod> for AuthMethodId {
                 CodexAuthMethod::ChatGpt => "chatgpt",
                 CodexAuthMethod::CodexApiKey => "codex-api-key",
                 CodexAuthMethod::OpenAiApiKey => "openai-api-key",
+                CodexAuthMethod::CustomModelProvider => "custom-model-provider",
             }
             .into(),
         )
@@ -415,6 +422,12 @@ impl From<CodexAuthMethod> for AuthMethod {
                 )),
                 meta: None,
             },
+            CodexAuthMethod::CustomModelProvider => Self {
+                id: method.into(),
+                name: "Use Custom Model Provider".into(),
+                description: Some("Requires setting up a custom model provider.".into()),
+                meta: None,
+            },
         }
     }
 }
@@ -427,6 +440,7 @@ impl TryFrom<AuthMethodId> for CodexAuthMethod {
             "chatgpt" => Ok(CodexAuthMethod::ChatGpt),
             "codex-api-key" => Ok(CodexAuthMethod::CodexApiKey),
             "openai-api-key" => Ok(CodexAuthMethod::OpenAiApiKey),
+            "custom-model-provider" => Ok(CodexAuthMethod::CustomModelProvider),
             _ => Err(Error::invalid_params().with_data("unsupported authentication method")),
         }
     }

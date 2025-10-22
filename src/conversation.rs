@@ -280,6 +280,10 @@ struct PromptState {
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     submission_id: String,
+    // Whether we've already received streaming deltas for the agent message
+    saw_agent_message_delta: bool,
+    // Whether we've already received streaming deltas for the agent reasoning
+    saw_agent_reasoning_delta: bool,
 }
 
 impl PromptState {
@@ -295,6 +299,8 @@ impl PromptState {
             event_count: 0,
             response_tx: Some(response_tx),
             submission_id,
+            saw_agent_message_delta: false,
+            saw_agent_reasoning_delta: false,
         }
     }
 
@@ -350,17 +356,41 @@ impl PromptState {
                 info!("User message {kind:?} echoed: {message:?}");
             }
             EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
-                // Send this to the client via session/update notification
-                info!("Agent message received: {delta:?}");
+                // Mark that we've seen deltas for the agent message and send the chunk.
+                // When deltas are emitted we will skip the eventual non-streaming
+                // `AgentMessage` to avoid sending duplicated content to the client.
+                self.saw_agent_message_delta = true;
+                info!("Agent message delta received: {delta:?}");
                 client.send_agent_text(delta).await;
+            }
+            EventMsg::AgentMessage(AgentMessageEvent { message, .. }) => {
+                // If we already received deltas for this submission, skip the final
+                // full message to avoid double-sending the same content.
+                if self.saw_agent_message_delta {
+                    info!("Skipping final AgentMessage because deltas were streamed");
+                } else {
+                    info!("Agent message (non-delta) received: {message:?}");
+                    client.send_agent_text(message).await;
+                }
             }
             EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent { delta })
             | EventMsg::AgentReasoningRawContentDelta(AgentReasoningRawContentDeltaEvent {
                 delta,
             }) => {
-                // Send this to the client via session/update notification
-                info!("Agent reasoning message received: {:?}", delta);
+                // Mark that we've seen deltas for agent reasoning and send the chunk.
+                // If reasoning deltas are used we will skip the non-streaming
+                // `AgentReasoning` event to avoid duplicating content.
+                self.saw_agent_reasoning_delta = true;
+                info!("Agent reasoning delta received: {:?}", delta);
                 client.send_agent_thought(delta).await;
+            }
+            EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
+                if self.saw_agent_reasoning_delta {
+                    info!("Skipping final AgentReasoning because deltas were streamed");
+                } else {
+                    info!("Agent reasoning (non-delta) received: {:?}", text);
+                    client.send_agent_thought(text).await;
+                }
             }
             EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {}) => {
                 // Make sure the section heading actually get spacing
@@ -433,6 +463,13 @@ impl PromptState {
                 info!(
                     "Task completed successfully after {} events. Last agent message: {last_agent_message:?}", self.event_count
                 );
+                // If the model provided a final agent message with the TaskComplete
+                // event, forward it as an AgentMessageChunk so clients receive the
+                // content even if no deltas or AgentMessage events were emitted.
+                if let Some(message) = last_agent_message {
+                    client.send_agent_text(message).await;
+                }
+
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
@@ -499,9 +536,7 @@ impl PromptState {
             }
 
             // Since we are getting the deltas, we can ignore these events
-            EventMsg::AgentReasoning(..)
-            | EventMsg::AgentReasoningRawContent(..)
-            | EventMsg::AgentMessage(..)
+            EventMsg::AgentReasoningRawContent(..)
             // In the future we can use this to update usage stats
             | EventMsg::TokenCount(..)
             // we already have a way to diff the turn, so ignore
@@ -1559,9 +1594,8 @@ impl<A: Auth> ConversationActor<A> {
         let current_model_id = self
             .find_model_preset()
             .map(|preset| ModelId(preset.id.into()))
-            .ok_or_else(|| {
-                anyhow::anyhow!("No valid model preset for model {}", self.config.model)
-            })?;
+            // Fallback to configured model id if no preset found to avoid failing session load.
+            .unwrap_or_else(|| ModelId(self.config.model.clone().into()));
 
         let available_models = self
             .model_presets
