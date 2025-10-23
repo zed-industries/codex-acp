@@ -31,11 +31,11 @@ use codex_core::{
         AgentReasoningRawContentDeltaEvent, AgentReasoningSectionBreakEvent,
         ApplyPatchApprovalRequestEvent, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent,
         ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent,
-        ExitedReviewModeEvent, FileChange, InputItem, ListCustomPromptsResponseEvent,
-        McpInvocation, McpToolCallBeginEvent, McpToolCallEndEvent, Op, PatchApplyBeginEvent,
-        PatchApplyEndEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest, StreamErrorEvent,
-        TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent, UserMessageEvent,
-        ViewImageToolCallEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        ExitedReviewModeEvent, FileChange, ItemCompletedEvent, ItemStartedEvent,
+        ListCustomPromptsResponseEvent, McpInvocation, McpToolCallBeginEvent, McpToolCallEndEvent,
+        Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReviewDecision, ReviewOutputEvent,
+        ReviewRequest, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent,
+        UserMessageEvent, ViewImageToolCallEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
 };
@@ -44,6 +44,7 @@ use codex_protocol::{
     custom_prompts::CustomPrompt,
     parse_command::ParsedCommand,
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
+    user_input::UserInput,
 };
 use itertools::Itertools;
 use mcp_types::CallToolResult;
@@ -348,6 +349,10 @@ impl PromptState {
             }) => {
                 info!("Task started with context window of {model_context_window:?}");
             }
+            EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
+
+                info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
+            }
             EventMsg::UserMessage(UserMessageEvent {
                 message,
                 kind,
@@ -356,11 +361,12 @@ impl PromptState {
                 info!("User message {kind:?} echoed: {message:?}");
             }
             EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
+                // Send this to the client via session/update notification
+                info!("Agent message delta received: {delta:?}");
                 // Mark that we've seen deltas for the agent message and send the chunk.
                 // When deltas are emitted we will skip the eventual non-streaming
                 // `AgentMessage` to avoid sending duplicated content to the client.
                 self.saw_agent_message_delta = true;
-                info!("Agent message delta received: {delta:?}");
                 client.send_agent_text(delta).await;
             }
             EventMsg::AgentMessage(AgentMessageEvent { message, .. }) => {
@@ -377,11 +383,12 @@ impl PromptState {
             | EventMsg::AgentReasoningRawContentDelta(AgentReasoningRawContentDeltaEvent {
                 delta,
             }) => {
+                // Send this to the client via session/update notification
+                info!("Agent reasoning message delta received: {:?}", delta);
                 // Mark that we've seen deltas for agent reasoning and send the chunk.
                 // If reasoning deltas are used we will skip the non-streaming
                 // `AgentReasoning` event to avoid duplicating content.
                 self.saw_agent_reasoning_delta = true;
-                info!("Agent reasoning delta received: {:?}", delta);
                 client.send_agent_thought(delta).await;
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
@@ -459,17 +466,13 @@ impl PromptState {
                 info!("Patch apply end: call_id={}, success={}", event.call_id, event.success);
                 self.end_patch_apply(client, event).await;
             }
+            EventMsg::ItemCompleted(ItemCompletedEvent { thread_id, turn_id, item }) => {
+                info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
+            }
             EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message}) => {
                 info!(
                     "Task completed successfully after {} events. Last agent message: {last_agent_message:?}", self.event_count
                 );
-                // If the model provided a final agent message with the TaskComplete
-                // event, forward it as an AgentMessageChunk so clients receive the
-                // content even if no deltas or AgentMessage events were emitted.
-                if let Some(message) = last_agent_message {
-                    client.send_agent_text(message).await;
-                }
-
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
@@ -1205,6 +1208,8 @@ impl TaskState {
             }
             // Expected but ignored
             EventMsg::TaskStarted(..)
+            | EventMsg::ItemStarted(..)
+            | EventMsg::ItemCompleted(..)
             | EventMsg::TokenCount(..)
             | EventMsg::AgentMessageDelta(..)
             | EventMsg::AgentReasoningDelta(..)
@@ -1642,7 +1647,7 @@ impl<A: Auth> ConversationActor<A> {
                 "compact" => op = Op::Compact,
                 "init" => {
                     op = Op::UserInput {
-                        items: vec![InputItem::Text {
+                        items: vec![UserInput::Text {
                             text: INIT_COMMAND_PROMPT.into(),
                         }],
                     }
@@ -1699,7 +1704,7 @@ impl<A: Auth> ConversationActor<A> {
                             .map_err(|e| Error::invalid_params().with_data(e.user_message()))?
                     {
                         op = Op::UserInput {
-                            items: vec![InputItem::Text { text: prompt }],
+                            items: vec![UserInput::Text { text: prompt }],
                         }
                     } else {
                         op = Op::UserInput { items }
@@ -1799,14 +1804,14 @@ impl<A: Auth> ConversationActor<A> {
     }
 }
 
-fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<InputItem> {
+fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<UserInput> {
     prompt
         .into_iter()
         .filter_map(|block| match block {
-            ContentBlock::Text(text_block) => Some(InputItem::Text {
+            ContentBlock::Text(text_block) => Some(UserInput::Text {
                 text: text_block.text,
             }),
-            ContentBlock::Image(image_block) => Some(InputItem::Image {
+            ContentBlock::Image(image_block) => Some(UserInput::Image {
                 image_url: format!("data:{};base64,{}", image_block.mime_type, image_block.data),
             }),
             ContentBlock::ResourceLink(ResourceLink {
@@ -1818,7 +1823,7 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<InputItem> {
                 title: _,
                 uri,
                 meta: _,
-            }) => Some(InputItem::Text {
+            }) => Some(UserInput::Text {
                 text: format_uri_as_link(Some(name), uri),
             }),
             ContentBlock::Resource(EmbeddedResource {
@@ -1831,7 +1836,7 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<InputItem> {
                         meta: _,
                     }),
                 meta: _,
-            }) => Some(InputItem::Text {
+            }) => Some(UserInput::Text {
                 text: format!(
                     "{}\n<context ref=\"{uri}\">\n${text}\n</context>",
                     format_uri_as_link(None, uri.clone())
@@ -1994,9 +1999,9 @@ fn extract_tool_call_content_from_changes(
 }
 
 /// Checks if a prompt is slash command
-fn extract_slash_command(content: &[InputItem]) -> Option<(&str, &str)> {
+fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
     let line = content.first().and_then(|block| match block {
-        InputItem::Text { text, .. } => Some(text),
+        UserInput::Text { text, .. } => Some(text),
         _ => None,
     })?;
 
@@ -2137,7 +2142,7 @@ mod tests {
         assert_eq!(
             ops.as_slice(),
             &[Op::UserInput {
-                items: vec![InputItem::Text {
+                items: vec![UserInput::Text {
                     text: INIT_COMMAND_PROMPT.to_string()
                 }]
             }],
@@ -2414,7 +2419,7 @@ mod tests {
         assert_eq!(
             ops.as_slice(),
             &[Op::UserInput {
-                items: vec![InputItem::Text {
+                items: vec![UserInput::Text {
                     text: "Custom prompt with foo arg.".into()
                 }]
             }],
@@ -2497,7 +2502,7 @@ mod tests {
                     let prompt = items
                         .into_iter()
                         .map(|i| match i {
-                            InputItem::Text { text } => text,
+                            UserInput::Text { text } => text,
                             _ => unimplemented!(),
                         })
                         .join("\n");

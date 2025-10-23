@@ -1,0 +1,24 @@
+{
+  "name": "@zed-industries/${PACKAGE_NAME}",
+  "version": "${VERSION}",
+  "description": "An ACP-compatible coding agent powered by Codex - ${OS} ${ARCH} binary",
+  "license": "Apache-2.0",
+  "author": "Zed <hi@zed.dev>",
+  "homepage": "https://github.com/zed-industries/codex-acp",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zed-industries/codex-acp.git"
+  },
+  "bin": {
+    "${PACKAGE_NAME}": "bin/codex-acp"
+  },
+  "os": [
+    "${OS}"
+  ],
+  "cpu": [
+    "${ARCH}"
+  ],
+  "files": [
+    "bin"
+  ]
+}

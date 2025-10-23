@@ -113,7 +113,7 @@ impl Agent for CodexAgent {
                 meta: None,
             },
             mcp_capabilities: McpCapabilities {
-                http: false,
+                http: true,
                 sse: false,
                 meta: None,
             },
@@ -150,6 +150,7 @@ impl Agent for CodexAgent {
                 let opts = codex_login::ServerOptions::new(
                     self.config.codex_home.clone(),
                     codex_core::auth::CLIENT_ID.to_string(),
+                    None,
                 );
 
                 let server =
@@ -229,6 +230,8 @@ impl Agent for CodexAgent {
                             enabled: true,
                             startup_timeout_sec: None,
                             tool_timeout_sec: None,
+                            disabled_tools: None,
+                            enabled_tools: None,
                         },
                     );
                 }
@@ -255,6 +258,8 @@ impl Agent for CodexAgent {
                             enabled: true,
                             startup_timeout_sec: None,
                             tool_timeout_sec: None,
+                            disabled_tools: None,
+                            enabled_tools: None,
                         },
                     );
                 }
