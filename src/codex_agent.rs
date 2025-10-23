@@ -124,6 +124,7 @@ impl Agent for CodexAgent {
             CodexAuthMethod::ChatGpt.into(),
             CodexAuthMethod::CodexApiKey.into(),
             CodexAuthMethod::OpenAiApiKey.into(),
+            CodexAuthMethod::CustomModelProvider.into(),
         ];
         // Until codex device code auth works, we can't use this in remote ssh projects
         if std::env::var("NO_BROWSER").is_ok() {
