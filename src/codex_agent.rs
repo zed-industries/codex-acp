@@ -286,7 +286,11 @@ impl Agent for CodexAgent {
             self.auth_manager.clone(),
             self.client_capabilities.clone(),
             config.clone(),
-            self.model_presets.clone(),
+            crate::conversation::ConversationModelContext {
+                model_presets: self.model_presets.clone(),
+                model_provider: config.model_provider.clone(),
+                model: config.model.clone(),
+            },
         ));
         let load = conversation.load().await?;
 

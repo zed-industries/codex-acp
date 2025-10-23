@@ -23,7 +23,7 @@ use codex_common::{
     model_presets::ModelPreset,
 };
 use codex_core::{
-    AuthManager, CodexConversation,
+    AuthManager, CodexConversation, ModelProviderInfo,
     config::Config,
     error::CodexErr,
     protocol::{
@@ -124,7 +124,7 @@ impl Conversation {
         auth: Arc<AuthManager>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         config: Config,
-        model_presets: Rc<Vec<ModelPreset>>,
+        model_ctx: ConversationModelContext,
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
 
@@ -133,7 +133,7 @@ impl Conversation {
             SessionClient::new(session_id, client_capabilities),
             conversation.clone(),
             config,
-            model_presets,
+            model_ctx,
             message_rx,
         );
         let handle = tokio::task::spawn_local(actor.spawn());
@@ -212,6 +212,17 @@ enum SubmissionState {
     Prompt(PromptState),
     /// Subtask, like /compact
     Task(TaskState),
+}
+
+/// Model-related context used when creating a conversation.
+#[derive(Clone)]
+pub(crate) struct ConversationModelContext {
+    /// Presets available for models by default.
+    pub(crate) model_presets: Rc<Vec<ModelPreset>>,
+    /// Information about the model provider in use.
+    pub(crate) model_provider: ModelProviderInfo,
+    /// The identifier/name of the currently selected model.
+    pub(crate) model: String,
 }
 
 impl SubmissionState {
@@ -1370,8 +1381,8 @@ struct ConversationActor<A> {
     config: Config,
     /// The custom prompts loaded for this workspace.
     custom_prompts: Rc<RefCell<Vec<CustomPrompt>>>,
-    /// The model presets for the conversation.
-    model_presets: Rc<Vec<ModelPreset>>,
+    /// Model-related context (presets, provider, current model)
+    model_ctx: ConversationModelContext,
     /// A sender for each interested `Op` submission that needs events routed.
     submissions: HashMap<String, SubmissionState>,
     /// A receiver for incoming conversation messages.
@@ -1384,7 +1395,7 @@ impl<A: Auth> ConversationActor<A> {
         client: SessionClient,
         conversation: Arc<dyn CodexConversationImpl>,
         config: Config,
-        model_presets: Rc<Vec<ModelPreset>>,
+        model_ctx: ConversationModelContext,
         message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
     ) -> Self {
         Self {
@@ -1393,7 +1404,7 @@ impl<A: Auth> ConversationActor<A> {
             conversation,
             config,
             custom_prompts: Rc::default(),
-            model_presets,
+            model_ctx,
             submissions: HashMap::new(),
             message_rx,
         }
@@ -1576,7 +1587,7 @@ impl<A: Auth> ConversationActor<A> {
     }
 
     fn find_model_preset(&self) -> Option<&ModelPreset> {
-        if let Some(preset) = self.model_presets.iter().find(|preset| {
+        if let Some(preset) = self.model_ctx.model_presets.iter().find(|preset| {
             preset.model == self.config.model && preset.effort == self.config.model_reasoning_effort
         }) {
             return Some(preset);
@@ -1584,7 +1595,7 @@ impl<A: Auth> ConversationActor<A> {
 
         // If we didn't find it, and it is set to none, see if we can find one with the default value
         if self.config.model_reasoning_effort.is_none()
-            && let Some(preset) = self.model_presets.iter().find(|preset| {
+            && let Some(preset) = self.model_ctx.model_presets.iter().find(|preset| {
                 preset.model == self.config.model
                     && preset.effort == Some(ReasoningEffort::default())
             })
@@ -1602,22 +1613,35 @@ impl<A: Auth> ConversationActor<A> {
             // Fallback to configured model id if no preset found to avoid failing session load.
             .unwrap_or_else(|| ModelId(self.config.model.clone().into()));
 
-        let available_models = self
-            .model_presets
-            .iter()
-            .map(|preset| ModelInfo {
-                model_id: ModelId(preset.id.into()),
-                name: preset.label.into(),
-                description: Some(
-                    preset
-                        .description
-                        .strip_prefix("— ")
-                        .unwrap_or(preset.description)
-                        .into(),
+        let available_models: Vec<ModelInfo> = if self.model_ctx.model_provider.name.is_empty() {
+            self.model_ctx
+                .model_presets
+                .iter()
+                .map(|preset| ModelInfo {
+                    model_id: ModelId(preset.id.into()),
+                    name: preset.label.into(),
+                    description: Some(
+                        preset
+                            .description
+                            .strip_prefix("— ")
+                            .unwrap_or(preset.description)
+                            .into(),
+                    ),
+                    meta: None,
+                })
+                .collect()
+        } else {
+            vec![ModelInfo {
+                model_id: ModelId(self.model_ctx.model.clone().into()),
+                name: format!(
+                    "{}/{}",
+                    self.model_ctx.model_provider.name,
+                    self.model_ctx.model.as_str()
                 ),
+                description: Some("Configured model provided by the model provider".into()),
                 meta: None,
-            })
-            .collect();
+            }]
+        };
 
         Ok(SessionModelState {
             current_model_id,
@@ -1764,6 +1788,7 @@ impl<A: Auth> ConversationActor<A> {
 
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
         let preset = self
+            .model_ctx
             .model_presets
             .iter()
             .find(|p| p.id == model.0.as_ref())
@@ -2451,7 +2476,24 @@ mod tests {
             session_client,
             conversation.clone(),
             config,
-            Default::default(),
+            ConversationModelContext {
+                model_presets: Default::default(),
+                model_provider: ModelProviderInfo {
+                    name: "test".to_string(),
+                    base_url: Some("https://api.test.com".to_string()),
+                    env_key: None,
+                    env_key_instructions: None,
+                    wire_api: Default::default(),
+                    query_params: Default::default(),
+                    http_headers: Default::default(),
+                    env_http_headers: Default::default(),
+                    request_max_retries: Default::default(),
+                    stream_max_retries: Default::default(),
+                    stream_idle_timeout_ms: Default::default(),
+                    requires_openai_auth: false,
+                },
+                model: String::from("gpt-5"),
+            },
             message_rx,
         );
         actor.custom_prompts = Rc::new(RefCell::new(custom_prompts));
