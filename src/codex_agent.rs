@@ -124,6 +124,7 @@ impl Agent for CodexAgent {
             CodexAuthMethod::ChatGpt.into(),
             CodexAuthMethod::CodexApiKey.into(),
             CodexAuthMethod::OpenAiApiKey.into(),
+            CodexAuthMethod::CustomModelProvider.into(),
         ];
         // Until codex device code auth works, we can't use this in remote ssh projects
         if std::env::var("NO_BROWSER").is_ok() {
@@ -175,6 +176,11 @@ impl Agent for CodexAgent {
                 })?;
                 codex_login::login_with_api_key(&self.config.codex_home, &api_key)
                     .map_err(Error::into_internal_error)?;
+            }
+            CodexAuthMethod::CustomModelProvider => {
+                // For custom model provider, we assume the user has already set up their credentials
+                // via environment variables or config files as needed.
+                info!("Assuming custom model provider is set up correctly.");
             }
         }
 
@@ -280,7 +286,11 @@ impl Agent for CodexAgent {
             self.auth_manager.clone(),
             self.client_capabilities.clone(),
             config.clone(),
-            self.model_presets.clone(),
+            crate::conversation::ConversationModelContext {
+                model_presets: self.model_presets.clone(),
+                model_provider: config.model_provider.clone(),
+                model: config.model.clone(),
+            },
         ));
         let load = conversation.load().await?;
 
@@ -377,6 +387,7 @@ enum CodexAuthMethod {
     ChatGpt,
     CodexApiKey,
     OpenAiApiKey,
+    CustomModelProvider,
 }
 
 impl From<CodexAuthMethod> for AuthMethodId {
@@ -386,6 +397,7 @@ impl From<CodexAuthMethod> for AuthMethodId {
                 CodexAuthMethod::ChatGpt => "chatgpt",
                 CodexAuthMethod::CodexApiKey => "codex-api-key",
                 CodexAuthMethod::OpenAiApiKey => "openai-api-key",
+                CodexAuthMethod::CustomModelProvider => "custom-model-provider",
             }
             .into(),
         )
@@ -420,6 +432,12 @@ impl From<CodexAuthMethod> for AuthMethod {
                 )),
                 meta: None,
             },
+            CodexAuthMethod::CustomModelProvider => Self {
+                id: method.into(),
+                name: "Use Custom Model Provider".into(),
+                description: Some("Requires setting up a custom model provider.".into()),
+                meta: None,
+            },
         }
     }
 }
@@ -432,6 +450,7 @@ impl TryFrom<AuthMethodId> for CodexAuthMethod {
             "chatgpt" => Ok(CodexAuthMethod::ChatGpt),
             "codex-api-key" => Ok(CodexAuthMethod::CodexApiKey),
             "openai-api-key" => Ok(CodexAuthMethod::OpenAiApiKey),
+            "custom-model-provider" => Ok(CodexAuthMethod::CustomModelProvider),
             _ => Err(Error::invalid_params().with_data("unsupported authentication method")),
         }
     }
