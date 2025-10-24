@@ -8,15 +8,15 @@ use std::{
 };
 
 use agent_client_protocol::{
-    Annotations, AudioContent, AvailableCommand, AvailableCommandInput, BlobResourceContents,
-    Client, ClientCapabilities, ContentBlock, Diff, EmbeddedResource, EmbeddedResourceResource,
-    Error, ImageContent, LoadSessionResponse, ModelId, ModelInfo, PermissionOption,
-    PermissionOptionId, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    ResourceLink, SessionId, SessionMode, SessionModeId, SessionModeState, SessionModelState,
-    SessionNotification, SessionUpdate, StopReason, TerminalId, TextContent, TextResourceContents,
-    ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind,
+    Annotations, AudioContent, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
+    BlobResourceContents, Client, ClientCapabilities, ContentBlock, ContentChunk, Diff,
+    EmbeddedResource, EmbeddedResourceResource, Error, ImageContent, LoadSessionResponse, ModelId,
+    ModelInfo, PermissionOption, PermissionOptionId, PermissionOptionKind, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, PromptRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SessionId, SessionMode,
+    SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate,
+    StopReason, TerminalId, TextContent, TextResourceContents, ToolCall, ToolCallContent,
+    ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use codex_common::{
     approval_presets::{ApprovalPreset, builtin_approval_presets},
@@ -349,10 +349,9 @@ impl PromptState {
             }
             EventMsg::UserMessage(UserMessageEvent {
                 message,
-                kind,
                 images: _,
             }) => {
-                info!("User message {kind:?} echoed: {message:?}");
+                info!("User message: {message:?}");
             }
             EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
                 // Send this to the client via session/update notification
@@ -1272,24 +1271,26 @@ impl SessionClient {
     }
 
     async fn send_agent_text(&self, text: impl Into<String>) {
-        self.send_notification(SessionUpdate::AgentMessageChunk {
+        self.send_notification(SessionUpdate::AgentMessageChunk(ContentChunk {
             content: ContentBlock::Text(TextContent {
                 text: text.into(),
                 annotations: None,
                 meta: None,
             }),
-        })
+            meta: None,
+        }))
         .await;
     }
 
     async fn send_agent_thought(&self, text: impl Into<String>) {
-        self.send_notification(SessionUpdate::AgentThoughtChunk {
+        self.send_notification(SessionUpdate::AgentThoughtChunk(ContentChunk {
             content: ContentBlock::Text(TextContent {
                 text: text.into(),
                 annotations: None,
                 meta: None,
             }),
-        })
+            meta: None,
+        }))
         .await;
     }
 
@@ -1428,9 +1429,12 @@ impl<A: Auth> ConversationActor<A> {
                     );
 
                     client
-                        .send_notification(SessionUpdate::AvailableCommandsUpdate {
-                            available_commands,
-                        })
+                        .send_notification(SessionUpdate::AvailableCommandsUpdate(
+                            AvailableCommandsUpdate {
+                                available_commands,
+                                meta: None,
+                            },
+                        ))
                         .await;
                 });
             }
@@ -1545,48 +1549,58 @@ impl<A: Auth> ConversationActor<A> {
         })
     }
 
-    fn find_model_preset(&self) -> Option<&ModelPreset> {
-        if let Some(preset) = self.model_presets.iter().find(|preset| {
-            preset.model == self.config.model && preset.effort == self.config.model_reasoning_effort
-        }) {
-            return Some(preset);
-        }
+    fn find_current_model(&self) -> Option<ModelId> {
+        let preset = self
+            .model_presets
+            .iter()
+            .find(|preset| preset.model == self.config.model)?;
 
-        // If we didn't find it, and it is set to none, see if we can find one with the default value
-        if self.config.model_reasoning_effort.is_none()
-            && let Some(preset) = self.model_presets.iter().find(|preset| {
-                preset.model == self.config.model
-                    && preset.effort == Some(ReasoningEffort::default())
+        let effort = self
+            .config
+            .model_reasoning_effort
+            .and_then(|effort| {
+                preset
+                    .supported_reasoning_efforts
+                    .iter()
+                    .find_map(|e| (e.effort == effort).then_some(effort))
             })
-        {
-            return Some(preset);
-        }
+            .unwrap_or(preset.default_reasoning_effort);
 
-        None
+        Some(Self::model_id(preset.id, effort))
+    }
+
+    fn model_id(id: &'static str, effort: ReasoningEffort) -> ModelId {
+        ModelId(format!("{id}/{effort}").into())
+    }
+
+    fn parse_model_id(id: ModelId) -> Result<(String, ReasoningEffort), Error> {
+        let Some((model, reasoning)) = id.0.split_once('/') else {
+            return Err(Error::internal_error().with_data(format!("Invalid model ID: {id}")));
+        };
+        let reasoning = serde_json::from_value(reasoning.into()).map_err(|_| {
+            Error::internal_error().with_data(format!("Invalid reasoning effort: {reasoning}"))
+        })?;
+        Ok((model.to_owned(), reasoning))
     }
 
     fn models(&self) -> Result<SessionModelState, Error> {
-        let current_model_id = self
-            .find_model_preset()
-            .map(|preset| ModelId(preset.id.into()))
-            .ok_or_else(|| {
-                anyhow::anyhow!("No valid model preset for model {}", self.config.model)
-            })?;
+        let current_model_id = self.find_current_model().ok_or_else(|| {
+            anyhow::anyhow!("No valid model preset for model {}", self.config.model)
+        })?;
 
         let available_models = self
             .model_presets
             .iter()
-            .map(|preset| ModelInfo {
-                model_id: ModelId(preset.id.into()),
-                name: preset.label.into(),
-                description: Some(
-                    preset
-                        .description
-                        .strip_prefix("— ")
-                        .unwrap_or(preset.description)
-                        .into(),
-                ),
-                meta: None,
+            .flat_map(|preset| {
+                preset
+                    .supported_reasoning_efforts
+                    .iter()
+                    .map(|effort| ModelInfo {
+                        model_id: Self::model_id(preset.id, effort.effort),
+                        name: format!("{} ({})", preset.display_name, effort.effort),
+                        description: Some(format!("{} {}", preset.description, effort.description)),
+                        meta: None,
+                    })
             })
             .collect();
 
@@ -1734,26 +1748,22 @@ impl<A: Auth> ConversationActor<A> {
     }
 
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
-        let preset = self
-            .model_presets
-            .iter()
-            .find(|p| p.id == model.0.as_ref())
-            .ok_or_else(|| Error::invalid_params().with_data("Model not found"))?;
+        let (model, effort) = Self::parse_model_id(model)?;
 
         self.conversation
             .submit(Op::OverrideTurnContext {
                 cwd: None,
                 approval_policy: None,
                 sandbox_policy: None,
-                model: Some(preset.model.into()),
-                effort: Some(preset.effort),
+                model: Some(model.clone()),
+                effort: Some(Some(effort)),
                 summary: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
-        self.config.model = preset.model.into();
-        self.config.model_reasoning_effort = preset.effort;
+        self.config.model = model;
+        self.config.model_reasoning_effort = Some(effort);
 
         Ok(())
     }
@@ -2022,9 +2032,10 @@ mod tests {
         assert_eq!(notifications.len(), 1);
         assert!(matches!(
             &notifications[0].update,
-            SessionUpdate::AgentMessageChunk {
-                content: ContentBlock::Text(TextContent { text, .. })
-            } if text == "Hi"
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Hi"
         ));
 
         Ok(())
@@ -2061,9 +2072,10 @@ mod tests {
         assert_eq!(notifications.len(), 1);
         assert!(matches!(
             &notifications[0].update,
-            SessionUpdate::AgentMessageChunk {
-                content: ContentBlock::Text(TextContent { text, .. })
-            } if text == "Compact task completed"
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Compact task completed"
         ));
         let ops = conversation.ops.lock().unwrap();
         assert_eq!(ops.as_slice(), &[Op::Compact]);
@@ -2103,9 +2115,9 @@ mod tests {
         assert!(
             matches!(
                 &notifications[0].update,
-                SessionUpdate::AgentMessageChunk {
-                    content: ContentBlock::Text(TextContent { text, .. })
-                } if text == INIT_COMMAND_PROMPT // we echo the prompt
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }), ..
+                }) if text == INIT_COMMAND_PROMPT // we echo the prompt
             ),
             "notifications don't match {notifications:?}"
         );
@@ -2155,9 +2167,10 @@ mod tests {
         assert!(
             matches!(
                 &notifications[0].update,
-                SessionUpdate::AgentMessageChunk {
-                    content: ContentBlock::Text(TextContent { text, .. })
-                } if text == "current changes" // we echo the prompt
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text == "current changes" // we echo the prompt
             ),
             "notifications don't match {notifications:?}"
         );
@@ -2209,9 +2222,10 @@ mod tests {
         assert!(
             matches!(
                 &notifications[0].update,
-                SessionUpdate::AgentMessageChunk {
-                    content: ContentBlock::Text(TextContent { text, .. })
-                } if text == "Review what we did in agents.md" // we echo the prompt
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text == "Review what we did in agents.md" // we echo the prompt
             ),
             "notifications don't match {notifications:?}"
         );
@@ -2263,9 +2277,10 @@ mod tests {
         assert!(
             matches!(
                 &notifications[0].update,
-                SessionUpdate::AgentMessageChunk {
-                    content: ContentBlock::Text(TextContent { text, .. })
-                } if text == "commit 123456" // we echo the prompt
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text == "commit 123456" // we echo the prompt
             ),
             "notifications don't match {notifications:?}"
         );
@@ -2317,9 +2332,10 @@ mod tests {
         assert!(
             matches!(
                 &notifications[0].update,
-                SessionUpdate::AgentMessageChunk {
-                    content: ContentBlock::Text(TextContent { text, .. })
-                } if text == "changes against 'feature'" // we echo the prompt
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text == "changes against 'feature'" // we echo the prompt
             ),
             "notifications don't match {notifications:?}"
         );
@@ -2379,9 +2395,10 @@ mod tests {
         assert!(
             matches!(
                 &notifications[0].update,
-                SessionUpdate::AgentMessageChunk {
-                    content: ContentBlock::Text(TextContent { text, .. })
-                } if text == "Custom prompt with foo arg."
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text == "Custom prompt with foo arg."
             ),
             "notifications don't match {notifications:?}"
         );
