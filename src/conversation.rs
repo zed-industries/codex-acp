@@ -515,14 +515,13 @@ impl PromptState {
             | EventMsg::TurnDiff(..)
             // Revisit when we can emit status updates
             | EventMsg::BackgroundEvent(..)
+            | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..) => {}
 
             // Unexpected events for this submission
             e @ (EventMsg::McpListToolsResponse(..)
             // returned from Op::ListCustomPrompts, ignore
             | EventMsg::ListCustomPromptsResponse(..)
-            // returned from Op::GetPath, ignore
-            | EventMsg::ConversationPath(..)
             // Used for returning a single history entry
             | EventMsg::GetHistoryEntryResponse(..)) => {
                 warn!("Unexpected event: {:?}", e);
@@ -758,6 +757,7 @@ impl PromptState {
             cwd,
             reason,
             parsed_cmd,
+            risk,
         } = event;
 
         // Create a new tool call for the command execution
@@ -777,6 +777,26 @@ impl PromptState {
             file_extension,
         });
 
+        let risk = risk.map(|risk| {
+            let mut str = format!(
+                "Risk Assessment: {}\nRisk Level: {}",
+                risk.description,
+                risk.risk_level.as_str()
+            );
+            if !risk.risk_categories.is_empty() {
+                str.push_str("\nRisk Categories:");
+                str.push_str(&risk.risk_categories.iter().map(|c| c.as_str()).join(", "));
+            }
+            str
+        });
+
+        let content = match (reason, risk) {
+            (Some(reason), Some(risk)) => Some(vec![[reason, risk].join("\n").into()]),
+            (Some(reason), None) => Some(vec![reason.into()]),
+            (None, Some(risk)) => Some(vec![risk.into()]),
+            (None, None) => None,
+        };
+
         let response = client
             .request_permission(
                 ToolCallUpdate {
@@ -785,7 +805,7 @@ impl PromptState {
                         kind: Some(kind),
                         status: Some(ToolCallStatus::Pending),
                         title: Some(title),
-                        content: reason.map(|r| vec![r.into()]),
+                        content,
                         locations: if locations.is_empty() {
                             None
                         } else {
@@ -1185,6 +1205,7 @@ impl TaskState {
             | EventMsg::AgentReasoningRawContent(..)
             | EventMsg::AgentReasoningRawContentDelta(..)
             | EventMsg::AgentReasoningSectionBreak(..)
+            | EventMsg::RawResponseItem(..)
             | EventMsg::BackgroundEvent(..) => {}
             // Unexpected events for this submission
             e @ (EventMsg::UserMessage(..)
@@ -1206,7 +1227,6 @@ impl TaskState {
             | EventMsg::McpListToolsResponse(..)
             | EventMsg::ListCustomPromptsResponse(..)
             | EventMsg::PlanUpdate(..)
-            | EventMsg::ConversationPath(..)
             | EventMsg::EnteredReviewMode(..)
             | EventMsg::ExitedReviewMode(..)) => {
                 warn!("Unexpected event: {:?}", e);
