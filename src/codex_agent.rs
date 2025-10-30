@@ -6,6 +6,7 @@ use agent_client_protocol::{
     SessionId, SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest,
     SetSessionModelResponse, V1,
 };
+use codex_app_server_protocol::AuthMode;
 use codex_common::model_presets::{ModelPreset, builtin_model_presets};
 use codex_core::{
     ConversationManager, NewConversation,
@@ -161,6 +162,13 @@ impl Agent for CodexAgent {
 
         match auth_method {
             CodexAuthMethod::ChatGpt => {
+                self.auth_manager.reload();
+                if matches!(
+                    self.auth_manager.auth(),
+                    Some(auth) if auth.mode == AuthMode::ChatGPT
+                ) {
+                    return Ok(AuthenticateResponse { meta: None });
+                }
                 // Perform browser/device login via codex-rs, then report success/failure to the client.
                 let opts = codex_login::ServerOptions::new(
                     self.config.codex_home.clone(),
