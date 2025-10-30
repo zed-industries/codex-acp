@@ -6,7 +6,6 @@ use agent_client_protocol::{
     SessionId, SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest,
     SetSessionModelResponse, V1,
 };
-use codex_app_server_protocol::AuthMode;
 use codex_common::model_presets::{ModelPreset, builtin_model_presets};
 use codex_core::{
     ConversationManager, NewConversation,
@@ -17,6 +16,7 @@ use codex_core::{
     },
     protocol::SessionSource,
 };
+use codex_login::AuthMode;
 use codex_login::{CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
 use codex_protocol::ConversationId;
 use std::{

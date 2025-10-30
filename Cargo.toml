@@ -24,7 +24,6 @@ codex-apply-patch = { git = "https://github.com/zed-industries/codex", branch = 
 codex-arg0 = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-common = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["cli"] }
 codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp" }
-codex-app-server-protocol = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-mcp-server = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-protocol = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-login = { git = "https://github.com/zed-industries/codex", branch = "acp" }

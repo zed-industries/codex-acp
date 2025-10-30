@@ -615,7 +615,6 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "async-trait",
- "codex-app-server-protocol",
  "codex-apply-patch",
  "codex-arg0",
  "codex-common",
