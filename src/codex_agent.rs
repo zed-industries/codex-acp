@@ -162,13 +162,6 @@ impl Agent for CodexAgent {
 
         match auth_method {
             CodexAuthMethod::ChatGpt => {
-                self.auth_manager.reload();
-                if matches!(
-                    self.auth_manager.auth(),
-                    Some(auth) if auth.mode == AuthMode::ChatGPT
-                ) {
-                    return Ok(AuthenticateResponse { meta: None });
-                }
                 // Perform browser/device login via codex-rs, then report success/failure to the client.
                 let opts = codex_login::ServerOptions::new(
                     self.config.codex_home.clone(),
@@ -184,6 +177,8 @@ impl Agent for CodexAgent {
                     .block_until_done()
                     .await
                     .map_err(Error::into_internal_error)?;
+
+                self.auth_manager.reload();
             }
             CodexAuthMethod::CodexApiKey => {
                 let api_key = read_codex_api_key_from_env().ok_or_else(|| {
