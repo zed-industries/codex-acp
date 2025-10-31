@@ -16,7 +16,6 @@ use codex_core::{
     },
     protocol::SessionSource,
 };
-use codex_login::AuthMode;
 use codex_login::{CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
 use codex_protocol::ConversationId;
 use std::{
