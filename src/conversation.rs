@@ -24,18 +24,19 @@ use codex_common::{
 };
 use codex_core::{
     AuthManager, CodexConversation,
-    config::Config,
+    config::{Config, set_project_trusted},
     error::CodexErr,
     protocol::{
-        AgentMessageDeltaEvent, AgentMessageEvent, AgentReasoningDeltaEvent, AgentReasoningEvent,
-        AgentReasoningRawContentDeltaEvent, AgentReasoningSectionBreakEvent,
-        ApplyPatchApprovalRequestEvent, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent,
-        ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent,
-        ExitedReviewModeEvent, FileChange, ItemCompletedEvent, ItemStartedEvent,
-        ListCustomPromptsResponseEvent, McpInvocation, McpToolCallBeginEvent, McpToolCallEndEvent,
-        Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReviewDecision, ReviewOutputEvent,
-        ReviewRequest, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent,
-        UserMessageEvent, ViewImageToolCallEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
+        AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ErrorEvent, Event,
+        EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent,
+        ExecCommandOutputDeltaEvent, ExitedReviewModeEvent, FileChange, ItemCompletedEvent,
+        ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation, McpToolCallBeginEvent,
+        McpToolCallEndEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent,
+        ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
+        ReviewOutputEvent, ReviewRequest, SandboxPolicy, StreamErrorEvent, TaskCompleteEvent,
+        TaskStartedEvent, TurnAbortedEvent, UserMessageEvent, ViewImageToolCallEvent,
+        WebSearchBeginEvent, WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
 };
@@ -353,17 +354,12 @@ impl PromptState {
             }) => {
                 info!("User message: {message:?}");
             }
-            EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
-                // Send this to the client via session/update notification
-                info!("Agent message received: {delta:?}");
+            EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent { thread_id, turn_id, item_id, delta }) => {
+                info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
                 client.send_agent_text(delta).await;
             }
-            EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent { delta })
-            | EventMsg::AgentReasoningRawContentDelta(AgentReasoningRawContentDeltaEvent {
-                delta,
-            }) => {
-                // Send this to the client via session/update notification
-                info!("Agent reasoning message received: {:?}", delta);
+            EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent { thread_id, turn_id, item_id, delta  }) | EventMsg::ReasoningRawContentDelta(ReasoningRawContentDeltaEvent { thread_id, turn_id, item_id, delta }) => {
+                info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
                 client.send_agent_thought(delta).await;
             }
             EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {}) => {
@@ -515,6 +511,8 @@ impl PromptState {
             | EventMsg::TurnDiff(..)
             // Revisit when we can emit status updates
             | EventMsg::BackgroundEvent(..)
+            // Old events
+            | EventMsg::AgentMessageDelta(..) | EventMsg::AgentReasoningDelta(..) | EventMsg::AgentReasoningRawContentDelta(..)
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..) => {}
 
@@ -523,7 +521,10 @@ impl PromptState {
             // returned from Op::ListCustomPrompts, ignore
             | EventMsg::ListCustomPromptsResponse(..)
             // Used for returning a single history entry
-            | EventMsg::GetHistoryEntryResponse(..)) => {
+            | EventMsg::GetHistoryEntryResponse(..)
+            | EventMsg::DeprecationNotice(..)
+            | EventMsg::UndoStarted(..)
+            | EventMsg::UndoCompleted(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
@@ -866,6 +867,7 @@ impl PromptState {
             command: _,
             cwd,
             parsed_cmd,
+            is_user_shell_command: _,
         } = event;
         // Create a new tool call for the command execution
         let tool_call_id = ToolCallId(call_id.clone().into());
@@ -1202,8 +1204,11 @@ impl TaskState {
             | EventMsg::TokenCount(..)
             | EventMsg::AgentMessageDelta(..)
             | EventMsg::AgentReasoningDelta(..)
+            | EventMsg::AgentMessageContentDelta(..)
             | EventMsg::AgentReasoningRawContent(..)
             | EventMsg::AgentReasoningRawContentDelta(..)
+            | EventMsg::ReasoningContentDelta(..)
+            | EventMsg::ReasoningRawContentDelta(..)
             | EventMsg::AgentReasoningSectionBreak(..)
             | EventMsg::RawResponseItem(..)
             | EventMsg::BackgroundEvent(..) => {}
@@ -1228,7 +1233,10 @@ impl TaskState {
             | EventMsg::ListCustomPromptsResponse(..)
             | EventMsg::PlanUpdate(..)
             | EventMsg::EnteredReviewMode(..)
-            | EventMsg::ExitedReviewMode(..)) => {
+            | EventMsg::ExitedReviewMode(..)
+            | EventMsg::DeprecationNotice(..)
+            | EventMsg::UndoStarted(..)
+            | EventMsg::UndoCompleted(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
@@ -1763,6 +1771,14 @@ impl<A: Auth> ConversationActor<A> {
 
         self.config.approval_policy = preset.approval;
         self.config.sandbox_policy = preset.sandbox.clone();
+
+        match preset.sandbox {
+            // Treat this user action as a trusted dir
+            SandboxPolicy::DangerFullAccess | SandboxPolicy::WorkspaceWrite { .. } => {
+                set_project_trusted(&self.config.codex_home, &self.config.cwd)?;
+            }
+            SandboxPolicy::ReadOnly => {}
+        };
 
         Ok(())
     }
@@ -2518,9 +2534,14 @@ mod tests {
                     self.op_tx
                         .send(Event {
                             id: id.to_string(),
-                            msg: EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
-                                delta: prompt,
-                            }),
+                            msg: EventMsg::AgentMessageContentDelta(
+                                AgentMessageContentDeltaEvent {
+                                    thread_id: id.to_string(),
+                                    turn_id: id.to_string(),
+                                    item_id: id.to_string(),
+                                    delta: prompt,
+                                },
+                            ),
                         })
                         .unwrap();
                     self.op_tx

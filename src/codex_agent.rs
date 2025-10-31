@@ -10,8 +10,10 @@ use codex_common::model_presets::{ModelPreset, builtin_model_presets};
 use codex_core::{
     ConversationManager, NewConversation,
     auth::{AuthManager, read_codex_api_key_from_env, read_openai_api_key_from_env},
-    config::Config,
-    config_types::{McpServerConfig, McpServerTransportConfig},
+    config::{
+        Config,
+        types::{McpServerConfig, McpServerTransportConfig},
+    },
     protocol::SessionSource,
 };
 use codex_login::{CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
@@ -51,7 +53,12 @@ pub struct CodexAgent {
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
     pub fn new(config: Config) -> Self {
-        let auth_manager = AuthManager::shared(config.codex_home.clone(), false);
+        let auth_manager = AuthManager::shared(
+            config.codex_home.clone(),
+            false,
+            config.cli_auth_credentials_store_mode,
+        );
+
         let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
 
         let model_presets = Rc::new(builtin_model_presets(
@@ -159,6 +166,7 @@ impl Agent for CodexAgent {
                     self.config.codex_home.clone(),
                     codex_core::auth::CLIENT_ID.to_string(),
                     None,
+                    self.config.cli_auth_credentials_store_mode,
                 );
 
                 let server =
@@ -173,16 +181,24 @@ impl Agent for CodexAgent {
                 let api_key = read_codex_api_key_from_env().ok_or_else(|| {
                     Error::internal_error().with_data(format!("{CODEX_API_KEY_ENV_VAR} is not set"))
                 })?;
-                codex_login::login_with_api_key(&self.config.codex_home, &api_key)
-                    .map_err(Error::into_internal_error)?;
+                codex_login::login_with_api_key(
+                    &self.config.codex_home,
+                    &api_key,
+                    self.config.cli_auth_credentials_store_mode,
+                )
+                .map_err(Error::into_internal_error)?;
             }
             CodexAuthMethod::OpenAiApiKey => {
                 let api_key = read_openai_api_key_from_env().ok_or_else(|| {
                     Error::internal_error()
                         .with_data(format!("{OPENAI_API_KEY_ENV_VAR} is not set"))
                 })?;
-                codex_login::login_with_api_key(&self.config.codex_home, &api_key)
-                    .map_err(Error::into_internal_error)?;
+                codex_login::login_with_api_key(
+                    &self.config.codex_home,
+                    &api_key,
+                    self.config.cli_auth_credentials_store_mode,
+                )
+                .map_err(Error::into_internal_error)?;
             }
         }
 
