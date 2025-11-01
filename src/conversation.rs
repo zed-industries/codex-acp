@@ -1614,9 +1614,10 @@ impl<A: Auth> ConversationActor<A> {
     }
 
     fn models(&self) -> Result<SessionModelState, Error> {
-        let current_model_id = self.find_current_model().ok_or_else(|| {
-            anyhow::anyhow!("No valid model preset for model {}", self.config.model)
-        })?;
+        let current_model_id = self.find_current_model().unwrap_or_else(|| {
+            // If no preset found, return the current model string as-is
+            ModelId(self.config.model.clone().into())
+        });
 
         let available_models = self
             .model_presets
