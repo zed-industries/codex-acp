@@ -1855,7 +1855,7 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<UserInput> {
                 meta: _,
             }) => Some(UserInput::Text {
                 text: format!(
-                    "{}\n<context ref=\"{uri}\">\n${text}\n</context>",
+                    "{}\n<context ref=\"{uri}\">\n{text}\n</context>",
                     format_uri_as_link(None, uri.clone())
                 ),
             }),
