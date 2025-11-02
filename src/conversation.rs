@@ -1603,14 +1603,13 @@ impl<A: Auth> ConversationActor<A> {
         ModelId(format!("{id}/{effort}").into())
     }
 
-    fn parse_model_id(id: &ModelId) -> Result<(String, ReasoningEffort), Error> {
+    fn parse_model_id(id: &ModelId) -> Result<(Option<String>, Option<ReasoningEffort>), Error> {
         let Some((model, reasoning)) = id.0.split_once('/') else {
-            return Err(Error::internal_error().with_data(format!("Invalid model ID: {id}")));
+            return Ok((None, None));
         };
-        let reasoning = serde_json::from_value(reasoning.into()).map_err(|_| {
-            Error::internal_error().with_data(format!("Invalid reasoning effort: {reasoning}"))
-        })?;
-        Ok((model.to_owned(), reasoning))
+
+        let reasoning = serde_json::from_value(reasoning.into()).ok();
+        Ok((Some(model.to_owned()), reasoning))
     }
 
     fn models(&self) -> Result<SessionModelState, Error> {
@@ -1787,22 +1786,31 @@ impl<A: Auth> ConversationActor<A> {
     }
 
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
-        let (model, effort) = Self::parse_model_id(&model)?;
+        let (parsed_model, parsed_effort) = Self::parse_model_id(&model)?;
+
+        // Determine model: parsed > current config > error
+        let model_to_use = match parsed_model {
+            Some(m) => m,
+            None if !self.config.model.is_empty() => self.config.model.clone(),
+            None => return Err(Error::invalid_params().with_data("No model parsed or configured")),
+        };
+
+        let effort_to_use = parsed_effort.or(self.config.model_reasoning_effort);
 
         self.conversation
             .submit(Op::OverrideTurnContext {
                 cwd: None,
                 approval_policy: None,
                 sandbox_policy: None,
-                model: Some(model.clone()),
-                effort: Some(Some(effort)),
+                model: Some(model_to_use.clone()),
+                effort: Some(effort_to_use),
                 summary: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
-        self.config.model = model;
-        self.config.model_reasoning_effort = Some(effort);
+        self.config.model = model_to_use;
+        self.config.model_reasoning_effort = effort_to_use;
 
         Ok(())
     }
