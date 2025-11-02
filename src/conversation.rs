@@ -1603,13 +1603,10 @@ impl<A: Auth> ConversationActor<A> {
         ModelId(format!("{id}/{effort}").into())
     }
 
-    fn parse_model_id(id: &ModelId) -> Result<(Option<String>, Option<ReasoningEffort>), Error> {
-        let Some((model, reasoning)) = id.0.split_once('/') else {
-            return Ok((None, None));
-        };
-
-        let reasoning = serde_json::from_value(reasoning.into()).ok();
-        Ok((Some(model.to_owned()), reasoning))
+    fn parse_model_id(id: &ModelId) -> Option<(String, ReasoningEffort)> {
+        let (model, reasoning) = id.0.split_once('/')?;
+        let reasoning = serde_json::from_value(reasoning.into()).ok()?;
+        Some((model.to_owned(), reasoning))
     }
 
     fn models(&self) -> Result<SessionModelState, Error> {
@@ -1786,16 +1783,22 @@ impl<A: Auth> ConversationActor<A> {
     }
 
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
-        let (parsed_model, parsed_effort) = Self::parse_model_id(&model)?;
+        // Try parsing as preset format, otherwise use as-is, fallback to config
+        let (model_to_use, effort_to_use) = Self::parse_model_id(&model)
+            .map(|(m, e)| (m, Some(e)))
+            .unwrap_or_else(|| {
+                let model_str = model.0.to_string();
+                let fallback = if !model_str.is_empty() {
+                    model_str
+                } else {
+                    self.config.model.clone()
+                };
+                (fallback, self.config.model_reasoning_effort)
+            });
 
-        // Determine model: parsed > current config > error
-        let model_to_use = match parsed_model {
-            Some(m) => m,
-            None if !self.config.model.is_empty() => self.config.model.clone(),
-            None => return Err(Error::invalid_params().with_data("No model parsed or configured")),
-        };
-
-        let effort_to_use = parsed_effort.or(self.config.model_reasoning_effort);
+        if model_to_use.is_empty() {
+            return Err(Error::invalid_params().with_data("No model parsed or configured"));
+        }
 
         self.conversation
             .submit(Op::OverrideTurnContext {
