@@ -354,17 +354,33 @@ impl PromptState {
             }) => {
                 info!("User message: {message:?}");
             }
-            EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent { thread_id, turn_id, item_id, delta }) => {
+            EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
+                thread_id,
+                turn_id,
+                item_id,
+                delta,
+            }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
-                client.send_agent_text(delta).await;
+                client.send_agent_text_delta(delta).await;
             }
-            EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent { thread_id, turn_id, item_id, delta  }) | EventMsg::ReasoningRawContentDelta(ReasoningRawContentDeltaEvent { thread_id, turn_id, item_id, delta }) => {
-                info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
-                client.send_agent_thought(delta).await;
+            EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
+                thread_id,
+                turn_id,
+                item_id,
+                delta,
+            })
+            | EventMsg::ReasoningRawContentDelta(ReasoningRawContentDeltaEvent {
+                thread_id,
+                turn_id,
+                item_id,
+                delta,
+            }) => {
+                info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
+                client.send_agent_thought_delta(delta).await;
             }
             EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {}) => {
                 // Make sure the section heading actually get spacing
-                client.send_agent_thought("\n\n").await;
+                client.send_agent_thought_delta("\n\n").await;
             }
             EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
                 // Send this to the client via session/update notification
@@ -500,11 +516,17 @@ impl PromptState {
                     drop(response_tx.send(Err(err)));
                 }
             }
+            EventMsg::AgentMessage(AgentMessageEvent { message }) => {
+                info!("Agent message (non-delta) received: {message:?}");
+                client.send_agent_text(message).await;
+            }
+            EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
+                info!("Agent reasoning (non-delta) received: {text:?}");
+                client.send_agent_thought(text).await;
+            }
 
-            // Since we are getting the deltas, we can ignore these events
-            EventMsg::AgentReasoning(..)
-            | EventMsg::AgentReasoningRawContent(..)
-            | EventMsg::AgentMessage(..)
+            // Ignore these events
+            EventMsg::AgentReasoningRawContent(..)
             // In the future we can use this to update usage stats
             | EventMsg::TokenCount(..)
             // we already have a way to diff the turn, so ignore
@@ -1248,6 +1270,8 @@ struct SessionClient {
     session_id: SessionId,
     client: Arc<dyn Client>,
     client_capabilities: Arc<Mutex<ClientCapabilities>>,
+    seen_message_deltas: Rc<RefCell<bool>>,
+    seen_reasoning_deltas: Rc<RefCell<bool>>,
 }
 
 impl SessionClient {
@@ -1256,6 +1280,8 @@ impl SessionClient {
             session_id,
             client: ACP_CLIENT.get().expect("Client should be set").clone(),
             client_capabilities,
+            seen_message_deltas: Rc::new(RefCell::new(false)),
+            seen_reasoning_deltas: Rc::new(RefCell::new(false)),
         }
     }
 
@@ -1269,6 +1295,8 @@ impl SessionClient {
             session_id,
             client,
             client_capabilities,
+            seen_message_deltas: Rc::new(RefCell::new(false)),
+            seen_reasoning_deltas: Rc::new(RefCell::new(false)),
         }
     }
 
@@ -1299,19 +1327,41 @@ impl SessionClient {
     }
 
     async fn send_agent_text(&self, text: impl Into<String>) {
-        self.send_notification(SessionUpdate::AgentMessageChunk(ContentChunk {
-            content: ContentBlock::Text(TextContent {
-                text: text.into(),
-                annotations: None,
-                meta: None,
-            }),
-            meta: None,
-        }))
-        .await;
+        if *self.seen_message_deltas.borrow() {
+            *self.seen_message_deltas.borrow_mut() = false;
+            return;
+        }
+        self.send_content(text, SessionUpdate::AgentMessageChunk)
+            .await;
+    }
+
+    async fn send_agent_text_delta(&self, text: impl Into<String>) {
+        *self.seen_message_deltas.borrow_mut() = true;
+        self.send_content(text, SessionUpdate::AgentMessageChunk)
+            .await;
     }
 
     async fn send_agent_thought(&self, text: impl Into<String>) {
-        self.send_notification(SessionUpdate::AgentThoughtChunk(ContentChunk {
+        if *self.seen_reasoning_deltas.borrow() {
+            *self.seen_reasoning_deltas.borrow_mut() = false;
+            return;
+        }
+        self.send_content(text, SessionUpdate::AgentThoughtChunk)
+            .await;
+    }
+
+    async fn send_agent_thought_delta(&self, text: impl Into<String>) {
+        *self.seen_reasoning_deltas.borrow_mut() = true;
+        self.send_content(text, SessionUpdate::AgentThoughtChunk)
+            .await;
+    }
+
+    async fn send_content(
+        &self,
+        text: impl Into<String>,
+        wrapper: fn(ContentChunk) -> SessionUpdate,
+    ) {
+        self.send_notification(wrapper(ContentChunk {
             content: ContentBlock::Text(TextContent {
                 text: text.into(),
                 annotations: None,
