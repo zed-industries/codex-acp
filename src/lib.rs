@@ -2,7 +2,6 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use agent_client_protocol::AgentSideConnection;
-use codex_common::CliConfigOverrides;
 use codex_core::config::{Config, ConfigOverrides};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -11,10 +10,12 @@ use tokio::task::LocalSet;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::EnvFilter;
 
+mod cli;
 mod codex_agent;
 mod conversation;
 mod local_spawner;
 mod prompt_args;
+mod session_store;
 
 pub static ACP_CLIENT: OnceLock<Arc<AgentSideConnection>> = OnceLock::new();
 
@@ -24,7 +25,6 @@ pub static ACP_CLIENT: OnceLock<Arc<AgentSideConnection>> = OnceLock::new();
 /// the ACP protocol with the existing codex-rs infrastructure.
 pub async fn run_main(
     _codex_linux_sandbox_exe: Option<PathBuf>,
-    cli_config_overrides: CliConfigOverrides,
 ) -> IoResult<()> {
     // Install a simple subscriber so `tracing` output is visible.
     // Users can control the log level with `RUST_LOG`.
@@ -33,8 +33,18 @@ pub async fn run_main(
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    let cli::LaunchArgs {
+        config_overrides,
+        session_persist,
+    } = cli::parse_launch_args().map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("failed to parse arguments: {err}"),
+        )
+    })?;
+
     // Parse CLI overrides and load configuration
-    let cli_kv_overrides = cli_config_overrides.parse_overrides().map_err(|e| {
+    let cli_kv_overrides = config_overrides.parse_overrides().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("error parsing -c overrides: {e}"),
@@ -50,8 +60,12 @@ pub async fn run_main(
             )
         })?;
 
+    let persistence_settings =
+        session_store::SessionPersistenceSettings::resolve(&config, &session_persist);
+    let session_store = session_store::SessionStore::new(persistence_settings);
+
     // Create our Agent implementation with notification channel
-    let agent = Rc::new(codex_agent::CodexAgent::new(config));
+    let agent = Rc::new(codex_agent::CodexAgent::new(config, session_store));
 
     let stdin = tokio::io::stdin().compat();
     let stdout = tokio::io::stdout().compat_write();
