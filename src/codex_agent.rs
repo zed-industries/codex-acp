@@ -137,8 +137,7 @@ impl CodexAgent {
                         None
                     } else {
                         Some(
-                            env
-                                .iter()
+                            env.iter()
                                 .map(|entry| (entry.name.clone(), entry.value.clone()))
                                 .collect(),
                         )
@@ -443,7 +442,9 @@ impl Agent for CodexAgent {
                 self.auth_manager.clone(),
             )
             .await
-            .map_err(|e| Error::internal_error().with_data(format!("failed to resume session: {e}")))?;
+            .map_err(|e| {
+                Error::internal_error().with_data(format!("failed to resume session: {e}"))
+            })?;
 
         let session_id = Self::session_id_from_conversation_id(conversation_id);
         if session_id != request.session_id {

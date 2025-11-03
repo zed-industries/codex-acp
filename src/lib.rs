@@ -23,9 +23,7 @@ pub static ACP_CLIENT: OnceLock<Arc<AgentSideConnection>> = OnceLock::new();
 ///
 /// This sets up an ACP agent that communicates over stdio, bridging
 /// the ACP protocol with the existing codex-rs infrastructure.
-pub async fn run_main(
-    _codex_linux_sandbox_exe: Option<PathBuf>,
-) -> IoResult<()> {
+pub async fn run_main(_codex_linux_sandbox_exe: Option<PathBuf>) -> IoResult<()> {
     // Install a simple subscriber so `tracing` output is visible.
     // Users can control the log level with `RUST_LOG`.
     tracing_subscriber::fmt()
