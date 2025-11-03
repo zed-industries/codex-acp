@@ -2,9 +2,9 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
     CancelNotification, ClientCapabilities, Error, Implementation, InitializeRequest,
     InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    SessionId, SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest,
-    SetSessionModelResponse, V1,
+    ModelId, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
+    PromptResponse, SessionId, SessionModeId, SetSessionModeRequest, SetSessionModeResponse,
+    SetSessionModelRequest, SetSessionModelResponse, V1,
 };
 use codex_core::{
     ConversationManager, NewConversation,
@@ -20,14 +20,16 @@ use codex_protocol::ConversationId;
 use std::{
     cell::RefCell,
     collections::HashMap,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, Mutex},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     conversation::Conversation,
     local_spawner::{AcpFs, LocalSpawner},
+    session_store::{self, SessionRecord, SessionStore},
 };
 
 /// The Codex implementation of the ACP Agent trait.
@@ -45,11 +47,13 @@ pub struct CodexAgent {
     conversation_manager: ConversationManager,
     /// Active sessions mapped by `SessionId`
     sessions: Rc<RefCell<HashMap<SessionId, Rc<Conversation>>>>,
+    /// Persistent session manifest store
+    session_store: SessionStore,
 }
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, session_store: SessionStore) -> Self {
         let auth_manager = AuthManager::shared(
             config.codex_home.clone(),
             false,
@@ -76,6 +80,131 @@ impl CodexAgent {
             config,
             conversation_manager,
             sessions: Rc::default(),
+            session_store,
+        }
+    }
+
+    fn apply_session_request(config: &mut Config, cwd: &Path, mcp_servers: &[McpServer]) {
+        // Allows us to support HTTP MCP servers
+        config.use_experimental_use_rmcp_client = true;
+        // Make sure we are going through the `apply_patch` code path
+        config.include_apply_patch_tool = true;
+        config.cwd = cwd.to_path_buf();
+
+        for server in mcp_servers {
+            match server {
+                McpServer::Sse { .. } => {}
+                McpServer::Http { name, url, headers } => {
+                    let http_headers = if headers.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            headers
+                                .iter()
+                                .map(|h| (h.name.clone(), h.value.clone()))
+                                .collect(),
+                        )
+                    };
+                    config.mcp_servers.insert(
+                        name.clone(),
+                        McpServerConfig {
+                            transport: McpServerTransportConfig::StreamableHttp {
+                                url: url.clone(),
+                                bearer_token_env_var: None,
+                                http_headers,
+                                env_http_headers: None,
+                            },
+                            enabled: true,
+                            startup_timeout_sec: None,
+                            tool_timeout_sec: None,
+                            disabled_tools: None,
+                            enabled_tools: None,
+                        },
+                    );
+                }
+                McpServer::Stdio {
+                    name,
+                    command,
+                    args,
+                    env,
+                } => {
+                    let env_map = if env.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            env
+                                .iter()
+                                .map(|entry| (entry.name.clone(), entry.value.clone()))
+                                .collect(),
+                        )
+                    };
+                    config.mcp_servers.insert(
+                        name.clone(),
+                        McpServerConfig {
+                            transport: McpServerTransportConfig::Stdio {
+                                command: command.display().to_string(),
+                                args: args.clone(),
+                                env: env_map,
+                                env_vars: vec![],
+                                cwd: Some(cwd.to_path_buf()),
+                            },
+                            enabled: true,
+                            startup_timeout_sec: None,
+                            tool_timeout_sec: None,
+                            disabled_tools: None,
+                            enabled_tools: None,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    fn persist_record(&self, record: SessionRecord) {
+        if let Err(err) = self.session_store.record_session(record) {
+            warn!("failed to persist session manifest: {err}");
+        }
+    }
+
+    fn persist_mode_update(&self, session_id: &SessionId, mode_id: &SessionModeId) {
+        if let Err(err) = self.session_store.update_mode(session_id, mode_id) {
+            warn!("failed to update persisted mode for {}: {err}", session_id);
+        }
+    }
+
+    fn persist_model_update(&self, session_id: &SessionId, model_id: &ModelId) {
+        if let Err(err) = self.session_store.update_model(session_id, model_id) {
+            warn!("failed to update persisted model for {}: {err}", session_id);
+        }
+    }
+
+    fn build_session_record(
+        session_id: &SessionId,
+        conversation_id: ConversationId,
+        rollout_path: PathBuf,
+        config: &Config,
+        mcp_servers: Vec<McpServer>,
+        load: &LoadSessionResponse,
+    ) -> SessionRecord {
+        SessionRecord {
+            version: session_store::MANIFEST_VERSION,
+            session_id: session_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            rollout_path,
+            cwd: config.cwd.clone(),
+            mcp_servers,
+            model_id: load
+                .models
+                .as_ref()
+                .map(|state| state.current_model_id.0.as_ref().to_string()),
+            mode_id: load
+                .modes
+                .as_ref()
+                .map(|state| state.current_mode_id.0.as_ref().to_string()),
+            approval_policy: Some(config.approval_policy),
+            sandbox_policy: Some(config.sandbox_policy.clone()),
+            reasoning_effort: config.model_reasoning_effort,
+            last_updated: session_store::current_timestamp(),
         }
     }
 
@@ -108,7 +237,7 @@ impl Agent for CodexAgent {
         *self.client_capabilities.lock().unwrap() = client_capabilities;
 
         let agent_capabilities = AgentCapabilities {
-            load_session: false, // Currently only able to do in-memory... which doesn't help us at the moment
+            load_session: self.session_store.is_enabled(),
             prompt_capabilities: PromptCapabilities {
                 audio: false,
                 embedded_context: true,
@@ -228,77 +357,16 @@ impl Agent for CodexAgent {
         } = request;
         info!("Creating new session with cwd: {}", cwd.display());
 
+        let persisted_mcp_servers = mcp_servers.clone();
         let mut config = self.config.clone();
-        // Allows us to support HTTP MCP servers
-        config.use_experimental_use_rmcp_client = true;
-        // Make sure we are going through the `apply_patch` code path
-        config.include_apply_patch_tool = true;
-        config.cwd.clone_from(&cwd);
-
-        // Propagate any client-provided MCP servers that codex-rs supports.
-        for mcp_server in mcp_servers {
-            match mcp_server {
-                // Not supported in codex
-                McpServer::Sse { .. } => {}
-                McpServer::Http { name, url, headers } => {
-                    config.mcp_servers.insert(
-                        name,
-                        McpServerConfig {
-                            transport: McpServerTransportConfig::StreamableHttp {
-                                url,
-                                bearer_token_env_var: None,
-                                http_headers: if headers.is_empty() {
-                                    None
-                                } else {
-                                    Some(headers.into_iter().map(|h| (h.name, h.value)).collect())
-                                },
-                                env_http_headers: None,
-                            },
-                            enabled: true,
-                            startup_timeout_sec: None,
-                            tool_timeout_sec: None,
-                            disabled_tools: None,
-                            enabled_tools: None,
-                        },
-                    );
-                }
-                McpServer::Stdio {
-                    name,
-                    command,
-                    args,
-                    env,
-                } => {
-                    config.mcp_servers.insert(
-                        name,
-                        McpServerConfig {
-                            transport: McpServerTransportConfig::Stdio {
-                                command: command.display().to_string(),
-                                args,
-                                env: if env.is_empty() {
-                                    None
-                                } else {
-                                    Some(env.into_iter().map(|env| (env.name, env.value)).collect())
-                                },
-                                env_vars: vec![],
-                                cwd: Some(cwd.clone()),
-                            },
-                            enabled: true,
-                            startup_timeout_sec: None,
-                            tool_timeout_sec: None,
-                            disabled_tools: None,
-                            enabled_tools: None,
-                        },
-                    );
-                }
-            }
-        }
+        Self::apply_session_request(&mut config, &cwd, &mcp_servers);
 
         let num_mcp_servers = config.mcp_servers.len();
 
         let NewConversation {
             conversation_id,
             conversation,
-            session_configured: _,
+            session_configured,
         } = Box::pin(self.conversation_manager.new_conversation(config.clone()))
             .await
             .map_err(|_e| Error::internal_error())?;
@@ -316,6 +384,18 @@ impl Agent for CodexAgent {
         self.sessions
             .borrow_mut()
             .insert(session_id.clone(), conversation);
+
+        if self.session_store.is_enabled() {
+            let record = Self::build_session_record(
+                &session_id,
+                session_configured.session_id,
+                session_configured.rollout_path.clone(),
+                &config,
+                persisted_mcp_servers,
+                &load,
+            );
+            self.persist_record(record);
+        }
 
         debug!("Created new session with {} MCP servers", num_mcp_servers);
 
@@ -338,14 +418,74 @@ impl Agent for CodexAgent {
         }
 
         // Check if we have this session already
-        let Some(conversation) = self.sessions.borrow().get(&request.session_id).cloned() else {
-            // For now, we can't actually load sessions from disk
-            // The conversation manager doesn't have a direct load method
-            // We would need to use resume_conversation_from_rollout with a rollout path
+        if let Some(conversation) = self.sessions.borrow().get(&request.session_id).cloned() {
+            return conversation.load().await;
+        }
+
+        if !self.session_store.is_enabled() {
+            return Err(Error::invalid_request());
+        }
+
+        let Some(record) = self.session_store.get(&request.session_id) else {
             return Err(Error::invalid_request());
         };
 
-        Ok(conversation.load().await?)
+        let persisted_servers = record.mcp_servers.clone();
+        let mut resume_config = self.config.clone();
+        Self::apply_session_request(&mut resume_config, &record.cwd, &persisted_servers);
+        session_store::apply_session_config_overrides(&mut resume_config, &record);
+
+        let config_for_actor = resume_config.clone();
+        let record_config = resume_config.clone();
+
+        let NewConversation {
+            conversation_id,
+            conversation,
+            session_configured,
+        } = self
+            .conversation_manager
+            .resume_conversation_from_rollout(
+                resume_config,
+                record.rollout_path.clone(),
+                self.auth_manager.clone(),
+            )
+            .await
+            .map_err(|e| {
+                Error::internal_error().with_data(format!("failed to resume session: {e}"))
+            })?;
+
+        let session_id = Self::session_id_from_conversation_id(conversation_id);
+        if session_id != request.session_id {
+            warn!(
+                "Session ID mismatch when resuming: requested={}, resumed={}",
+                request.session_id, session_id
+            );
+        }
+
+        let conversation = Rc::new(Conversation::new(
+            session_id.clone(),
+            conversation,
+            self.auth_manager.clone(),
+            self.client_capabilities.clone(),
+            config_for_actor,
+        ));
+        let load = conversation.load().await?;
+
+        self.sessions
+            .borrow_mut()
+            .insert(session_id.clone(), conversation);
+
+        let updated_record = Self::build_session_record(
+            &session_id,
+            session_configured.session_id,
+            session_configured.rollout_path.clone(),
+            &record_config,
+            persisted_servers,
+            &load,
+        );
+        self.persist_record(updated_record);
+
+        Ok(load)
     }
 
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {
@@ -376,9 +516,12 @@ impl Agent for CodexAgent {
         args: SetSessionModeRequest,
     ) -> Result<SetSessionModeResponse, Error> {
         info!("Setting session mode for session: {}", args.session_id);
-        self.get_conversation(&args.session_id)?
-            .set_mode(args.mode_id)
+        let session_id = args.session_id;
+        let mode_id = args.mode_id;
+        self.get_conversation(&session_id)?
+            .set_mode(mode_id.clone())
             .await?;
+        self.persist_mode_update(&session_id, &mode_id);
         Ok(SetSessionModeResponse::default())
     }
 
@@ -388,9 +531,14 @@ impl Agent for CodexAgent {
     ) -> Result<SetSessionModelResponse, Error> {
         info!("Setting session model for session: {}", args.session_id);
 
-        self.get_conversation(&args.session_id)?
-            .set_model(args.model_id)
+        let session_id = args.session_id;
+        let model_id = args.model_id;
+
+        self.get_conversation(&session_id)?
+            .set_model(model_id.clone())
             .await?;
+
+        self.persist_model_update(&session_id, &model_id);
 
         Ok(SetSessionModelResponse::default())
     }
