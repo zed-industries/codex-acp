@@ -42,10 +42,11 @@ pub fn parse_launch_args() -> Result<SessionPersistCli, ParseError> {
             continue;
         }
 
-        if let Some(rest) = arg_str.strip_prefix("-c") {
-            if rest.contains('=') {
-                continue;
-            }
+        if arg_str
+            .strip_prefix("-c")
+            .is_some_and(|rest| rest.contains('='))
+        {
+            continue;
         }
 
         if arg_str.starts_with("--config=") {
@@ -54,11 +55,9 @@ pub fn parse_launch_args() -> Result<SessionPersistCli, ParseError> {
 
         if arg_str == "--session-persist" {
             session_persist.flag = Some(true);
-            if let Some(next) = args.peek() {
-                if is_value_token(next) {
-                    let value = args.next().unwrap();
-                    session_persist.path = Some(PathBuf::from(value));
-                }
+            if matches!(args.peek(), Some(next) if is_value_token(next)) {
+                let value = args.next().unwrap();
+                session_persist.path = Some(PathBuf::from(value));
             }
             continue;
         }

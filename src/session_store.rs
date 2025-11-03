@@ -173,11 +173,9 @@ impl SessionStore {
         let new_mode = Some(mode_id.0.as_ref().to_string());
         if record.mode_id != new_mode {
             record.mode_id = new_mode.clone();
-            if let Some(mode_id_str) = &record.mode_id {
-                if let Some(preset) = resolve_preset(mode_id_str) {
-                    record.approval_policy = Some(preset.approval);
-                    record.sandbox_policy = Some(preset.sandbox.clone());
-                }
+            if let Some(preset) = record.mode_id.as_deref().and_then(resolve_preset) {
+                record.approval_policy = Some(preset.approval);
+                record.sandbox_policy = Some(preset.sandbox.clone());
             }
             record.last_updated = current_timestamp();
             write_manifest(&self.manifest_path, &map)?;
@@ -300,11 +298,9 @@ pub fn apply_session_config_overrides(config: &mut Config, record: &SessionRecor
     }
     if let Some(policy) = &record.sandbox_policy {
         config.sandbox_policy = policy.clone();
-    } else if let Some(mode_id) = &record.mode_id {
-        if let Some(preset) = preset_for_mode(mode_id) {
-            config.approval_policy = preset.approval;
-            config.sandbox_policy = preset.sandbox.clone();
-        }
+    } else if let Some(preset) = record.mode_id.as_deref().and_then(preset_for_mode) {
+        config.approval_policy = preset.approval;
+        config.sandbox_policy = preset.sandbox.clone();
     }
 
     if let Some(model_id) = &record.model_id {
