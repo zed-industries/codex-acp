@@ -52,11 +52,12 @@ pub fn parse_launch_args() -> Result<LaunchArgs, ParseError> {
             continue;
         }
 
-        if let Some(rest) = arg_str.strip_prefix("-c") {
-            if rest.contains('=') {
-                overrides.push(rest.to_string());
-                continue;
-            }
+        if let Some(rest) = arg_str
+            .strip_prefix("-c")
+            .and_then(|rest| rest.contains('=').then_some(rest))
+        {
+            overrides.push(rest.to_string());
+            continue;
         }
 
         if let Some(rest) = arg_str.strip_prefix("--config=") {
@@ -66,11 +67,9 @@ pub fn parse_launch_args() -> Result<LaunchArgs, ParseError> {
 
         if arg_str == "--session-persist" {
             session_persist.flag = Some(true);
-            if let Some(next) = args.peek() {
-                if is_value_token(next) {
-                    let value = args.next().unwrap();
-                    session_persist.path = Some(PathBuf::from(value));
-                }
+            if matches!(args.peek(), Some(next) if is_value_token(next)) {
+                let value = args.next().unwrap();
+                session_persist.path = Some(PathBuf::from(value));
             }
             continue;
         }

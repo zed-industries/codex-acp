@@ -410,7 +410,11 @@ impl Agent for CodexAgent {
             return Err(Error::auth_required());
         }
 
-        if let Some(conversation) = self.sessions.borrow().get(&request.session_id).cloned() {
+        let conversation = {
+            let sessions = self.sessions.borrow();
+            sessions.get(&request.session_id).cloned()
+        };
+        if let Some(conversation) = conversation {
             return conversation.load().await;
         }
 
