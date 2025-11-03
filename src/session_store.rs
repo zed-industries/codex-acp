@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use agent_client_protocol::{McpServer, ModelId, SessionId, SessionModeId};
-use codex_common::approval_presets::{builtin_approval_presets, ApprovalPreset};
+use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::config::Config;
 use codex_core::protocol::{AskForApproval, SandboxPolicy};
 use codex_protocol::config_types::ReasoningEffort;
@@ -282,22 +282,17 @@ fn write_manifest(path: &Path, records: &HashMap<String, SessionRecord>) -> io::
 pub(crate) fn split_model_id(
     model_id: &str,
 ) -> Result<(String, ReasoningEffort), serde_json::Error> {
-    let (model, reasoning) = model_id
-        .split_once('/')
-        .ok_or_else(|| {
-            serde_json::Error::io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid model identifier",
-            ))
-        })?;
+    let (model, reasoning) = model_id.split_once('/').ok_or_else(|| {
+        serde_json::Error::io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid model identifier",
+        ))
+    })?;
     let effort: ReasoningEffort = serde_json::from_value(reasoning.into())?;
     Ok((model.to_string(), effort))
 }
 
-pub fn apply_session_config_overrides(
-    config: &mut Config,
-    record: &SessionRecord,
-) {
+pub fn apply_session_config_overrides(config: &mut Config, record: &SessionRecord) {
     config.cwd.clone_from(&record.cwd);
 
     if let Some(approval) = record.approval_policy {

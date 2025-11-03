@@ -132,8 +132,7 @@ impl CodexAgent {
                         None
                     } else {
                         Some(
-                            env
-                                .iter()
+                            env.iter()
                                 .map(|entry| (entry.name.clone(), entry.value.clone()))
                                 .collect(),
                         )
