@@ -35,7 +35,7 @@ use codex_core::{
         McpToolCallEndEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent,
         ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
         ReviewOutputEvent, ReviewRequest, SandboxPolicy, StreamErrorEvent, TaskCompleteEvent,
-        TaskStartedEvent, TurnAbortedEvent, UserMessageEvent, ViewImageToolCallEvent,
+        TaskStartedEvent, TurnAbortedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
         WebSearchBeginEvent, WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
@@ -500,6 +500,9 @@ impl PromptState {
                     drop(response_tx.send(Err(err)));
                 }
             }
+            EventMsg::Warning(WarningEvent { message }) => {
+                warn!("Warning: {message}");
+            }
 
             // Since we are getting the deltas, we can ignore these events
             EventMsg::AgentReasoning(..)
@@ -779,16 +782,11 @@ impl PromptState {
         });
 
         let risk = risk.map(|risk| {
-            let mut str = format!(
+            format!(
                 "Risk Assessment: {}\nRisk Level: {}",
                 risk.description,
                 risk.risk_level.as_str()
-            );
-            if !risk.risk_categories.is_empty() {
-                str.push_str("\nRisk Categories:");
-                str.push_str(&risk.risk_categories.iter().map(|c| c.as_str()).join(", "));
-            }
-            str
+            )
         });
 
         let content = match (reason, risk) {
@@ -1196,6 +1194,9 @@ impl TaskState {
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
                 }
+            }
+            EventMsg::Warning(WarningEvent { message }) => {
+                warn!("Warning: {message}");
             }
             // Expected but ignored
             EventMsg::TaskStarted(..)
