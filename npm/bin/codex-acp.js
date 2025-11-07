@@ -47,7 +47,9 @@ function getBinaryPath() {
 
   try {
     // Try to resolve the platform-specific package
-    const binaryPath = fileURLToPath(import.meta.resolve(`${packageName}/bin/${binaryName}`));
+    const binaryPath = fileURLToPath(
+      import.meta.resolve(`${packageName}/bin/${binaryName}`),
+    );
 
     if (existsSync(binaryPath)) {
       return binaryPath;
