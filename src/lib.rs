@@ -22,6 +22,10 @@ pub static ACP_CLIENT: OnceLock<Arc<AgentSideConnection>> = OnceLock::new();
 ///
 /// This sets up an ACP agent that communicates over stdio, bridging
 /// the ACP protocol with the existing codex-rs infrastructure.
+///
+/// # Errors
+///
+/// If unable to parse the config or start the program.
 pub async fn run_main(
     _codex_linux_sandbox_exe: Option<PathBuf>,
     cli_config_overrides: CliConfigOverrides,

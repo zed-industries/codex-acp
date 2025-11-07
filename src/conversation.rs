@@ -60,7 +60,7 @@ use crate::{
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 
-/// Trait for abstracting over the CodexConversation to make testing easier.
+/// Trait for abstracting over the `CodexConversation` to make testing easier.
 #[async_trait::async_trait]
 pub trait CodexConversationImpl {
     async fn submit(&self, op: Op) -> Result<String, CodexErr>;
@@ -132,7 +132,7 @@ impl Conversation {
         let actor = ConversationActor::new(
             auth,
             SessionClient::new(session_id, client_capabilities),
-            conversation.clone(),
+            conversation,
             config,
             model_presets,
             message_rx,
@@ -257,7 +257,7 @@ impl CustomPromptsState {
                 custom_prompts,
             }) => {
                 if let Some(tx) = self.response_tx.take() {
-                    let _ = tx.send(Ok(custom_prompts));
+                    drop(tx.send(Ok(custom_prompts)));
                 }
             }
             e => {
@@ -307,6 +307,7 @@ impl PromptState {
         !response_tx.is_closed()
     }
 
+    #[expect(clippy::too_many_lines)]
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         self.event_count += 1;
 
@@ -1111,7 +1112,7 @@ fn parse_command_tool_call(parsed_cmd: Vec<ParsedCommand>, cwd: &Path) -> ParseC
                 titles.push(match (query, path.as_ref()) {
                     (Some(query), Some(path)) => format!("Search {query} in {path}"),
                     (Some(query), None) => format!("Search {query}"),
-                    _ => format!("Search {}", cmd),
+                    _ => format!("Search {cmd}"),
                 });
                 cmd_path = path.map(PathBuf::from);
                 kind = ToolKind::Search;
@@ -1424,10 +1425,10 @@ impl<A: Auth> ConversationActor<A> {
     async fn handle_message(&mut self, message: ConversationMessage) {
         match message {
             ConversationMessage::Load { response_tx } => {
-                let result = self.handle_load().await;
+                let result = self.handle_load();
                 drop(response_tx.send(result));
                 let client = self.client.clone();
-                let mut available_commands = self.builtin_commands();
+                let mut available_commands = Self::builtin_commands();
                 let load_custom_prompts = self.load_custom_prompts().await;
                 let custom_prompts = self.custom_prompts.clone();
 
@@ -1489,7 +1490,7 @@ impl<A: Auth> ConversationActor<A> {
         }
     }
 
-    fn builtin_commands(&mut self) -> Vec<AvailableCommand> {
+    fn builtin_commands() -> Vec<AvailableCommand> {
         vec![
             AvailableCommand {
                 name: "review".to_string(),
@@ -1602,7 +1603,7 @@ impl<A: Auth> ConversationActor<A> {
         ModelId(format!("{id}/{effort}").into())
     }
 
-    fn parse_model_id(id: ModelId) -> Result<(String, ReasoningEffort), Error> {
+    fn parse_model_id(id: &ModelId) -> Result<(String, ReasoningEffort), Error> {
         let Some((model, reasoning)) = id.0.split_once('/') else {
             return Err(Error::internal_error().with_data(format!("Invalid model ID: {id}")));
         };
@@ -1640,7 +1641,7 @@ impl<A: Auth> ConversationActor<A> {
         })
     }
 
-    async fn handle_load(&mut self) -> Result<LoadSessionResponse, Error> {
+    fn handle_load(&mut self) -> Result<LoadSessionResponse, Error> {
         Ok(LoadSessionResponse {
             modes: self.modes(),
             models: Some(self.models()?),
@@ -1779,13 +1780,13 @@ impl<A: Auth> ConversationActor<A> {
                 set_project_trusted(&self.config.codex_home, &self.config.cwd)?;
             }
             SandboxPolicy::ReadOnly => {}
-        };
+        }
 
         Ok(())
     }
 
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
-        let (model, effort) = Self::parse_model_id(model)?;
+        let (model, effort) = Self::parse_model_id(&model)?;
 
         self.conversation
             .submit(Op::OverrideTurnContext {
@@ -2476,7 +2477,7 @@ mod tests {
             session_client,
             conversation.clone(),
             config,
-            Default::default(),
+            Rc::default(),
             message_rx,
         );
         actor.custom_prompts = Rc::new(RefCell::new(custom_prompts));

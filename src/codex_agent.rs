@@ -90,7 +90,7 @@ impl CodexAgent {
         SessionId(conversation_id.to_string().into())
     }
 
-    async fn get_conversation(&self, session_id: &SessionId) -> Result<Rc<Conversation>, Error> {
+    fn get_conversation(&self, session_id: &SessionId) -> Result<Rc<Conversation>, Error> {
         Ok(self
             .sessions
             .borrow()
@@ -292,9 +292,7 @@ impl Agent for CodexAgent {
             conversation_id,
             conversation,
             session_configured: _,
-        } = self
-            .conversation_manager
-            .new_conversation(config.clone())
+        } = Box::pin(self.conversation_manager.new_conversation(config.clone()))
             .await
             .map_err(|_e| Error::internal_error())?;
 
@@ -352,7 +350,7 @@ impl Agent for CodexAgent {
         }
 
         // Get the session state
-        let conversation = self.get_conversation(&request.session_id).await?;
+        let conversation = self.get_conversation(&request.session_id)?;
         let stop_reason = conversation.prompt(request).await?;
 
         Ok(PromptResponse {
@@ -363,10 +361,7 @@ impl Agent for CodexAgent {
 
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
         info!("Cancelling operations for session: {}", args.session_id);
-        self.get_conversation(&args.session_id)
-            .await?
-            .cancel()
-            .await?;
+        self.get_conversation(&args.session_id)?.cancel().await?;
         Ok(())
     }
 
@@ -375,8 +370,7 @@ impl Agent for CodexAgent {
         args: SetSessionModeRequest,
     ) -> Result<SetSessionModeResponse, Error> {
         info!("Setting session mode for session: {}", args.session_id);
-        self.get_conversation(&args.session_id)
-            .await?
+        self.get_conversation(&args.session_id)?
             .set_mode(args.mode_id)
             .await?;
         Ok(SetSessionModeResponse::default())
@@ -388,8 +382,7 @@ impl Agent for CodexAgent {
     ) -> Result<SetSessionModelResponse, Error> {
         info!("Setting session model for session: {}", args.session_id);
 
-        self.get_conversation(&args.session_id)
-            .await?
+        self.get_conversation(&args.session_id)?
             .set_model(args.model_id)
             .await?;
 
