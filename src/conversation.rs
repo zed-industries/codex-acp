@@ -1830,7 +1830,7 @@ impl<A: Auth> ConversationActor<A> {
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
         } else {
-            error!("Received event for unknown submission ID: {}", id);
+            warn!("Received event for unknown submission ID: {id} {msg:?}");
         }
     }
 }
