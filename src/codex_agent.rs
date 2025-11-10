@@ -16,7 +16,7 @@ use codex_core::{
     },
     protocol::SessionSource,
 };
-use codex_login::{CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
+use codex_login::{AuthMode, CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
 use codex_protocol::ConversationId;
 use std::{
     cell::RefCell,
@@ -158,6 +158,20 @@ impl Agent for CodexAgent {
         request: AuthenticateRequest,
     ) -> Result<AuthenticateResponse, Error> {
         let auth_method = CodexAuthMethod::try_from(request.method_id)?;
+
+        // Check before starting login flow if already authenticated with the same method
+        if let Some(auth) = self.auth_manager.auth() {
+            match (auth.mode, auth_method) {
+                (
+                    AuthMode::ApiKey,
+                    CodexAuthMethod::CodexApiKey | CodexAuthMethod::OpenAiApiKey,
+                )
+                | (AuthMode::ChatGPT, CodexAuthMethod::ChatGpt) => {
+                    return Ok(AuthenticateResponse { meta: None });
+                }
+                _ => {}
+            }
+        }
 
         match auth_method {
             CodexAuthMethod::ChatGpt => {
