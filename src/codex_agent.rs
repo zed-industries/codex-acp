@@ -157,6 +157,11 @@ impl Agent for CodexAgent {
         &self,
         request: AuthenticateRequest,
     ) -> Result<AuthenticateResponse, Error> {
+        // Check before starting login flow if already authenticated
+        if self.auth_manager.auth().is_some() {
+            return Ok(AuthenticateResponse { meta: None });
+        }
+
         let auth_method = CodexAuthMethod::try_from(request.method_id)?;
 
         match auth_method {
