@@ -2490,6 +2490,51 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_delta_deduplication() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest {
+                session_id: session_id.clone(),
+                prompt: vec!["test delta".into()],
+                meta: None,
+            },
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        // We should only get ONE notification, not duplicates from both delta and non-delta
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(
+            notifications.len(),
+            1,
+            "Should only receive delta event, not duplicate non-delta. Got: {notifications:?}"
+        );
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "test delta"
+        ));
+
+        Ok(())
+    }
+
     async fn setup(
         custom_prompts: Vec<CustomPrompt>,
     ) -> anyhow::Result<(
@@ -2576,9 +2621,18 @@ mod tests {
                                     thread_id: id.to_string(),
                                     turn_id: id.to_string(),
                                     item_id: id.to_string(),
-                                    delta: prompt,
+                                    delta: prompt.clone(),
                                 },
                             ),
+                        })
+                        .unwrap();
+                    // Send non-delta event (should be deduplicated, but handled by deduplication)
+                    self.op_tx
+                        .send(Event {
+                            id: id.to_string(),
+                            msg: EventMsg::AgentMessage(AgentMessageEvent {
+                                message: prompt,
+                            }),
                         })
                         .unwrap();
                     self.op_tx
