@@ -282,6 +282,8 @@ struct PromptState {
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     submission_id: String,
+    seen_message_deltas: bool,
+    seen_reasoning_deltas: bool,
 }
 
 impl PromptState {
@@ -297,6 +299,8 @@ impl PromptState {
             event_count: 0,
             response_tx: Some(response_tx),
             submission_id,
+            seen_message_deltas: false,
+            seen_reasoning_deltas: false,
         }
     }
 
@@ -361,7 +365,8 @@ impl PromptState {
                 delta,
             }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
-                client.send_agent_text_delta(delta).await;
+                self.seen_message_deltas = true;
+                client.send_agent_text(delta).await;
             }
             EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
                 thread_id,
@@ -376,11 +381,13 @@ impl PromptState {
                 delta,
             }) => {
                 info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
-                client.send_agent_thought_delta(delta).await;
+                self.seen_reasoning_deltas = true;
+                client.send_agent_thought(delta).await;
             }
             EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {}) => {
                 // Make sure the section heading actually get spacing
-                client.send_agent_thought_delta("\n\n").await;
+                self.seen_reasoning_deltas = true;
+                client.send_agent_thought("\n\n").await;
             }
             EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
                 // Send this to the client via session/update notification
@@ -518,10 +525,16 @@ impl PromptState {
             }
             EventMsg::AgentMessage(AgentMessageEvent { message }) => {
                 info!("Agent message (non-delta) received: {message:?}");
+                if std::mem::take(&mut self.seen_message_deltas) {
+                    return;
+                }
                 client.send_agent_text(message).await;
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
                 info!("Agent reasoning (non-delta) received: {text:?}");
+                if std::mem::take(&mut self.seen_reasoning_deltas) {
+                    return;
+                }
                 client.send_agent_thought(text).await;
             }
 
@@ -1270,8 +1283,6 @@ struct SessionClient {
     session_id: SessionId,
     client: Arc<dyn Client>,
     client_capabilities: Arc<Mutex<ClientCapabilities>>,
-    seen_message_deltas: Rc<RefCell<bool>>,
-    seen_reasoning_deltas: Rc<RefCell<bool>>,
 }
 
 impl SessionClient {
@@ -1280,8 +1291,6 @@ impl SessionClient {
             session_id,
             client: ACP_CLIENT.get().expect("Client should be set").clone(),
             client_capabilities,
-            seen_message_deltas: Rc::new(RefCell::new(false)),
-            seen_reasoning_deltas: Rc::new(RefCell::new(false)),
         }
     }
 
@@ -1295,8 +1304,6 @@ impl SessionClient {
             session_id,
             client,
             client_capabilities,
-            seen_message_deltas: Rc::new(RefCell::new(false)),
-            seen_reasoning_deltas: Rc::new(RefCell::new(false)),
         }
     }
 
@@ -1327,31 +1334,11 @@ impl SessionClient {
     }
 
     async fn send_agent_text(&self, text: impl Into<String>) {
-        if *self.seen_message_deltas.borrow() {
-            *self.seen_message_deltas.borrow_mut() = false;
-            return;
-        }
-        self.send_content(text, SessionUpdate::AgentMessageChunk)
-            .await;
-    }
-
-    async fn send_agent_text_delta(&self, text: impl Into<String>) {
-        *self.seen_message_deltas.borrow_mut() = true;
         self.send_content(text, SessionUpdate::AgentMessageChunk)
             .await;
     }
 
     async fn send_agent_thought(&self, text: impl Into<String>) {
-        if *self.seen_reasoning_deltas.borrow() {
-            *self.seen_reasoning_deltas.borrow_mut() = false;
-            return;
-        }
-        self.send_content(text, SessionUpdate::AgentThoughtChunk)
-            .await;
-    }
-
-    async fn send_agent_thought_delta(&self, text: impl Into<String>) {
-        *self.seen_reasoning_deltas.borrow_mut() = true;
         self.send_content(text, SessionUpdate::AgentThoughtChunk)
             .await;
     }
