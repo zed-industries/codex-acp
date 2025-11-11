@@ -35,7 +35,7 @@ use codex_core::{
         McpToolCallEndEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent,
         ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
         ReviewOutputEvent, ReviewRequest, SandboxPolicy, StreamErrorEvent, TaskCompleteEvent,
-        TaskStartedEvent, TurnAbortedEvent, UserMessageEvent, ViewImageToolCallEvent,
+        TaskStartedEvent, TurnAbortedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
         WebSearchBeginEvent, WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
@@ -60,7 +60,7 @@ use crate::{
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 
-/// Trait for abstracting over the CodexConversation to make testing easier.
+/// Trait for abstracting over the `CodexConversation` to make testing easier.
 #[async_trait::async_trait]
 pub trait CodexConversationImpl {
     async fn submit(&self, op: Op) -> Result<String, CodexErr>;
@@ -132,7 +132,7 @@ impl Conversation {
         let actor = ConversationActor::new(
             auth,
             SessionClient::new(session_id, client_capabilities),
-            conversation.clone(),
+            conversation,
             config,
             model_presets,
             message_rx,
@@ -257,7 +257,7 @@ impl CustomPromptsState {
                 custom_prompts,
             }) => {
                 if let Some(tx) = self.response_tx.take() {
-                    let _ = tx.send(Ok(custom_prompts));
+                    drop(tx.send(Ok(custom_prompts)));
                 }
             }
             e => {
@@ -311,6 +311,7 @@ impl PromptState {
         !response_tx.is_closed()
     }
 
+    #[expect(clippy::too_many_lines)]
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         self.event_count += 1;
 
@@ -536,6 +537,9 @@ impl PromptState {
                     return;
                 }
                 client.send_agent_thought(text).await;
+            }
+            EventMsg::Warning(WarningEvent { message }) => {
+                warn!("Warning: {message}");
             }
 
             // Ignore these events
@@ -814,16 +818,11 @@ impl PromptState {
         });
 
         let risk = risk.map(|risk| {
-            let mut str = format!(
+            format!(
                 "Risk Assessment: {}\nRisk Level: {}",
                 risk.description,
                 risk.risk_level.as_str()
-            );
-            if !risk.risk_categories.is_empty() {
-                str.push_str("\nRisk Categories:");
-                str.push_str(&risk.risk_categories.iter().map(|c| c.as_str()).join(", "));
-            }
-            str
+            )
         });
 
         let content = match (reason, risk) {
@@ -1148,7 +1147,7 @@ fn parse_command_tool_call(parsed_cmd: Vec<ParsedCommand>, cwd: &Path) -> ParseC
                 titles.push(match (query, path.as_ref()) {
                     (Some(query), Some(path)) => format!("Search {query} in {path}"),
                     (Some(query), None) => format!("Search {query}"),
-                    _ => format!("Search {}", cmd),
+                    _ => format!("Search {cmd}"),
                 });
                 cmd_path = path.map(PathBuf::from);
                 kind = ToolKind::Search;
@@ -1231,6 +1230,9 @@ impl TaskState {
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
                 }
+            }
+            EventMsg::Warning(WarningEvent { message }) => {
+                warn!("Warning: {message}");
             }
             // Expected but ignored
             EventMsg::TaskStarted(..)
@@ -1460,10 +1462,10 @@ impl<A: Auth> ConversationActor<A> {
     async fn handle_message(&mut self, message: ConversationMessage) {
         match message {
             ConversationMessage::Load { response_tx } => {
-                let result = self.handle_load().await;
+                let result = self.handle_load();
                 drop(response_tx.send(result));
                 let client = self.client.clone();
-                let mut available_commands = self.builtin_commands();
+                let mut available_commands = Self::builtin_commands();
                 let load_custom_prompts = self.load_custom_prompts().await;
                 let custom_prompts = self.custom_prompts.clone();
 
@@ -1525,7 +1527,7 @@ impl<A: Auth> ConversationActor<A> {
         }
     }
 
-    fn builtin_commands(&mut self) -> Vec<AvailableCommand> {
+    fn builtin_commands() -> Vec<AvailableCommand> {
         vec![
             AvailableCommand {
                 name: "review".to_string(),
@@ -1638,20 +1640,17 @@ impl<A: Auth> ConversationActor<A> {
         ModelId(format!("{id}/{effort}").into())
     }
 
-    fn parse_model_id(id: ModelId) -> Result<(String, ReasoningEffort), Error> {
-        let Some((model, reasoning)) = id.0.split_once('/') else {
-            return Err(Error::internal_error().with_data(format!("Invalid model ID: {id}")));
-        };
-        let reasoning = serde_json::from_value(reasoning.into()).map_err(|_| {
-            Error::internal_error().with_data(format!("Invalid reasoning effort: {reasoning}"))
-        })?;
-        Ok((model.to_owned(), reasoning))
+    fn parse_model_id(id: &ModelId) -> Option<(String, ReasoningEffort)> {
+        let (model, reasoning) = id.0.split_once('/')?;
+        let reasoning = serde_json::from_value(reasoning.into()).ok()?;
+        Some((model.to_owned(), reasoning))
     }
 
     fn models(&self) -> Result<SessionModelState, Error> {
-        let current_model_id = self.find_current_model().ok_or_else(|| {
-            anyhow::anyhow!("No valid model preset for model {}", self.config.model)
-        })?;
+        let current_model_id = self.find_current_model().unwrap_or_else(|| {
+            // If no preset found, return the current model string as-is
+            ModelId(self.config.model.clone().into())
+        });
 
         let available_models = self
             .model_presets
@@ -1676,7 +1675,7 @@ impl<A: Auth> ConversationActor<A> {
         })
     }
 
-    async fn handle_load(&mut self) -> Result<LoadSessionResponse, Error> {
+    fn handle_load(&mut self) -> Result<LoadSessionResponse, Error> {
         Ok(LoadSessionResponse {
             modes: self.modes(),
             models: Some(self.models()?),
@@ -1815,28 +1814,43 @@ impl<A: Auth> ConversationActor<A> {
                 set_project_trusted(&self.config.codex_home, &self.config.cwd)?;
             }
             SandboxPolicy::ReadOnly => {}
-        };
+        }
 
         Ok(())
     }
 
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
-        let (model, effort) = Self::parse_model_id(model)?;
+        // Try parsing as preset format, otherwise use as-is, fallback to config
+        let (model_to_use, effort_to_use) = Self::parse_model_id(&model)
+            .map(|(m, e)| (m, Some(e)))
+            .unwrap_or_else(|| {
+                let model_str = model.0.to_string();
+                let fallback = if !model_str.is_empty() {
+                    model_str
+                } else {
+                    self.config.model.clone()
+                };
+                (fallback, self.config.model_reasoning_effort)
+            });
+
+        if model_to_use.is_empty() {
+            return Err(Error::invalid_params().with_data("No model parsed or configured"));
+        }
 
         self.conversation
             .submit(Op::OverrideTurnContext {
                 cwd: None,
                 approval_policy: None,
                 sandbox_policy: None,
-                model: Some(model.clone()),
-                effort: Some(Some(effort)),
+                model: Some(model_to_use.clone()),
+                effort: Some(effort_to_use),
                 summary: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
-        self.config.model = model;
-        self.config.model_reasoning_effort = Some(effort);
+        self.config.model = model_to_use;
+        self.config.model_reasoning_effort = effort_to_use;
 
         Ok(())
     }
@@ -1853,7 +1867,7 @@ impl<A: Auth> ConversationActor<A> {
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
         } else {
-            error!("Received event for unknown submission ID: {}", id);
+            warn!("Received event for unknown submission ID: {id} {msg:?}");
         }
     }
 }
@@ -2557,7 +2571,7 @@ mod tests {
             session_client,
             conversation.clone(),
             config,
-            Default::default(),
+            Rc::default(),
             message_rx,
         );
         actor.custom_prompts = Rc::new(RefCell::new(custom_prompts));
@@ -2630,9 +2644,7 @@ mod tests {
                     self.op_tx
                         .send(Event {
                             id: id.to_string(),
-                            msg: EventMsg::AgentMessage(AgentMessageEvent {
-                                message: prompt,
-                            }),
+                            msg: EventMsg::AgentMessage(AgentMessageEvent { message: prompt }),
                         })
                         .unwrap();
                     self.op_tx
