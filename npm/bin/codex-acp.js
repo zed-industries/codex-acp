@@ -2,6 +2,7 @@
 
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 // Map Node.js platform/arch to package names
 function getPlatformPackage() {
@@ -46,9 +47,9 @@ function getBinaryPath() {
 
   try {
     // Try to resolve the platform-specific package
-    const binaryPath = import.meta
-      .resolve(`${packageName}/bin/${binaryName}`)
-      .replace("file://", "");
+    const binaryPath = fileURLToPath(
+      import.meta.resolve(`${packageName}/bin/${binaryName}`),
+    );
 
     if (existsSync(binaryPath)) {
       return binaryPath;

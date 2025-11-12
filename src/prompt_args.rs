@@ -1,4 +1,4 @@
-/// Mostly copied from `codex_tui::bottom_pane::prompt_args`: https://github.com/zed-industries/codex/blob/9baf30493dd9f531af1e4dc49a781654b1b2c966/codex-rs/tui/src/bottom_pane/prompt_args.rs#L1
+/// Mostly copied from `codex_tui::bottom_pane::prompt_args`: <https://github.com/zed-industries/codex/blob/9baf30493dd9f531af1e4dc49a781654b1b2c966/codex-rs/tui/src/bottom_pane/prompt_args.rs#L1>
 use codex_protocol::custom_prompts::CustomPrompt;
 use regex_lite::Regex;
 use shlex::Shlex;
@@ -132,9 +132,8 @@ pub fn expand_custom_prompt(
     rest: &str,
     custom_prompts: &[CustomPrompt],
 ) -> Result<Option<String>, PromptExpansionError> {
-    let prompt = match custom_prompts.iter().find(|p| p.name == name) {
-        Some(prompt) => prompt,
-        None => return Ok(None),
+    let Some(prompt) = custom_prompts.iter().find(|p| p.name == name) else {
+        return Ok(None);
     };
     // If there are named placeholders, expect key=value inputs.
     let required = prompt_argument_names(&prompt.content);

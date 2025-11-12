@@ -113,9 +113,9 @@ impl AcpFs {
         local_spawner: LocalSpawner,
     ) -> Self {
         Self {
-            session_id,
             client_capabilities,
             local_spawner,
+            session_id,
         }
     }
 }

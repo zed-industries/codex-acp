@@ -16,7 +16,7 @@ use codex_core::{
     },
     protocol::SessionSource,
 };
-use codex_login::{CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
+use codex_login::{AuthMode, CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
 use codex_protocol::ConversationId;
 use std::{
     cell::RefCell,
@@ -216,7 +216,7 @@ impl CodexAgent {
         SessionId(conversation_id.to_string().into())
     }
 
-    async fn get_conversation(&self, session_id: &SessionId) -> Result<Rc<Conversation>, Error> {
+    fn get_conversation(&self, session_id: &SessionId) -> Result<Rc<Conversation>, Error> {
         Ok(self
             .sessions
             .borrow()
@@ -284,6 +284,20 @@ impl Agent for CodexAgent {
         request: AuthenticateRequest,
     ) -> Result<AuthenticateResponse, Error> {
         let auth_method = CodexAuthMethod::try_from(request.method_id)?;
+
+        // Check before starting login flow if already authenticated with the same method
+        if let Some(auth) = self.auth_manager.auth() {
+            match (auth.mode, auth_method) {
+                (
+                    AuthMode::ApiKey,
+                    CodexAuthMethod::CodexApiKey | CodexAuthMethod::OpenAiApiKey,
+                )
+                | (AuthMode::ChatGPT, CodexAuthMethod::ChatGpt) => {
+                    return Ok(AuthenticateResponse { meta: None });
+                }
+                _ => {}
+            }
+        }
 
         match auth_method {
             CodexAuthMethod::ChatGpt => {
@@ -357,9 +371,7 @@ impl Agent for CodexAgent {
             conversation_id,
             conversation,
             session_configured,
-        } = self
-            .conversation_manager
-            .new_conversation(config.clone())
+        } = Box::pin(self.conversation_manager.new_conversation(config.clone()))
             .await
             .map_err(|_e| Error::internal_error())?;
 
@@ -493,7 +505,7 @@ impl Agent for CodexAgent {
         }
 
         // Get the session state
-        let conversation = self.get_conversation(&request.session_id).await?;
+        let conversation = self.get_conversation(&request.session_id)?;
         let stop_reason = conversation.prompt(request).await?;
 
         Ok(PromptResponse {
@@ -504,10 +516,7 @@ impl Agent for CodexAgent {
 
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
         info!("Cancelling operations for session: {}", args.session_id);
-        self.get_conversation(&args.session_id)
-            .await?
-            .cancel()
-            .await?;
+        self.get_conversation(&args.session_id)?.cancel().await?;
         Ok(())
     }
 
@@ -518,8 +527,7 @@ impl Agent for CodexAgent {
         info!("Setting session mode for session: {}", args.session_id);
         let session_id = args.session_id;
         let mode_id = args.mode_id;
-        self.get_conversation(&session_id)
-            .await?
+        self.get_conversation(&session_id)?
             .set_mode(mode_id.clone())
             .await?;
         self.persist_mode_update(&session_id, &mode_id);
@@ -535,8 +543,7 @@ impl Agent for CodexAgent {
         let session_id = args.session_id;
         let model_id = args.model_id;
 
-        self.get_conversation(&session_id)
-            .await?
+        self.get_conversation(&session_id)?
             .set_model(model_id.clone())
             .await?;
 
