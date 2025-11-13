@@ -282,6 +282,8 @@ struct PromptState {
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     submission_id: String,
+    seen_message_deltas: bool,
+    seen_reasoning_deltas: bool,
 }
 
 impl PromptState {
@@ -297,6 +299,8 @@ impl PromptState {
             event_count: 0,
             response_tx: Some(response_tx),
             submission_id,
+            seen_message_deltas: false,
+            seen_reasoning_deltas: false,
         }
     }
 
@@ -357,15 +361,33 @@ impl PromptState {
             }
             EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent { thread_id, turn_id, item_id, delta }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
+                self.seen_message_deltas = true;
                 client.send_agent_text(delta).await;
             }
-            EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent { thread_id, turn_id, item_id, delta  }) | EventMsg::ReasoningRawContentDelta(ReasoningRawContentDeltaEvent { thread_id, turn_id, item_id, delta }) => {
-                info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
+            EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent { thread_id, turn_id, item_id, delta })
+            | EventMsg::ReasoningRawContentDelta(ReasoningRawContentDeltaEvent { thread_id, turn_id, item_id, delta }) => {
+                info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
+                self.seen_reasoning_deltas = true;
                 client.send_agent_thought(delta).await;
             }
             EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {}) => {
                 // Make sure the section heading actually get spacing
+                self.seen_reasoning_deltas = true;
                 client.send_agent_thought("\n\n").await;
+            }
+            EventMsg::AgentMessage(AgentMessageEvent { message }) => {
+                info!("Agent message (non-delta) received: {message:?}");
+                // We didn't receive this message via streaming
+                if !std::mem::take(&mut self.seen_message_deltas) {
+                    client.send_agent_text(message).await;
+                }
+            }
+            EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
+                info!("Agent reasoning (non-delta) received: {text:?}");
+                // We didn't receive this message via streaming
+                if !std::mem::take(&mut self.seen_reasoning_deltas) {
+                    client.send_agent_thought(text).await;
+                }
             }
             EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
                 // Send this to the client via session/update notification
@@ -505,10 +527,8 @@ impl PromptState {
                 warn!("Warning: {message}");
             }
 
-            // Since we are getting the deltas, we can ignore these events
-            EventMsg::AgentReasoning(..)
-            | EventMsg::AgentReasoningRawContent(..)
-            | EventMsg::AgentMessage(..)
+            // Ignore these events
+            EventMsg::AgentReasoningRawContent(..)
             // In the future we can use this to update usage stats
             | EventMsg::TokenCount(..)
             // we already have a way to diff the turn, so ignore
@@ -2467,6 +2487,51 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_delta_deduplication() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest {
+                session_id: session_id.clone(),
+                prompt: vec!["test delta".into()],
+                meta: None,
+            },
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        // We should only get ONE notification, not duplicates from both delta and non-delta
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(
+            notifications.len(),
+            1,
+            "Should only receive delta event, not duplicate non-delta. Got: {notifications:?}"
+        );
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "test delta"
+        ));
+
+        Ok(())
+    }
+
     async fn setup(
         custom_prompts: Vec<CustomPrompt>,
     ) -> anyhow::Result<(
@@ -2553,9 +2618,16 @@ mod tests {
                                     thread_id: id.to_string(),
                                     turn_id: id.to_string(),
                                     item_id: id.to_string(),
-                                    delta: prompt,
+                                    delta: prompt.clone(),
                                 },
                             ),
+                        })
+                        .unwrap();
+                    // Send non-delta event (should be deduplicated, but handled by deduplication)
+                    self.op_tx
+                        .send(Event {
+                            id: id.to_string(),
+                            msg: EventMsg::AgentMessage(AgentMessageEvent { message: prompt }),
                         })
                         .unwrap();
                     self.op_tx
