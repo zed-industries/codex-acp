@@ -359,28 +359,13 @@ impl PromptState {
             }) => {
                 info!("User message: {message:?}");
             }
-            EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
-                thread_id,
-                turn_id,
-                item_id,
-                delta,
-            }) => {
+            EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent { thread_id, turn_id, item_id, delta }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
                 self.seen_message_deltas = true;
                 client.send_agent_text(delta).await;
             }
-            EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
-                thread_id,
-                turn_id,
-                item_id,
-                delta,
-            })
-            | EventMsg::ReasoningRawContentDelta(ReasoningRawContentDeltaEvent {
-                thread_id,
-                turn_id,
-                item_id,
-                delta,
-            }) => {
+            EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent { thread_id, turn_id, item_id, delta })
+            | EventMsg::ReasoningRawContentDelta(ReasoningRawContentDeltaEvent { thread_id, turn_id, item_id, delta }) => {
                 info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought(delta).await;
@@ -389,6 +374,20 @@ impl PromptState {
                 // Make sure the section heading actually get spacing
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought("\n\n").await;
+            }
+            EventMsg::AgentMessage(AgentMessageEvent { message }) => {
+                info!("Agent message (non-delta) received: {message:?}");
+                // We didn't receive this message via streaming
+                if !std::mem::take(&mut self.seen_message_deltas) {
+                    client.send_agent_text(message).await;
+                }
+            }
+            EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
+                info!("Agent reasoning (non-delta) received: {text:?}");
+                // We didn't receive this message via streaming
+                if !std::mem::take(&mut self.seen_reasoning_deltas) {
+                    client.send_agent_thought(text).await;
+                }
             }
             EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
                 // Send this to the client via session/update notification
@@ -523,20 +522,6 @@ impl PromptState {
                 if let Err(err) = self.review_mode_exit(client, event).await && let Some(response_tx) = self.response_tx.take() {
                     drop(response_tx.send(Err(err)));
                 }
-            }
-            EventMsg::AgentMessage(AgentMessageEvent { message }) => {
-                info!("Agent message (non-delta) received: {message:?}");
-                if std::mem::take(&mut self.seen_message_deltas) {
-                    return;
-                }
-                client.send_agent_text(message).await;
-            }
-            EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
-                info!("Agent reasoning (non-delta) received: {text:?}");
-                if std::mem::take(&mut self.seen_reasoning_deltas) {
-                    return;
-                }
-                client.send_agent_thought(text).await;
             }
             EventMsg::Warning(WarningEvent { message }) => {
                 warn!("Warning: {message}");
@@ -1336,21 +1321,19 @@ impl SessionClient {
     }
 
     async fn send_agent_text(&self, text: impl Into<String>) {
-        self.send_content(text, SessionUpdate::AgentMessageChunk)
-            .await;
+        self.send_notification(SessionUpdate::AgentMessageChunk(ContentChunk {
+            content: ContentBlock::Text(TextContent {
+                text: text.into(),
+                annotations: None,
+                meta: None,
+            }),
+            meta: None,
+        }))
+        .await;
     }
 
     async fn send_agent_thought(&self, text: impl Into<String>) {
-        self.send_content(text, SessionUpdate::AgentThoughtChunk)
-            .await;
-    }
-
-    async fn send_content(
-        &self,
-        text: impl Into<String>,
-        wrapper: fn(ContentChunk) -> SessionUpdate,
-    ) {
-        self.send_notification(wrapper(ContentChunk {
+        self.send_notification(SessionUpdate::AgentThoughtChunk(ContentChunk {
             content: ContentBlock::Text(TextContent {
                 text: text.into(),
                 annotations: None,
