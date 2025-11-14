@@ -20,7 +20,7 @@ use agent_client_protocol::{
 };
 use codex_common::{
     approval_presets::{ApprovalPreset, builtin_approval_presets},
-    model_presets::ModelPreset,
+    model_presets::{ModelPreset, all_model_presets},
 };
 use codex_core::{
     AuthManager, CodexConversation,
@@ -58,6 +58,7 @@ use crate::{
 };
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
+static MODEL_PRESETS: LazyLock<&Vec<ModelPreset>> = LazyLock::new(all_model_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 
 /// Trait for abstracting over the `CodexConversation` to make testing easier.
@@ -125,7 +126,6 @@ impl Conversation {
         auth: Arc<AuthManager>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         config: Config,
-        model_presets: Rc<Vec<ModelPreset>>,
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
 
@@ -134,7 +134,6 @@ impl Conversation {
             SessionClient::new(session_id, client_capabilities),
             conversation,
             config,
-            model_presets,
             message_rx,
         );
         let handle = tokio::task::spawn_local(actor.spawn());
@@ -364,13 +363,14 @@ impl PromptState {
                 self.seen_message_deltas = true;
                 client.send_agent_text(delta).await;
             }
-            EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent { thread_id, turn_id, item_id, delta })
-            | EventMsg::ReasoningRawContentDelta(ReasoningRawContentDeltaEvent { thread_id, turn_id, item_id, delta }) => {
-                info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
+            EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent { thread_id, turn_id, item_id, delta, summary_index: index })
+            | EventMsg::ReasoningRawContentDelta(ReasoningRawContentDeltaEvent { thread_id, turn_id, item_id, delta, content_index: index }) => {
+                info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought(delta).await;
             }
-            EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {}) => {
+            EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent { item_id, summary_index}) => {
+                info!("Agent reasoning section break received:  item_id: {item_id}, index: {summary_index}");
                 // Make sure the section heading actually get spacing
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought("\n\n").await;
@@ -1391,8 +1391,6 @@ struct ConversationActor<A> {
     config: Config,
     /// The custom prompts loaded for this workspace.
     custom_prompts: Rc<RefCell<Vec<CustomPrompt>>>,
-    /// The model presets for the conversation.
-    model_presets: Rc<Vec<ModelPreset>>,
     /// A sender for each interested `Op` submission that needs events routed.
     submissions: HashMap<String, SubmissionState>,
     /// A receiver for incoming conversation messages.
@@ -1405,7 +1403,6 @@ impl<A: Auth> ConversationActor<A> {
         client: SessionClient,
         conversation: Arc<dyn CodexConversationImpl>,
         config: Config,
-        model_presets: Rc<Vec<ModelPreset>>,
         message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
     ) -> Self {
         Self {
@@ -1414,7 +1411,6 @@ impl<A: Auth> ConversationActor<A> {
             conversation,
             config,
             custom_prompts: Rc::default(),
-            model_presets,
             submissions: HashMap::new(),
             message_rx,
         }
@@ -1600,8 +1596,7 @@ impl<A: Auth> ConversationActor<A> {
     }
 
     fn find_current_model(&self) -> Option<ModelId> {
-        let preset = self
-            .model_presets
+        let preset = MODEL_PRESETS
             .iter()
             .find(|preset| preset.model == self.config.model)?;
 
@@ -1635,8 +1630,7 @@ impl<A: Auth> ConversationActor<A> {
             ModelId(self.config.model.clone().into())
         });
 
-        let available_models = self
-            .model_presets
+        let available_models = MODEL_PRESETS
             .iter()
             .flat_map(|preset| {
                 preset
@@ -2554,7 +2548,6 @@ mod tests {
             session_client,
             conversation.clone(),
             config,
-            Rc::default(),
             message_rx,
         );
         actor.custom_prompts = Rc::new(RefCell::new(custom_prompts));
