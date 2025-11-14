@@ -6,7 +6,6 @@ use agent_client_protocol::{
     SessionId, SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest,
     SetSessionModelResponse, V1,
 };
-use codex_common::model_presets::{ModelPreset, builtin_model_presets};
 use codex_core::{
     ConversationManager, NewConversation,
     auth::{AuthManager, read_codex_api_key_from_env, read_openai_api_key_from_env},
@@ -46,8 +45,6 @@ pub struct CodexAgent {
     conversation_manager: ConversationManager,
     /// Active sessions mapped by `SessionId`
     sessions: Rc<RefCell<HashMap<SessionId, Rc<Conversation>>>>,
-    /// Default model presets for a given auth mode
-    model_presets: Rc<Vec<ModelPreset>>,
 }
 
 impl CodexAgent {
@@ -61,9 +58,6 @@ impl CodexAgent {
 
         let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
 
-        let model_presets = Rc::new(builtin_model_presets(
-            auth_manager.auth().map(|auth| auth.mode),
-        ));
         let local_spawner = LocalSpawner::new();
         let capabilities_clone = client_capabilities.clone();
         let conversation_manager =
@@ -82,7 +76,6 @@ impl CodexAgent {
             config,
             conversation_manager,
             sessions: Rc::default(),
-            model_presets,
         }
     }
 
@@ -317,7 +310,6 @@ impl Agent for CodexAgent {
             self.auth_manager.clone(),
             self.client_capabilities.clone(),
             config.clone(),
-            self.model_presets.clone(),
         ));
         let load = conversation.load().await?;
 
