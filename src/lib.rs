@@ -30,7 +30,7 @@ pub static ACP_CLIENT: OnceLock<Arc<AgentSideConnection>> = OnceLock::new();
 /// If unable to parse the config or start the program.
 pub async fn run_main(
     _codex_linux_sandbox_exe: Option<PathBuf>,
-    mut cli_config_overrides: CliConfigOverrides,
+    cli_config_overrides: CliConfigOverrides,
 ) -> IoResult<()> {
     // Install a simple subscriber so `tracing` output is visible.
     // Users can control the log level with `RUST_LOG`.
