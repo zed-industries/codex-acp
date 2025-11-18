@@ -91,6 +91,13 @@ impl CodexAgent {
             .ok_or_else(Error::invalid_request)?
             .clone())
     }
+
+    fn check_auth(&self) -> Result<(), Error> {
+        if self.config.model_provider_id == "openai" && self.auth_manager.auth().is_none() {
+            return Err(Error::auth_required());
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -218,9 +225,8 @@ impl Agent for CodexAgent {
 
     async fn new_session(&self, request: NewSessionRequest) -> Result<NewSessionResponse, Error> {
         // Check before sending if authentication was successful or not
-        if self.auth_manager.auth().is_none() {
-            return Err(Error::auth_required());
-        }
+        self.check_auth()?;
+
         let NewSessionRequest {
             cwd,
             mcp_servers,
@@ -333,9 +339,7 @@ impl Agent for CodexAgent {
     ) -> Result<LoadSessionResponse, Error> {
         info!("Loading session: {}", request.session_id);
         // Check before sending if authentication was successful or not
-        if self.auth_manager.auth().is_none() {
-            return Err(Error::auth_required());
-        }
+        self.check_auth()?;
 
         // Check if we have this session already
         let Some(conversation) = self.sessions.borrow().get(&request.session_id).cloned() else {
@@ -351,9 +355,7 @@ impl Agent for CodexAgent {
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {
         info!("Processing prompt for session: {}", request.session_id);
         // Check before sending if authentication was successful or not
-        if self.auth_manager.auth().is_none() {
-            return Err(Error::auth_required());
-        }
+        self.check_auth()?;
 
         // Get the session state
         let conversation = self.get_conversation(&request.session_id)?;
