@@ -463,9 +463,11 @@ impl PromptState {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
             }
-            EventMsg::Error(ErrorEvent { message })
-            | EventMsg::StreamError(StreamErrorEvent { message }) => {
-                error!("Error during turn: {}", message);
+            EventMsg::StreamError(StreamErrorEvent { message }) => {
+                error!("Handled error during turn: {}", message);
+            }
+            EventMsg::Error(ErrorEvent { message }) => {
+                error!("Unhandled error during turn: {}", message);
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Err(Error::internal_error().with_data(message))).ok();
                 }
@@ -1195,9 +1197,11 @@ impl TaskState {
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
                 client.send_agent_thought(text).await;
             }
-            EventMsg::Error(ErrorEvent { message })
-            | EventMsg::StreamError(StreamErrorEvent { message }) => {
-                error!("Error during turn: {}", message);
+            EventMsg::StreamError(StreamErrorEvent { message }) => {
+                error!("Handled error during turn: {}", message);
+            }
+            EventMsg::Error(ErrorEvent { message }) => {
+                error!("Unhandled error during turn: {}", message);
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx
                         .send(Err(Error::internal_error().with_data(message)))
