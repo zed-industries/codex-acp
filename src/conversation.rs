@@ -1630,6 +1630,20 @@ impl<A: Auth> ConversationActor<A> {
             ModelId(self.config.model.clone().into())
         });
 
+        // If the user is using a custom provider, don't return the list
+        if self.config.model_provider_id != "openai" {
+            return Ok(SessionModelState {
+                available_models: vec![ModelInfo {
+                    model_id: current_model_id.clone(),
+                    name: format!("{current_model_id} ({})", self.config.model_provider.name),
+                    description: None,
+                    meta: None,
+                }],
+                current_model_id,
+                meta: None,
+            });
+        }
+
         let available_models = MODEL_PRESETS
             .iter()
             .flat_map(|preset| {
