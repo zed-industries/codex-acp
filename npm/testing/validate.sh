@@ -80,8 +80,8 @@ EXPECTED_PACKAGES=(
   "@zed-industries/codex-acp-darwin-x64"
   "@zed-industries/codex-acp-linux-arm64"
   "@zed-industries/codex-acp-linux-x64"
-  "@zed-industries/codex-acp-windows-arm64"
-  "@zed-industries/codex-acp-windows-x64"
+  "@zed-industries/codex-acp-win32-arm64"
+  "@zed-industries/codex-acp-win32-x64"
 )
 
 missing_packages=0

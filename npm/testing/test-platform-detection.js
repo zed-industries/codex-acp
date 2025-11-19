@@ -18,8 +18,8 @@ function getPlatformPackage() {
       x64: "codex-acp-linux-x64",
     },
     win32: {
-      arm64: "codex-acp-windows-arm64",
-      x64: "codex-acp-windows-x64",
+      arm64: "codex-acp-win32-arm64",
+      x64: "codex-acp-win32-x64",
     },
   };
 
@@ -45,8 +45,8 @@ function testAllPlatforms() {
     { platform: "darwin", arch: "x64", expected: "codex-acp-darwin-x64" },
     { platform: "linux", arch: "arm64", expected: "codex-acp-linux-arm64" },
     { platform: "linux", arch: "x64", expected: "codex-acp-linux-x64" },
-    { platform: "win32", arch: "arm64", expected: "codex-acp-windows-arm64" },
-    { platform: "win32", arch: "x64", expected: "codex-acp-windows-x64" },
+    { platform: "win32", arch: "arm64", expected: "codex-acp-win32-arm64" },
+    { platform: "win32", arch: "x64", expected: "codex-acp-win32-x64" },
   ];
 
   console.log("Testing platform detection logic...\n");
@@ -70,18 +70,16 @@ function testAllPlatforms() {
     try {
       const result = getPlatformPackage();
       if (result === testCase.expected) {
-        console.log(
-          `✓ ${testCase.platform}-${testCase.arch} -> ${result}`
-        );
+        console.log(`✓ ${testCase.platform}-${testCase.arch} -> ${result}`);
       } else {
         console.error(
-          `✗ ${testCase.platform}-${testCase.arch} -> Expected: ${testCase.expected}, Got: ${result}`
+          `✗ ${testCase.platform}-${testCase.arch} -> Expected: ${testCase.expected}, Got: ${result}`,
         );
         allPassed = false;
       }
     } catch (e) {
       console.error(
-        `✗ ${testCase.platform}-${testCase.arch} -> Error: ${e.message}`
+        `✗ ${testCase.platform}-${testCase.arch} -> Error: ${e.message}`,
       );
       allPassed = false;
     } finally {
