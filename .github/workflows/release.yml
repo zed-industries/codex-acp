@@ -198,14 +198,12 @@ jobs:
           path: npm-packages
 
       - name: Publish platform packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for pkg in npm-packages/*; do
             if [ -d "$pkg" ]; then
               echo "Publishing $(basename $pkg)..."
               cd "$pkg"
-              npm publish --provenance --access public
+              npm publish
               cd ../..
             fi
           done
@@ -241,11 +239,9 @@ jobs:
           sleep 30
 
       - name: Publish base package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd npm
-          npm publish --provenance --access public
+          npm publish
 
   create-release:
     name: Create Release
