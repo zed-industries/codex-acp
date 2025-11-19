@@ -198,6 +198,8 @@ jobs:
           path: npm-packages
 
       - name: Publish platform packages
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for pkg in npm-packages/*; do
             if [ -d "$pkg" ]; then
@@ -239,6 +241,8 @@ jobs:
           sleep 30
 
       - name: Publish base package
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd npm
           npm publish
