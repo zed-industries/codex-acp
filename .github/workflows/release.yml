@@ -205,7 +205,7 @@ jobs:
             if [ -d "$pkg" ]; then
               echo "Publishing $(basename $pkg)..."
               cd "$pkg"
-              npm publish
+              npm publish --provenance --access public
               cd ../..
             fi
           done
@@ -245,7 +245,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd npm
-          npm publish
+          npm publish --provenance --access public
 
   create-release:
     name: Create Release
