@@ -199,7 +199,7 @@ jobs:
 
       - name: Publish platform packages
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for pkg in npm-packages/*; do
             if [ -d "$pkg" ]; then
@@ -242,7 +242,7 @@ jobs:
 
       - name: Publish base package
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd npm
           npm publish
