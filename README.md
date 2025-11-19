@@ -56,6 +56,18 @@ Or via npm:
 npx @zed-industries/codex-acp
 ```
 
+### Session persistence
+
+Enable persistent sessions with either:
+
+- `codex-acp --session-persist` (or `--session-persist=/custom/path`)
+- Environment variables: `CODEX_SESSION_PERSIST=1` and optionally `CODEX_SESSION_DIR=/custom/path`
+
+By default, metadata lives alongside rollout JSONL files under `${CODEX_HOME}/sessions`. The
+manifest keeps track of the rollout path, model/mode overrides, and MCP servers so `/session/load`
+can resume a conversation after the agent restarts. Disable persistence with `--no-session-persist`
+or `CODEX_SESSION_PERSIST=0` if you want the in-memory behavior back.
+
 ## License
 
 Apache-2.0
