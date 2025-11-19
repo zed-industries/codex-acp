@@ -25,15 +25,15 @@ declare -A platforms=(
   ["x86_64-apple-darwin"]="darwin x64 "
   ["x86_64-unknown-linux-gnu"]="linux x64 "
   ["aarch64-unknown-linux-gnu"]="linux arm64 "
-  ["x86_64-pc-windows-msvc"]="windows x64 .exe"
-  ["aarch64-pc-windows-msvc"]="windows arm64 .exe"
+  ["x86_64-pc-windows-msvc"]="win32 x64 .exe"
+  ["aarch64-pc-windows-msvc"]="win32 arm64 .exe"
 )
 
 for target in "${!platforms[@]}"; do
   read os arch ext <<< "${platforms[$target]}"
 
   # Determine archive extension
-  if [[ "$os" == "windows" ]]; then
+  if [[ "$os" == "win32" ]]; then
     archive_ext="zip"
   else
     archive_ext="tar.gz"
@@ -77,7 +77,7 @@ for target in "${!platforms[@]}"; do
   envsubst < "$TEMPLATE_PATH" > "${pkg_dir}/package.json"
 
   # Update bin field for Windows to include .exe extension
-  if [[ "$os" == "windows" ]]; then
+  if [[ "$os" == "win32" ]]; then
     # Use sed to update the bin path in package.json
     sed -i.bak 's|"bin/codex-acp"|"bin/codex-acp.exe"|' "${pkg_dir}/package.json"
     rm "${pkg_dir}/package.json.bak"
