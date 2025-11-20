@@ -88,7 +88,7 @@ impl CodexAgent {
             .sessions
             .borrow()
             .get(session_id)
-            .ok_or_else(Error::invalid_request)?
+            .ok_or_else(|| Error::resource_not_found(None))?
             .clone())
     }
 
@@ -346,7 +346,7 @@ impl Agent for CodexAgent {
             // For now, we can't actually load sessions from disk
             // The conversation manager doesn't have a direct load method
             // We would need to use resume_conversation_from_rollout with a rollout path
-            return Err(Error::invalid_request());
+            return Err(Error::resource_not_found(None));
         };
 
         Ok(conversation.load().await?)
