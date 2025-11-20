@@ -24,24 +24,25 @@ use codex_common::{
 };
 use codex_core::{
     AuthManager, CodexConversation,
-    config::{Config, set_project_trusted},
+    config::{Config, set_project_trust_level},
     error::CodexErr,
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
         AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ErrorEvent, Event,
         EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent,
         ExecCommandOutputDeltaEvent, ExitedReviewModeEvent, FileChange, ItemCompletedEvent,
-        ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation, McpToolCallBeginEvent,
-        McpToolCallEndEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent,
-        ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
-        ReviewOutputEvent, ReviewRequest, SandboxPolicy, StreamErrorEvent, TaskCompleteEvent,
-        TaskStartedEvent, TurnAbortedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
-        WebSearchBeginEvent, WebSearchEndEvent,
+        ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent,
+        McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, Op,
+        PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent,
+        ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
+        SandboxPolicy, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent,
+        UserMessageEvent, ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent,
+        WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
 };
 use codex_protocol::{
-    config_types::ReasoningEffort,
+    config_types::{ReasoningEffort, TrustLevel},
     custom_prompts::CustomPrompt,
     parse_command::ParsedCommand,
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
@@ -528,6 +529,18 @@ impl PromptState {
             EventMsg::Warning(WarningEvent { message }) => {
                 warn!("Warning: {message}");
             }
+            EventMsg::McpStartupUpdate(McpStartupUpdateEvent { server, status }) => {
+                info!("MCP startup update: server={server}, status={status:?}");
+            }
+            EventMsg::McpStartupComplete(McpStartupCompleteEvent {
+                ready,
+                failed,
+                cancelled,
+            }) => {
+                info!(
+                    "MCP startup complete: ready={ready:?}, failed={failed:?}, cancelled={cancelled:?}"
+                );
+            }
 
             // Ignore these events
             EventMsg::AgentReasoningRawContent(..)
@@ -600,6 +613,7 @@ impl PromptState {
             reason,
             // grant_root doesn't seem to be set anywhere on the codex side
             grant_root: _,
+            turn_id: _,
         } = event;
         let (title, locations, content) = extract_tool_call_content_from_changes(changes);
         let response = client
@@ -664,6 +678,7 @@ impl PromptState {
             call_id,
             auto_approved: _,
             changes,
+            turn_id: _,
         } = event;
 
         let (title, locations, content) = extract_tool_call_content_from_changes(changes);
@@ -690,12 +705,24 @@ impl PromptState {
             stdout: _,
             stderr: _,
             success,
+            changes,
+            turn_id: _,
         } = event;
+
+        let (title, locations, content) = if !changes.is_empty() {
+            let (title, locations, content) = extract_tool_call_content_from_changes(changes);
+            (Some(title), Some(locations), Some(content.collect()))
+        } else {
+            (None, None, None)
+        };
 
         client
             .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
                 id: ToolCallId(call_id.into()),
                 fields: ToolCallUpdateFields {
+                    title,
+                    locations,
+                    content,
                     status: Some(if success {
                         ToolCallStatus::Completed
                     } else {
@@ -781,6 +808,7 @@ impl PromptState {
         let ExecApprovalRequestEvent {
             call_id,
             command: _,
+            turn_id: _,
             cwd,
             reason,
             parsed_cmd,
@@ -884,11 +912,13 @@ impl PromptState {
     async fn exec_command_begin(&mut self, client: &SessionClient, event: ExecCommandBeginEvent) {
         let raw_input = serde_json::json!(&event);
         let ExecCommandBeginEvent {
+            turn_id: _,
+            source: _,
+            interaction_input: _,
             call_id,
             command: _,
             cwd,
             parsed_cmd,
-            is_user_shell_command: _,
         } = event;
         // Create a new tool call for the command execution
         let tool_call_id = ToolCallId(call_id.clone().into());
@@ -998,6 +1028,12 @@ impl PromptState {
     async fn exec_command_end(&mut self, client: &SessionClient, event: ExecCommandEndEvent) {
         let raw_output = serde_json::json!(&event);
         let ExecCommandEndEvent {
+            turn_id: _,
+            command: _,
+            cwd: _,
+            parsed_cmd: _,
+            source: _,
+            interaction_input: _,
             call_id,
             exit_code,
             stdout: _,
@@ -1223,7 +1259,19 @@ impl TaskState {
             EventMsg::Warning(WarningEvent { message }) => {
                 warn!("Warning: {message}");
             }
-            // Expected but ignored
+            EventMsg::McpStartupUpdate(McpStartupUpdateEvent { server, status }) => {
+                info!("MCP startup update: server={server}, status={status:?}");
+            }
+            EventMsg::McpStartupComplete(McpStartupCompleteEvent {
+                ready,
+                failed,
+                cancelled,
+            }) => {
+                info!(
+                    "MCP startup complete: ready={ready:?}, failed={failed:?}, cancelled={cancelled:?}"
+                );
+            }
+            // Expected but ignore
             EventMsg::TaskStarted(..)
             | EventMsg::ItemStarted(..)
             | EventMsg::ItemCompleted(..)
@@ -1711,6 +1759,7 @@ impl<A: Auth> ConversationActor<A> {
                         review_request: ReviewRequest {
                             prompt: prompt.to_string(),
                             user_facing_hint: user_facing_hint.to_string(),
+                            append_to_original_thread: true,
                         },
                     }
                 }
@@ -1723,6 +1772,7 @@ impl<A: Auth> ConversationActor<A> {
                                 "Review the code changes against the base branch '{branch}'. Start by finding the merge diff between the current branch and {branch}'s upstream e.g. (`git merge-base HEAD \"$(git rev-parse --abbrev-ref \"{branch}@{{upstream}}\")\"`), then run `git diff` against that SHA to see what changes we would merge into the {branch} branch. Provide prioritized, actionable findings."
                             ),
                             user_facing_hint: format!("changes against '{branch}'"),
+                            append_to_original_thread: true,
                         },
                     }
                 }
@@ -1735,6 +1785,7 @@ impl<A: Auth> ConversationActor<A> {
                                 "Review the code changes introduced by commit {sha}. Provide prioritized, actionable findings."
                             ),
                             user_facing_hint: format!("commit {sha}"),
+                            append_to_original_thread: true,
                         },
                     }
                 }
@@ -1806,7 +1857,11 @@ impl<A: Auth> ConversationActor<A> {
         match preset.sandbox {
             // Treat this user action as a trusted dir
             SandboxPolicy::DangerFullAccess | SandboxPolicy::WorkspaceWrite { .. } => {
-                set_project_trusted(&self.config.codex_home, &self.config.cwd)?;
+                set_project_trust_level(
+                    &self.config.codex_home,
+                    &self.config.cwd,
+                    TrustLevel::Trusted,
+                )?;
             }
             SandboxPolicy::ReadOnly => {}
         }
@@ -2263,7 +2318,8 @@ mod tests {
             &[Op::Review {
                 review_request: ReviewRequest {
                     prompt: "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.".into(),
-                    user_facing_hint: "current changes".into()
+                    user_facing_hint: "current changes".into(),
+                    append_to_original_thread: true,
                 }
             }],
             "ops don't match {ops:?}"
@@ -2318,7 +2374,8 @@ mod tests {
             &[Op::Review {
                 review_request: ReviewRequest {
                     prompt: "Review what we did in agents.md".into(),
-                    user_facing_hint: "Review what we did in agents.md".into()
+                    user_facing_hint: "Review what we did in agents.md".into(),
+                    append_to_original_thread: true,
                 }
             }],
             "ops don't match {ops:?}"
@@ -2373,7 +2430,8 @@ mod tests {
             &[Op::Review {
                 review_request: ReviewRequest {
                     prompt: "Review the code changes introduced by commit 123456. Provide prioritized, actionable findings.".into(),
-                    user_facing_hint: "commit 123456".into()
+                    user_facing_hint: "commit 123456".into(),
+                    append_to_original_thread: true,
                 }
             }],
             "ops don't match {ops:?}"
@@ -2428,7 +2486,8 @@ mod tests {
             &[Op::Review {
                 review_request: ReviewRequest {
                     prompt: "Review the code changes against the base branch 'feature'. Start by finding the merge diff between the current branch and feature's upstream e.g. (`git merge-base HEAD \"$(git rev-parse --abbrev-ref \"feature@{upstream}\")\"`), then run `git diff` against that SHA to see what changes we would merge into the feature branch. Provide prioritized, actionable findings.".into(),
-                    user_facing_hint: "changes against 'feature'".into()
+                    user_facing_hint: "changes against 'feature'".into(),
+                    append_to_original_thread: true,
                 }
             }],
             "ops don't match {ops:?}"
