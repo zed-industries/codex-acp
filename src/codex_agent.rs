@@ -60,6 +60,7 @@ impl CodexAgent {
             SessionSource::Unknown,
             HelloWorldExecutor::shared(),
         );
+
         Self {
             auth_manager,
             client_capabilities,

@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
 mod conversation;
+mod command_executor;
 mod tool_executor;
 mod prompt_args;
 
@@ -71,6 +72,8 @@ pub async fn run_main(
             if ACP_CLIENT.set(Arc::new(client)).is_err() {
                 return Err(std::io::Error::other("ACP client already set"));
             }
+
+            crate::command_executor::init_command_dispatcher();
 
             io_task
                 .await
