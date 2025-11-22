@@ -1407,11 +1407,7 @@ impl SessionClient {
         .await;
     }
 
-    async fn send_token_usage(
-        &self,
-        info: TokenUsageInfo,
-        rate_limits: Option<RateLimitSnapshot>,
-    ) {
+    async fn send_token_usage(&self, info: TokenUsageInfo, rate_limits: Option<RateLimitSnapshot>) {
         let mut meta = serde_json::Map::new();
         meta.insert(
             "token_usage".to_string(),

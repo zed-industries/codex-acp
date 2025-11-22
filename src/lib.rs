@@ -12,10 +12,10 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
-mod conversation;
 mod command_executor;
-mod tool_executor;
+mod conversation;
 mod prompt_args;
+mod tool_executor;
 
 pub static ACP_CLIENT: OnceLock<Arc<AgentSideConnection>> = OnceLock::new();
 

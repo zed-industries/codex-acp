@@ -35,8 +35,7 @@ pub struct ShellExecutionResult {
     pub timed_out: bool,
 }
 
-type ResponseSender =
-    oneshot::Sender<Result<ShellExecutionResult, String>>;
+type ResponseSender = oneshot::Sender<Result<ShellExecutionResult, String>>;
 
 pub struct CommandDispatcher {
     sender: mpsc::UnboundedSender<(ShellExecutionRequest, ResponseSender)>,
