@@ -20,14 +20,14 @@ path = "src/lib.rs"
 agent-client-protocol = { version = "0.7.0", features = ["unstable"] }
 anyhow = "1"
 async-trait = "0.1"
-mcp-types = { git = "https://github.com/sagemathinc/codex", rev = "712399aed05f07ee64675224c1ed99cf27abb63a" }
-codex-apply-patch = { git = "https://github.com/sagemathinc/codex", rev = "712399aed05f07ee64675224c1ed99cf27abb63a" }
-codex-arg0 = { git = "https://github.com/sagemathinc/codex", rev = "712399aed05f07ee64675224c1ed99cf27abb63a" }
-codex-common = { git = "https://github.com/sagemathinc/codex", rev = "712399aed05f07ee64675224c1ed99cf27abb63a", features = ["cli"] }
-codex-core = { git = "https://github.com/sagemathinc/codex", rev = "712399aed05f07ee64675224c1ed99cf27abb63a" }
-codex-mcp-server = { git = "https://github.com/sagemathinc/codex", rev = "712399aed05f07ee64675224c1ed99cf27abb63a" }
-codex-protocol = { git = "https://github.com/sagemathinc/codex", rev = "712399aed05f07ee64675224c1ed99cf27abb63a" }
-codex-login = { git = "https://github.com/sagemathinc/codex", rev = "712399aed05f07ee64675224c1ed99cf27abb63a" }
+mcp-types = { path = "../codex/codex-rs/mcp-types" }
+codex-apply-patch = { path = "../codex/codex-rs/apply-patch" }
+codex-arg0 = { path = "../codex/codex-rs/arg0" }
+codex-common = { path = "../codex/codex-rs/common", features = ["cli"] }
+codex-core = { path = "../codex/codex-rs/core" }
+codex-mcp-server = { path = "../codex/codex-rs/mcp-server" }
+codex-protocol = { path = "../codex/codex-rs/protocol" }
+codex-login = { path = "../codex/codex-rs/login" }
 itertools = "0.14.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

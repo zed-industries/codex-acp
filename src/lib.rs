@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
 mod conversation;
+mod tool_executor;
 mod prompt_args;
 
 pub static ACP_CLIENT: OnceLock<Arc<AgentSideConnection>> = OnceLock::new();

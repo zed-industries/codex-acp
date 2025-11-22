@@ -772,7 +772,6 @@ dependencies = [
 [[package]]
 name = "codex-app-server-protocol"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "clap",
@@ -790,7 +789,6 @@ dependencies = [
 [[package]]
 name = "codex-apply-patch"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "similar",
@@ -802,7 +800,6 @@ dependencies = [
 [[package]]
 name = "codex-arg0"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "codex-apply-patch",
@@ -816,7 +813,6 @@ dependencies = [
 [[package]]
 name = "codex-async-utils"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "async-trait",
  "tokio",
@@ -826,7 +822,6 @@ dependencies = [
 [[package]]
 name = "codex-common"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "clap",
  "codex-app-server-protocol",
@@ -842,7 +837,6 @@ dependencies = [
 [[package]]
 name = "codex-core"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "askama",
@@ -915,7 +909,6 @@ dependencies = [
 [[package]]
 name = "codex-execpolicy"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "clap",
@@ -930,7 +923,6 @@ dependencies = [
 [[package]]
 name = "codex-file-search"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "clap",
@@ -944,7 +936,6 @@ dependencies = [
 [[package]]
 name = "codex-git"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "once_cell",
  "regex",
@@ -959,7 +950,6 @@ dependencies = [
 [[package]]
 name = "codex-keyring-store"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "keyring",
  "tracing",
@@ -968,7 +958,6 @@ dependencies = [
 [[package]]
 name = "codex-linux-sandbox"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "clap",
  "codex-core",
@@ -980,7 +969,6 @@ dependencies = [
 [[package]]
 name = "codex-lmstudio"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "codex-core",
  "reqwest",
@@ -993,7 +981,6 @@ dependencies = [
 [[package]]
 name = "codex-login"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "base64",
  "chrono",
@@ -1015,7 +1002,6 @@ dependencies = [
 [[package]]
 name = "codex-mcp-server"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "codex-arg0",
@@ -1036,7 +1022,6 @@ dependencies = [
 [[package]]
 name = "codex-ollama"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "async-stream",
  "bytes",
@@ -1052,7 +1037,6 @@ dependencies = [
 [[package]]
 name = "codex-otel"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "chrono",
  "codex-app-server-protocol",
@@ -1075,7 +1059,6 @@ dependencies = [
 [[package]]
 name = "codex-protocol"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "base64",
  "codex-git",
@@ -1100,7 +1083,6 @@ dependencies = [
 [[package]]
 name = "codex-rmcp-client"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "axum",
@@ -1127,7 +1109,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-cache"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "lru",
  "sha1",
@@ -1137,7 +1118,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-image"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "base64",
  "codex-utils-cache",
@@ -1149,7 +1129,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-json-to-toml"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "serde_json",
  "toml",
@@ -1158,7 +1137,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-pty"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "portable-pty",
@@ -1168,7 +1146,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-readiness"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "async-trait",
  "thiserror 2.0.17",
@@ -1179,12 +1156,10 @@ dependencies = [
 [[package]]
 name = "codex-utils-string"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 
 [[package]]
 name = "codex-windows-sandbox"
 version = "0.1.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "codex-protocol",
@@ -2832,7 +2807,6 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 [[package]]
 name = "mcp-types"
 version = "0.0.0"
-source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "schemars 0.8.22",
  "serde",
