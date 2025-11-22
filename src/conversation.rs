@@ -464,10 +464,10 @@ impl PromptState {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
             }
-            EventMsg::StreamError(StreamErrorEvent { message }) => {
+            EventMsg::StreamError(StreamErrorEvent { message, .. }) => {
                 error!("Handled error during turn: {}", message);
             }
-            EventMsg::Error(ErrorEvent { message }) => {
+            EventMsg::Error(ErrorEvent { message, .. }) => {
                 error!("Unhandled error during turn: {}", message);
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Err(Error::internal_error().with_data(message))).ok();
@@ -478,6 +478,9 @@ impl PromptState {
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
                 }
+            }
+            EventMsg::ElicitationRequest(event) => {
+                info!("Received elicitation request: {:?}", event);
             }
             EventMsg::ShutdownComplete => {
                 info!("Agent shutting down");
@@ -1238,10 +1241,10 @@ impl TaskState {
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
                 client.send_agent_thought(text).await;
             }
-            EventMsg::StreamError(StreamErrorEvent { message }) => {
+            EventMsg::StreamError(StreamErrorEvent { message, .. }) => {
                 error!("Handled error during turn: {}", message);
             }
-            EventMsg::Error(ErrorEvent { message }) => {
+            EventMsg::Error(ErrorEvent { message, .. }) => {
                 error!("Unhandled error during turn: {}", message);
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx
@@ -1254,6 +1257,9 @@ impl TaskState {
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
                 }
+            }
+            EventMsg::ElicitationRequest(event) => {
+                info!("Received elicitation request: {:?}", event);
             }
             EventMsg::ShutdownComplete => {
                 info!("Agent shutting down");
@@ -2139,14 +2145,12 @@ fn extract_tool_call_content_from_changes(
                         meta: None,
                     },
                     codex_core::protocol::FileChange::Update {
-                        unified_diff: _,
+                        unified_diff,
                         move_path,
-                        old_content,
-                        new_content,
                     } => Diff {
                         path: move_path.unwrap_or(path),
-                        old_text: Some(old_content),
-                        new_text: new_content,
+                        old_text: None,
+                        new_text: unified_diff,
                         meta: None,
                     },
                 },

@@ -25,10 +25,7 @@ use std::{
 };
 use tracing::{debug, info};
 
-use crate::{
-    conversation::Conversation,
-    local_spawner::{AcpFs, LocalSpawner},
-};
+use crate::conversation::Conversation;
 
 /// The Codex implementation of the ACP Agent trait.
 ///
@@ -58,18 +55,8 @@ impl CodexAgent {
 
         let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
 
-        let local_spawner = LocalSpawner::new();
-        let capabilities_clone = client_capabilities.clone();
         let conversation_manager =
-            ConversationManager::new(auth_manager.clone(), SessionSource::Unknown).with_fs(
-                Box::new(move |conversation_id| {
-                    Arc::new(AcpFs::new(
-                        Self::session_id_from_conversation_id(conversation_id),
-                        capabilities_clone.clone(),
-                        local_spawner.clone(),
-                    ))
-                }),
-            );
+            ConversationManager::new(auth_manager.clone(), SessionSource::Unknown);
         Self {
             auth_manager,
             client_capabilities,

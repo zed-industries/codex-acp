@@ -43,3 +43,6 @@ clap = "4.5.53"
 let-underscore = "warn"
 rust-2018-idioms = "warn"
 unused = "warn"
+
+[patch.crates-io]
+rmcp = { git = "https://github.com/bolinfest/rust-sdk", branch = "pr556" }
