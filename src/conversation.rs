@@ -33,11 +33,11 @@ use codex_core::{
         ExecCommandOutputDeltaEvent, ExitedReviewModeEvent, FileChange, ItemCompletedEvent,
         ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent,
         McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, Op,
-        PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent,
+        PatchApplyBeginEvent, PatchApplyEndEvent, RateLimitSnapshot, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
-        SandboxPolicy, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent,
-        UserMessageEvent, ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent,
-        WebSearchEndEvent,
+        SandboxPolicy, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent, TokenCountEvent,
+        TokenUsageInfo, TurnAbortedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
+        WebSearchBeginEvent, WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
 };
@@ -541,11 +541,16 @@ impl PromptState {
                     "MCP startup complete: ready={ready:?}, failed={failed:?}, cancelled={cancelled:?}"
                 );
             }
+            EventMsg::TokenCount(TokenCountEvent { info, rate_limits }) => {
+                if let Some(info) = info {
+                    client
+                        .send_token_usage(info, rate_limits)
+                        .await;
+                }
+            }
 
             // Ignore these events
             EventMsg::AgentReasoningRawContent(..)
-            // In the future we can use this to update usage stats
-            | EventMsg::TokenCount(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
             // Revisit when we can emit status updates
@@ -1394,6 +1399,39 @@ impl SessionClient {
             meta: None,
         }))
         .await;
+    }
+
+    async fn send_token_usage(
+        &self,
+        info: TokenUsageInfo,
+        rate_limits: Option<RateLimitSnapshot>,
+    ) {
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "token_usage".to_string(),
+            serde_json::to_value(info).unwrap_or(serde_json::Value::Null),
+        );
+        if let Some(limits) = rate_limits {
+            meta.insert(
+                "rate_limits".to_string(),
+                serde_json::to_value(limits).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        let notification = SessionNotification {
+            session_id: self.session_id.clone(),
+            update: SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent {
+                    text: String::new(),
+                    annotations: None,
+                    meta: None,
+                }),
+                meta: Some(serde_json::Value::Object(meta)),
+            }),
+            meta: None,
+        };
+        if let Err(e) = self.client.session_notification(notification).await {
+            error!("Failed to send session notification: {:?}", e);
+        }
     }
 
     async fn update_plan(&self, plan: Vec<PlanItemArg>) {
