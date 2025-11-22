@@ -20,15 +20,15 @@ path = "src/lib.rs"
 agent-client-protocol = { version = "0.7.0", features = ["unstable"] }
 anyhow = "1"
 async-trait = "0.1"
-codex-apply-patch = { git = "https://github.com/zed-industries/codex", branch = "acp" }
-codex-arg0 = { git = "https://github.com/zed-industries/codex", branch = "acp" }
-codex-common = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["cli"] }
-codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp" }
-codex-mcp-server = { git = "https://github.com/zed-industries/codex", branch = "acp" }
-codex-protocol = { git = "https://github.com/zed-industries/codex", branch = "acp" }
-codex-login = { git = "https://github.com/zed-industries/codex", branch = "acp" }
+mcp-types = { git = "https://github.com/sagemathinc/codex", rev = "712399aed05f07ee64675224c1ed99cf27abb63a" }
+codex-apply-patch = { git = "https://github.com/sagemathinc/codex", rev = "712399aed05f07ee64675224c1ed99cf27abb63a" }
+codex-arg0 = { git = "https://github.com/sagemathinc/codex", rev = "712399aed05f07ee64675224c1ed99cf27abb63a" }
+codex-common = { git = "https://github.com/sagemathinc/codex", rev = "712399aed05f07ee64675224c1ed99cf27abb63a", features = ["cli"] }
+codex-core = { git = "https://github.com/sagemathinc/codex", rev = "712399aed05f07ee64675224c1ed99cf27abb63a" }
+codex-mcp-server = { git = "https://github.com/sagemathinc/codex", rev = "712399aed05f07ee64675224c1ed99cf27abb63a" }
+codex-protocol = { git = "https://github.com/sagemathinc/codex", rev = "712399aed05f07ee64675224c1ed99cf27abb63a" }
+codex-login = { git = "https://github.com/sagemathinc/codex", rev = "712399aed05f07ee64675224c1ed99cf27abb63a" }
 itertools = "0.14.0"
-mcp-types = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }

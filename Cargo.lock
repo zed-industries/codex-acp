@@ -224,7 +224,7 @@ dependencies = [
  "memchr",
  "proc-macro2",
  "quote",
- "rustc-hash 2.1.1",
+ "rustc-hash",
  "serde",
  "serde_derive",
  "syn 2.0.110",
@@ -569,7 +569,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63044e1ae8e69f3b5a92c736ca6269b8d12fa7efe39bf34ddb06d102cf0e2cab"
 dependencies = [
  "memchr",
- "regex-automata",
  "serde",
 ]
 
@@ -645,6 +644,17 @@ name = "cfg_aliases"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
+
+[[package]]
+name = "chardetng"
+version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14b8f0b65b7b08ae3c8187e8d77174de20cb6777864c6b832d8ad365999cf1ea"
+dependencies = [
+ "cfg-if",
+ "encoding_rs",
+ "memchr",
+]
 
 [[package]]
 name = "chrono"
@@ -762,7 +772,7 @@ dependencies = [
 [[package]]
 name = "codex-app-server-protocol"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "clap",
@@ -772,6 +782,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strum_macros",
+ "thiserror 2.0.17",
  "ts-rs",
  "uuid",
 ]
@@ -779,7 +790,7 @@ dependencies = [
 [[package]]
 name = "codex-apply-patch"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "similar",
@@ -791,7 +802,7 @@ dependencies = [
 [[package]]
 name = "codex-arg0"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "codex-apply-patch",
@@ -805,7 +816,7 @@ dependencies = [
 [[package]]
 name = "codex-async-utils"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "async-trait",
  "tokio",
@@ -815,7 +826,7 @@ dependencies = [
 [[package]]
 name = "codex-common"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "clap",
  "codex-app-server-protocol",
@@ -831,7 +842,7 @@ dependencies = [
 [[package]]
 name = "codex-core"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "askama",
@@ -839,6 +850,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "chardetng",
  "chrono",
  "codex-app-server-protocol",
  "codex-apply-patch",
@@ -853,11 +865,11 @@ dependencies = [
  "codex-utils-pty",
  "codex-utils-readiness",
  "codex-utils-string",
- "codex-utils-tokenizer",
  "codex-windows-sandbox",
  "core-foundation 0.9.4",
  "dirs",
  "dunce",
+ "encoding_rs",
  "env-flags",
  "eventsource-stream",
  "futures",
@@ -867,9 +879,11 @@ dependencies = [
  "landlock",
  "libc",
  "mcp-types",
+ "once_cell",
  "openssl-sys",
  "os_info",
  "rand 0.9.2",
+ "regex",
  "regex-lite",
  "reqwest",
  "seccompiler",
@@ -892,6 +906,7 @@ dependencies = [
  "tracing",
  "tree-sitter",
  "tree-sitter-bash",
+ "url",
  "uuid",
  "which",
  "wildmatch",
@@ -900,7 +915,7 @@ dependencies = [
 [[package]]
 name = "codex-execpolicy"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "clap",
@@ -915,7 +930,7 @@ dependencies = [
 [[package]]
 name = "codex-file-search"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "clap",
@@ -929,7 +944,7 @@ dependencies = [
 [[package]]
 name = "codex-git"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "once_cell",
  "regex",
@@ -944,7 +959,7 @@ dependencies = [
 [[package]]
 name = "codex-keyring-store"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "keyring",
  "tracing",
@@ -953,7 +968,7 @@ dependencies = [
 [[package]]
 name = "codex-linux-sandbox"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "clap",
  "codex-core",
@@ -965,7 +980,7 @@ dependencies = [
 [[package]]
 name = "codex-lmstudio"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "codex-core",
  "reqwest",
@@ -978,7 +993,7 @@ dependencies = [
 [[package]]
 name = "codex-login"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "base64",
  "chrono",
@@ -1000,7 +1015,7 @@ dependencies = [
 [[package]]
 name = "codex-mcp-server"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "codex-arg0",
@@ -1021,7 +1036,7 @@ dependencies = [
 [[package]]
 name = "codex-ollama"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "async-stream",
  "bytes",
@@ -1037,7 +1052,7 @@ dependencies = [
 [[package]]
 name = "codex-otel"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "chrono",
  "codex-app-server-protocol",
@@ -1060,7 +1075,7 @@ dependencies = [
 [[package]]
 name = "codex-protocol"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "base64",
  "codex-git",
@@ -1085,7 +1100,7 @@ dependencies = [
 [[package]]
 name = "codex-rmcp-client"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "axum",
@@ -1112,7 +1127,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-cache"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "lru",
  "sha1",
@@ -1122,7 +1137,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-image"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "base64",
  "codex-utils-cache",
@@ -1134,7 +1149,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-json-to-toml"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "serde_json",
  "toml",
@@ -1143,7 +1158,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-pty"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "portable-pty",
@@ -1153,7 +1168,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-readiness"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "async-trait",
  "thiserror 2.0.17",
@@ -1164,24 +1179,12 @@ dependencies = [
 [[package]]
 name = "codex-utils-string"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
-
-[[package]]
-name = "codex-utils-tokenizer"
-version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
-dependencies = [
- "anyhow",
- "codex-utils-cache",
- "thiserror 2.0.17",
- "tiktoken-rs",
- "tokio",
-]
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 
 [[package]]
 name = "codex-windows-sandbox"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "anyhow",
  "codex-protocol",
@@ -1758,17 +1761,6 @@ dependencies = [
  "futures-core",
  "nom",
  "pin-project-lite",
-]
-
-[[package]]
-name = "fancy-regex"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "531e46835a22af56d1e3b66f04844bed63158bc094a628bec1d321d9b4c44bf2"
-dependencies = [
- "bit-set",
- "regex-automata",
- "regex-syntax 0.8.8",
 ]
 
 [[package]]
@@ -2840,7 +2832,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 [[package]]
 name = "mcp-types"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#e7951021998f73114db23ccd550f3a5d25232342"
+source = "git+https://github.com/sagemathinc/codex?rev=712399aed05f07ee64675224c1ed99cf27abb63a#712399aed05f07ee64675224c1ed99cf27abb63a"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -3763,7 +3755,7 @@ dependencies = [
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
- "rustc-hash 2.1.1",
+ "rustc-hash",
  "rustls",
  "socket2 0.6.1",
  "thiserror 2.0.17",
@@ -3783,7 +3775,7 @@ dependencies = [
  "lru-slab",
  "rand 0.9.2",
  "ring",
- "rustc-hash 2.1.1",
+ "rustc-hash",
  "rustls",
  "rustls-pki-types",
  "slab",
@@ -4048,10 +4040,11 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "0.8.5"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5947688160b56fb6c827e3c20a72c90392a1d7e9dec74749197aa1780ac42ca"
+checksum = "acc36ea743d4bbc97e9f3c33bf0b97765a5cf338de3d9c3d2f321a6e38095615"
 dependencies = [
+ "async-trait",
  "base64",
  "bytes",
  "chrono",
@@ -4082,9 +4075,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "0.8.5"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01263441d3f8635c628e33856c468b96ebbce1af2d3699ea712ca71432d4ee7a"
+checksum = "263caba1c96f2941efca0fdcd97b03f42bcde52d2347d05e5d77c93ab18c5b58"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -4092,12 +4085,6 @@ dependencies = [
  "serde_json",
  "syn 2.0.110",
 ]
-
-[[package]]
-name = "rustc-hash"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustc-hash"
@@ -5058,21 +5045,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "tiktoken-rs"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a19830747d9034cd9da43a60eaa8e552dfda7712424aebf187b7a60126bae0d"
-dependencies = [
- "anyhow",
- "base64",
- "bstr",
- "fancy-regex",
- "lazy_static",
- "regex",
- "rustc-hash 1.1.0",
 ]
 
 [[package]]
