@@ -27,7 +27,7 @@ pub static ACP_CLIENT: OnceLock<Arc<AgentSideConnection>> = OnceLock::new();
 ///
 /// If unable to parse the config or start the program.
 pub async fn run_main(
-    _codex_linux_sandbox_exe: Option<PathBuf>,
+    codex_linux_sandbox_exe: Option<PathBuf>,
     cli_config_overrides: CliConfigOverrides,
 ) -> IoResult<()> {
     // Install a simple subscriber so `tracing` output is visible.
@@ -45,7 +45,12 @@ pub async fn run_main(
         )
     })?;
 
-    let config = Config::load_with_cli_overrides(cli_kv_overrides, ConfigOverrides::default())
+    let config_overrides = ConfigOverrides {
+        codex_linux_sandbox_exe,
+        ..ConfigOverrides::default()
+    };
+
+    let config = Config::load_with_cli_overrides(cli_kv_overrides, config_overrides)
         .await
         .map_err(|e| {
             std::io::Error::new(
