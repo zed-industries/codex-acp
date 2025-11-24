@@ -28,12 +28,12 @@ use codex_core::{
     error::CodexErr,
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
-        AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ErrorEvent, Event,
-        EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent,
-        ExecCommandOutputDeltaEvent, ExitedReviewModeEvent, FileChange, ItemCompletedEvent,
-        ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent,
-        McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, Op,
-        PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent,
+        AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ElicitationAction,
+        ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
+        ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExitedReviewModeEvent, FileChange,
+        ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation,
+        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
+        Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
         SandboxPolicy, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent,
         UserMessageEvent, ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent,
@@ -42,6 +42,7 @@ use codex_core::{
     review_format::format_review_findings_block,
 };
 use codex_protocol::{
+    approvals::ElicitationRequestEvent,
     config_types::{ReasoningEffort, TrustLevel},
     custom_prompts::CustomPrompt,
     parse_command::ParsedCommand,
@@ -49,7 +50,8 @@ use codex_protocol::{
     user_input::UserInput,
 };
 use itertools::Itertools;
-use mcp_types::CallToolResult;
+use mcp_types::{CallToolResult, RequestId};
+use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
@@ -464,13 +466,13 @@ impl PromptState {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
             }
-            EventMsg::StreamError(StreamErrorEvent { message }) => {
-                error!("Handled error during turn: {}", message);
+            EventMsg::StreamError(StreamErrorEvent { message , codex_error_info}) => {
+                error!("Handled error during turn: {message} {codex_error_info:?}");
             }
-            EventMsg::Error(ErrorEvent { message }) => {
-                error!("Unhandled error during turn: {}", message);
+            EventMsg::Error(ErrorEvent { message, codex_error_info }) => {
+                error!("Unhandled error during turn: {message} {codex_error_info:?}");
                 if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Err(Error::internal_error().with_data(message))).ok();
+                    response_tx.send(Err(Error::internal_error().with_data(json!({ "message": message, "codex_error_info": codex_error_info })))).ok();
                 }
             }
             EventMsg::TurnAborted(TurnAbortedEvent { reason }) => {
@@ -541,6 +543,12 @@ impl PromptState {
                     "MCP startup complete: ready={ready:?}, failed={failed:?}, cancelled={cancelled:?}"
                 );
             }
+            EventMsg::ElicitationRequest(event) => {
+                info!("Elicitation request: server={}, id={:?}, message={}", event.server_name, event.id, event.message);
+                if let Err(err) = self.mcp_elicitation(client, event).await && let Some(response_tx) = self.response_tx.take() {
+                    drop(response_tx.send(Err(err)));
+                }
+            }
 
             // Ignore these events
             EventMsg::AgentReasoningRawContent(..)
@@ -567,6 +575,77 @@ impl PromptState {
                 warn!("Unexpected event: {:?}", e);
             }
         }
+    }
+
+    async fn mcp_elicitation(
+        &self,
+        client: &SessionClient,
+        event: ElicitationRequestEvent,
+    ) -> Result<(), Error> {
+        let raw_input = serde_json::json!(&event);
+        let ElicitationRequestEvent {
+            server_name,
+            id,
+            message,
+        } = event;
+        let response = client
+            .request_permission(
+                ToolCallUpdate {
+                    id: ToolCallId(match &id {
+                        RequestId::String(s) => s.clone().into(),
+                        RequestId::Integer(i) => i.to_string().into(),
+                    }),
+                    fields: ToolCallUpdateFields {
+                        kind: Some(ToolKind::Other),
+                        status: Some(ToolCallStatus::Pending),
+                        title: Some(server_name.clone()),
+                        content: Some(vec![message.into()]),
+                        raw_input: Some(raw_input),
+                        ..Default::default()
+                    },
+                    meta: None,
+                },
+                vec![
+                    PermissionOption {
+                        id: PermissionOptionId("approved".into()),
+                        name: "Yes, provide the requested info".into(),
+                        kind: PermissionOptionKind::AllowOnce,
+                        meta: None,
+                    },
+                    PermissionOption {
+                        id: PermissionOptionId("abort".into()),
+                        name: "No, but continue without it".into(),
+                        kind: PermissionOptionKind::RejectOnce,
+                        meta: None,
+                    },
+                    PermissionOption {
+                        id: PermissionOptionId("cancel".into()),
+                        name: "Cancel this request".into(),
+                        kind: PermissionOptionKind::RejectOnce,
+                        meta: None,
+                    },
+                ],
+            )
+            .await?;
+
+        let decision = match response.outcome {
+            RequestPermissionOutcome::Cancelled => ElicitationAction::Cancel,
+            RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
+                "approved" => ElicitationAction::Accept,
+                "abort" => ElicitationAction::Decline,
+                _ => ElicitationAction::Cancel,
+            },
+        };
+
+        self.conversation
+            .submit(Op::ResolveElicitation {
+                server_name,
+                request_id: id,
+                decision,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        Ok(())
     }
 
     async fn review_mode_exit(
@@ -1233,14 +1312,22 @@ impl TaskState {
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
                 client.send_agent_thought(text).await;
             }
-            EventMsg::StreamError(StreamErrorEvent { message }) => {
-                error!("Handled error during turn: {}", message);
+            EventMsg::StreamError(StreamErrorEvent {
+                message,
+                codex_error_info,
+            }) => {
+                error!("Handled error during turn: {message} {codex_error_info:?}");
             }
-            EventMsg::Error(ErrorEvent { message }) => {
-                error!("Unhandled error during turn: {}", message);
+            EventMsg::Error(ErrorEvent {
+                message,
+                codex_error_info,
+            }) => {
+                error!("Unhandled error during turn: {message} {codex_error_info:?}");
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx
-                        .send(Err(Error::internal_error().with_data(message)))
+                        .send(Err(Error::internal_error().with_data(
+                            json!({ "message": message, "codex_error_info": codex_error_info }),
+                        )))
                         .ok();
                 }
             }
@@ -1309,6 +1396,7 @@ impl TaskState {
             | EventMsg::EnteredReviewMode(..)
             | EventMsg::ExitedReviewMode(..)
             | EventMsg::DeprecationNotice(..)
+            | EventMsg::ElicitationRequest(..)
             | EventMsg::UndoStarted(..)
             | EventMsg::UndoCompleted(..)) => {
                 warn!("Unexpected event: {:?}", e);
