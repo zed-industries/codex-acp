@@ -1729,13 +1729,19 @@ impl<A: Auth> ConversationActor<A> {
     }
 
     fn modes(&self) -> Option<SessionModeState> {
-        let current_mode_id = APPROVAL_PRESETS
+        let current_preset = APPROVAL_PRESETS
             .iter()
             .find(|preset| {
                 preset.approval == self.config.approval_policy
                     && preset.sandbox == self.config.sandbox_policy
             })
-            .map(|preset| SessionModeId(preset.id.into()))?;
+            .unwrap_or(
+                APPROVAL_PRESETS
+                    .first()
+                    .expect("approval presets are empty!"),
+            );
+
+        let current_mode_id = SessionModeId(current_preset.id.into());
 
         Some(SessionModeState {
             current_mode_id,
@@ -1745,10 +1751,16 @@ impl<A: Auth> ConversationActor<A> {
                     id: SessionModeId(preset.id.into()),
                     name: preset.label.to_owned(),
                     description: Some(preset.description.to_owned()),
-                    meta: None,
+                    meta: Some(json!({
+                        "approval_policy": current_preset.approval,
+                        "sandbox_policy": current_preset.sandbox,
+                    })),
                 })
                 .collect(),
-            meta: None,
+            meta: Some(json!({
+                "approval_policy": current_preset.approval,
+                "sandbox_policy": current_preset.sandbox,
+            })),
         })
     }
 
