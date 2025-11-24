@@ -588,13 +588,14 @@ impl PromptState {
             id,
             message,
         } = event;
+        let tool_call_id = ToolCallId(match &id {
+            RequestId::String(s) => s.clone().into(),
+            RequestId::Integer(i) => i.to_string().into(),
+        });
         let response = client
             .request_permission(
                 ToolCallUpdate {
-                    id: ToolCallId(match &id {
-                        RequestId::String(s) => s.clone().into(),
-                        RequestId::Integer(i) => i.to_string().into(),
-                    }),
+                    id: tool_call_id.clone(),
                     fields: ToolCallUpdateFields {
                         kind: Some(ToolKind::Other),
                         status: Some(ToolCallStatus::Pending),
@@ -645,6 +646,22 @@ impl PromptState {
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        client
+            .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                id: tool_call_id,
+                fields: ToolCallUpdateFields {
+                    status: Some(if decision == ElicitationAction::Accept {
+                        ToolCallStatus::Completed
+                    } else {
+                        ToolCallStatus::Failed
+                    }),
+                    ..Default::default()
+                },
+                meta: None,
+            }))
+            .await;
+
         Ok(())
     }
 
