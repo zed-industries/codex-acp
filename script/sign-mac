@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+    echo "Usage: $0 <binary_path>"
+    exit 1
+fi
+
+binary_path="$1"
+
+if [[ ! -f "$binary_path" ]]; then
+    echo "Error: Binary not found at $binary_path"
+    exit 1
+fi
+
+can_code_sign=false
+IDENTITY="Zed Industries, Inc."
+
+echo "Code signing binary at $binary_path"
+
+if [[ -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]]; then
+    can_code_sign=true
+
+    echo "Setting up keychain for code signing..."
+    security create-keychain -p "$MACOS_CERTIFICATE_PASSWORD" codex-acp.keychain || echo ""
+    security default-keychain -s codex-acp.keychain
+    security unlock-keychain -p "$MACOS_CERTIFICATE_PASSWORD" codex-acp.keychain
+    security set-keychain-settings codex-acp.keychain
+    echo "$MACOS_CERTIFICATE" | base64 --decode > /tmp/codex-acp-certificate.p12
+    security import /tmp/codex-acp-certificate.p12 -k codex-acp.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+    rm /tmp/codex-acp-certificate.p12
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_CERTIFICATE_PASSWORD" codex-acp.keychain
+
+    function cleanup() {
+        echo "Cleaning up keychain"
+        security default-keychain -s login.keychain
+        security delete-keychain codex-acp.keychain
+    }
+
+    trap cleanup EXIT
+fi
+
+if [[ $can_code_sign = true ]]; then
+    echo "Signing with identity: $IDENTITY"
+    /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${binary_path}" -v
+    echo "✓ Successfully signed ${binary_path}"
+    exit 0
+else
+    echo "One or more of the following variables are missing: MACOS_CERTIFICATE, MACOS_CERTIFICATE_PASSWORD"
+    echo "====== WARNING ======"
+    echo "Binary is NOT code signed. Performing ad-hoc signing for local use."
+    echo "====== WARNING ======"
+    exit 1
+fi
