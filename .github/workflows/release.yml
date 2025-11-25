@@ -105,7 +105,6 @@ jobs:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
         run: |
-          chmod +x script/sign-mac
           ./script/sign-mac target/${{ matrix.target }}/release/codex-acp
 
       - name: Create archive
