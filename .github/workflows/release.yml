@@ -99,6 +99,15 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Code sign macOS binary
+        if: startsWith(matrix.os, 'macos')
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          chmod +x script/sign-mac
+          ./script/sign-mac target/${{ matrix.target }}/release/codex-acp
+
       - name: Create archive
         id: create_archive
         shell: bash
