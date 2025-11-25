@@ -42,7 +42,7 @@ if [[ -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]]; th
 fi
 
 if [[ $can_code_sign = true ]]; then
-    echo "Signing with identity: $IDENTITY"
+    echo "Signing binary ${binary_path}"
     /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${binary_path}" -v
     echo "✓ Successfully signed ${binary_path}"
     exit 0
