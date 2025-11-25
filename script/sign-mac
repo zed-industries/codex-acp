@@ -48,8 +48,5 @@ if [[ $can_code_sign = true ]]; then
     exit 0
 else
     echo "One or more of the following variables are missing: MACOS_CERTIFICATE, MACOS_CERTIFICATE_PASSWORD"
-    echo "====== WARNING ======"
-    echo "Binary is NOT code signed. Performing ad-hoc signing for local use."
-    echo "====== WARNING ======"
     exit 1
 fi
