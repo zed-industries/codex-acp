@@ -9,6 +9,14 @@ $ErrorActionPreference = 'Stop'
 Write-Host "Windows code signing script for codex-acp"
 Write-Host "Binary path: $BinaryPath"
 
+if (-not (Test-Path $BinaryPath)) {
+    Write-Error "Error: Binary not found at $BinaryPath"
+    exit 1
+}
+
+$BinaryPath = Convert-Path $BinaryPath
+Write-Host "Binary path (absolute): $BinaryPath"
+
 # Verify the binary exists
 if (-not (Test-Path $BinaryPath)) {
     Write-Error "Error: Binary not found at $BinaryPath"
