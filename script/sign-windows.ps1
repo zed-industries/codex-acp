@@ -53,9 +53,14 @@ if ($canCodeSign) {
             Write-Host "Installing Az.CodeSigning module..."
             Install-Module -Name Az.CodeSigning -Repository PSGallery -Force -Scope CurrentUser
         }
-
-        # Import the module
         Import-Module Az.CodeSigning -ErrorAction Stop
+
+        # Check if TrustedSigning module is available
+        if (-not (Get-Module -ListAvailable -Name TrustedSigning)) {
+            Write-Host "Installing TrustedSigning module..."
+            Install-Module -Name TrustedSigning -Repository PSGallery -Force -Scope CurrentUser
+        }
+        Import-Module TrustedSigning -ErrorAction Stop
 
         # Authenticate with Azure using service principal
         $securePassword = ConvertTo-SecureString $env:AZURE_CLIENT_SECRET -AsPlainText -Force
