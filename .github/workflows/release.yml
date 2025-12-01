@@ -99,6 +99,29 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Code sign macOS binary
+        if: startsWith(matrix.os, 'macos')
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          ./script/sign-mac target/${{ matrix.target }}/release/codex-acp
+
+      - name: Code sign Windows binary
+        if: startsWith(matrix.os, 'windows')
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          ACCOUNT_NAME: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
+          CERT_PROFILE_NAME: ${{ vars.AZURE_SIGNING_CERT_PROFILE_NAME }}
+          ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          FILE_DIGEST: SHA256
+          TIMESTAMP_DIGEST: SHA256
+          TIMESTAMP_SERVER: http://timestamp.acs.microsoft.com
+        run: |
+          .\script\sign-windows.ps1 target\${{ matrix.target }}\release\codex-acp.exe
+
       - name: Create archive
         id: create_archive
         shell: bash
