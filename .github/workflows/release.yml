@@ -113,12 +113,12 @@ jobs:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-          ACCOUNT_NAME: ${{ secrets.WINDOWS_ACCOUNT_NAME }}
-          CERT_PROFILE_NAME: ${{ secrets.WINDOWS_CERT_PROFILE_NAME }}
-          ENDPOINT: ${{ secrets.WINDOWS_ENDPOINT }}
-          FILE_DIGEST: ${{ secrets.WINDOWS_FILE_DIGEST }}
-          TIMESTAMP_DIGEST: ${{ secrets.WINDOWS_TIMESTAMP_DIGEST }}
-          TIMESTAMP_SERVER: ${{ secrets.WINDOWS_TIMESTAMP_SERVER }}
+          ACCOUNT_NAME: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
+          CERT_PROFILE_NAME: ${{ vars.AZURE_SIGNING_CERT_PROFILE_NAME }}
+          ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          FILE_DIGEST: SHA256
+          TIMESTAMP_DIGEST: SHA256
+          TIMESTAMP_SERVER: http://timestamp.acs.microsoft.com
         run: |
           .\script\sign-windows.ps1 target\${{ matrix.target }}\release\codex-acp.exe
 
