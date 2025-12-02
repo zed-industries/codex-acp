@@ -45,6 +45,35 @@ if [[ $can_code_sign = true ]]; then
     echo "Signing binary ${binary_path}"
     /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${binary_path}" -v
     echo "✓ Successfully signed ${binary_path}"
+
+    if [[ -n "${APPLE_NOTARIZATION_KEY:-}" && -n "${APPLE_NOTARIZATION_KEY_ID:-}" && -n "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
+        echo "Notarizing binary with Apple"
+
+        # Create temporary zip file for notarization
+        temp_zip=$(mktemp).zip
+        zip -q "$temp_zip" "${binary_path}"
+
+        # Create temporary file for the API key
+        notarization_key_file=$(mktemp)
+        echo "$APPLE_NOTARIZATION_KEY" > "$notarization_key_file"
+
+        # Submit for notarization and wait for completion
+        xcode_bin_dir_path="$(xcode-select -p)/usr/bin"
+        "${xcode_bin_dir_path}/notarytool" submit --wait \
+            --key "$notarization_key_file" \
+            --key-id "$APPLE_NOTARIZATION_KEY_ID" \
+            --issuer "$APPLE_NOTARIZATION_ISSUER_ID" \
+            "$temp_zip"
+
+        # Clean up temporary files
+        rm "$notarization_key_file"
+        rm "$temp_zip"
+
+        echo "✓ Successfully notarized ${binary_path}"
+    else
+        echo "⚠️  Skipping notarization - missing APPLE_NOTARIZATION_KEY, APPLE_NOTARIZATION_KEY_ID, or APPLE_NOTARIZATION_ISSUER_ID"
+    fi
+
     exit 0
 else
     echo "One or more of the following variables are missing: MACOS_CERTIFICATE, MACOS_CERTIFICATE_PASSWORD"
