@@ -14,69 +14,62 @@ if [[ ! -f "$binary_path" ]]; then
     exit 1
 fi
 
-can_code_sign=false
 IDENTITY="Zed Industries, Inc."
 
 echo "Code signing binary at $binary_path"
 
-if [[ -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]]; then
-    can_code_sign=true
-
-    echo "Setting up keychain for code signing..."
-    security create-keychain -p "$MACOS_CERTIFICATE_PASSWORD" codex-acp.keychain || echo ""
-    security default-keychain -s codex-acp.keychain
-    security unlock-keychain -p "$MACOS_CERTIFICATE_PASSWORD" codex-acp.keychain
-    security set-keychain-settings codex-acp.keychain
-    echo "$MACOS_CERTIFICATE" | base64 --decode > /tmp/codex-acp-certificate.p12
-    security import /tmp/codex-acp-certificate.p12 -k codex-acp.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-    rm /tmp/codex-acp-certificate.p12
-    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_CERTIFICATE_PASSWORD" codex-acp.keychain
-
-    function cleanup() {
-        echo "Cleaning up keychain"
-        security default-keychain -s login.keychain
-        security delete-keychain codex-acp.keychain
-    }
-
-    trap cleanup EXIT
-fi
-
-if [[ $can_code_sign = true ]]; then
-    echo "Signing binary ${binary_path}"
-    /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${binary_path}" -v
-    echo "✓ Successfully signed ${binary_path}"
-
-    if [[ -n "${APPLE_NOTARIZATION_KEY:-}" && -n "${APPLE_NOTARIZATION_KEY_ID:-}" && -n "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
-        echo "Notarizing binary with Apple"
-
-        # Create temporary zip file for notarization
-        temp_zip=$(mktemp).zip
-        zip -q "$temp_zip" "${binary_path}"
-
-        # Create temporary file for the API key
-        notarization_key_file=$(mktemp)
-        echo "$APPLE_NOTARIZATION_KEY" > "$notarization_key_file"
-
-        # Submit for notarization and wait for completion
-        xcode_bin_dir_path="$(xcode-select -p)/usr/bin"
-        "${xcode_bin_dir_path}/notarytool" submit --wait \
-            --key "$notarization_key_file" \
-            --key-id "$APPLE_NOTARIZATION_KEY_ID" \
-            --issuer "$APPLE_NOTARIZATION_ISSUER_ID" \
-            "$temp_zip"
-
-        # Clean up temporary files
-        rm "$notarization_key_file"
-        rm "$temp_zip"
-
-        echo "✓ Successfully notarized ${binary_path}"
-    else
-        echo "One or more of the following variables are missing: APPLE_NOTARIZATION_KEY, APPLE_NOTARIZATION_KEY_ID, APPLE_NOTARIZATION_ISSUER_ID"
-        exit 1
-    fi
-
-    exit 0
-else
-    echo "One or more of the following variables are missing: MACOS_CERTIFICATE, MACOS_CERTIFICATE_PASSWORD"
+if [[ -z "${MACOS_CERTIFICATE:-}" || -z "${MACOS_CERTIFICATE_PASSWORD:-}" || -z "${APPLE_NOTARIZATION_KEY:-}" || -z "${APPLE_NOTARIZATION_KEY_ID:-}" || -z "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
+    echo "Error: One or more required variables are missing:"
+    echo "  - MACOS_CERTIFICATE"
+    echo "  - MACOS_CERTIFICATE_PASSWORD"
+    echo "  - APPLE_NOTARIZATION_KEY"
+    echo "  - APPLE_NOTARIZATION_KEY_ID"
+    echo "  - APPLE_NOTARIZATION_ISSUER_ID"
     exit 1
 fi
+
+echo "Setting up keychain for code signing..."
+security create-keychain -p "$MACOS_CERTIFICATE_PASSWORD" codex-acp.keychain || echo ""
+security default-keychain -s codex-acp.keychain
+security unlock-keychain -p "$MACOS_CERTIFICATE_PASSWORD" codex-acp.keychain
+security set-keychain-settings codex-acp.keychain
+echo "$MACOS_CERTIFICATE" | base64 --decode > /tmp/codex-acp-certificate.p12
+security import /tmp/codex-acp-certificate.p12 -k codex-acp.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+rm /tmp/codex-acp-certificate.p12
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_CERTIFICATE_PASSWORD" codex-acp.keychain
+
+function cleanup() {
+    echo "Cleaning up keychain"
+    security default-keychain -s login.keychain
+    security delete-keychain codex-acp.keychain
+}
+
+trap cleanup EXIT
+
+echo "Signing binary ${binary_path}"
+/usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${binary_path}" -v
+echo "✓ Successfully signed ${binary_path}"
+
+echo "Notarizing binary with Apple"
+
+# Create temporary zip file for notarization
+temp_zip=$(mktemp).zip
+zip -q "$temp_zip" "${binary_path}"
+
+# Create temporary file for the API key
+notarization_key_file=$(mktemp)
+echo "$APPLE_NOTARIZATION_KEY" > "$notarization_key_file"
+
+# Submit for notarization and wait for completion
+xcode_bin_dir_path="$(xcode-select -p)/usr/bin"
+"${xcode_bin_dir_path}/notarytool" submit --wait \
+    --key "$notarization_key_file" \
+    --key-id "$APPLE_NOTARIZATION_KEY_ID" \
+    --issuer "$APPLE_NOTARIZATION_ISSUER_ID" \
+    "$temp_zip"
+
+# Clean up temporary files
+rm "$notarization_key_file"
+rm "$temp_zip"
+
+echo "✓ Successfully notarized ${binary_path}"
