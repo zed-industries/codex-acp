@@ -68,7 +68,6 @@ xcode_bin_dir_path="$(xcode-select -p)/usr/bin"
     --issuer "$APPLE_NOTARIZATION_ISSUER_ID" \
     "$temp_zip"
 
-# Clean up temporary files
 rm "$notarization_key_file"
 rm "$temp_zip"
 
