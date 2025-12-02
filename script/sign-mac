@@ -71,7 +71,8 @@ if [[ $can_code_sign = true ]]; then
 
         echo "✓ Successfully notarized ${binary_path}"
     else
-        echo "⚠️  Skipping notarization - missing APPLE_NOTARIZATION_KEY, APPLE_NOTARIZATION_KEY_ID, or APPLE_NOTARIZATION_ISSUER_ID"
+        echo "One or more of the following variables are missing: APPLE_NOTARIZATION_KEY, APPLE_NOTARIZATION_KEY_ID, APPLE_NOTARIZATION_ISSUER_ID"
+        exit 1
     fi
 
     exit 0
