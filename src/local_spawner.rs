@@ -42,13 +42,8 @@ impl FsTask {
                 path,
                 tx,
             } => {
-                let read_text_file = Self::client().read_text_file(ReadTextFileRequest {
-                    session_id,
-                    path,
-                    line: None,
-                    limit: None,
-                    meta: None,
-                });
+                let read_text_file =
+                    Self::client().read_text_file(ReadTextFileRequest::new(session_id, path));
                 let response = read_text_file
                     .await
                     .map(|response| response.content)
@@ -61,13 +56,10 @@ impl FsTask {
                 limit,
                 tx,
             } => {
-                let read_text_file = Self::client().read_text_file(ReadTextFileRequest {
-                    session_id,
-                    path,
-                    line: None,
-                    limit: Some(limit.try_into().unwrap_or(u32::MAX)),
-                    meta: None,
-                });
+                let read_text_file = Self::client().read_text_file(
+                    ReadTextFileRequest::new(session_id, path)
+                        .limit(limit.try_into().unwrap_or(u32::MAX)),
+                );
                 let response = read_text_file
                     .await
                     .map(|response| response.content)
@@ -81,12 +73,7 @@ impl FsTask {
                 tx,
             } => {
                 let response = Self::client()
-                    .write_text_file(WriteTextFileRequest {
-                        session_id,
-                        path,
-                        content,
-                        meta: None,
-                    })
+                    .write_text_file(WriteTextFileRequest::new(session_id, path, content))
                     .await
                     .map(|_| ())
                     .map_err(|e| std::io::Error::other(e.to_string()));

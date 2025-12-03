@@ -2,9 +2,9 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
     CancelNotification, ClientCapabilities, Error, Implementation, InitializeRequest,
     InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    SessionId, SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest,
-    SetSessionModelResponse, V1,
+    McpServerHttp, McpServerStdio, NewSessionRequest, NewSessionResponse, PromptCapabilities,
+    PromptRequest, PromptResponse, ProtocolVersion, SessionId, SetSessionModeRequest,
+    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
 use codex_core::{
     ConversationManager, NewConversation,
@@ -80,7 +80,7 @@ impl CodexAgent {
     }
 
     fn session_id_from_conversation_id(conversation_id: ConversationId) -> SessionId {
-        SessionId(conversation_id.to_string().into())
+        SessionId::new(conversation_id.to_string())
     }
 
     fn get_conversation(&self, session_id: &SessionId) -> Result<Rc<Conversation>, Error> {
@@ -107,28 +107,16 @@ impl Agent for CodexAgent {
             protocol_version,
             client_capabilities,
             client_info: _, // TODO: save and pass into Codex somehow
-            meta: _,
+            ..
         } = request;
         debug!("Received initialize request with protocol version {protocol_version:?}",);
-        let protocol_version = V1;
+        let protocol_version = ProtocolVersion::V1;
 
         *self.client_capabilities.lock().unwrap() = client_capabilities;
 
-        let agent_capabilities = AgentCapabilities {
-            load_session: false, // Currently only able to do in-memory... which doesn't help us at the moment
-            prompt_capabilities: PromptCapabilities {
-                audio: false,
-                embedded_context: true,
-                image: true,
-                meta: None,
-            },
-            mcp_capabilities: McpCapabilities {
-                http: true,
-                sse: false,
-                meta: None,
-            },
-            meta: None,
-        };
+        let agent_capabilities = AgentCapabilities::new()
+            .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
+            .mcp_capabilities(McpCapabilities::new().http(true));
 
         let mut auth_methods = vec![
             CodexAuthMethod::ChatGpt.into(),
@@ -140,17 +128,10 @@ impl Agent for CodexAgent {
             auth_methods.remove(0);
         }
 
-        Ok(InitializeResponse {
-            protocol_version,
-            agent_capabilities,
-            agent_info: Some(Implementation {
-                name: "codex-acp".into(),
-                title: Some("Codex".into()),
-                version: env!("CARGO_PKG_VERSION").into(),
-            }),
-            auth_methods,
-            meta: None,
-        })
+        Ok(InitializeResponse::new(protocol_version)
+            .agent_capabilities(agent_capabilities)
+            .agent_info(Implementation::new("codex-acp", env!("CARGO_PKG_VERSION")).title("Codex"))
+            .auth_methods(auth_methods))
     }
 
     async fn authenticate(
@@ -167,7 +148,7 @@ impl Agent for CodexAgent {
                     CodexAuthMethod::CodexApiKey | CodexAuthMethod::OpenAiApiKey,
                 )
                 | (AuthMode::ChatGPT, CodexAuthMethod::ChatGpt) => {
-                    return Ok(AuthenticateResponse { meta: None });
+                    return Ok(AuthenticateResponse::new());
                 }
                 _ => {}
             }
@@ -195,7 +176,7 @@ impl Agent for CodexAgent {
             }
             CodexAuthMethod::CodexApiKey => {
                 let api_key = read_codex_api_key_from_env().ok_or_else(|| {
-                    Error::internal_error().with_data(format!("{CODEX_API_KEY_ENV_VAR} is not set"))
+                    Error::internal_error().data(format!("{CODEX_API_KEY_ENV_VAR} is not set"))
                 })?;
                 codex_login::login_with_api_key(
                     &self.config.codex_home,
@@ -206,8 +187,7 @@ impl Agent for CodexAgent {
             }
             CodexAuthMethod::OpenAiApiKey => {
                 let api_key = read_openai_api_key_from_env().ok_or_else(|| {
-                    Error::internal_error()
-                        .with_data(format!("{OPENAI_API_KEY_ENV_VAR} is not set"))
+                    Error::internal_error().data(format!("{OPENAI_API_KEY_ENV_VAR} is not set"))
                 })?;
                 codex_login::login_with_api_key(
                     &self.config.codex_home,
@@ -220,7 +200,7 @@ impl Agent for CodexAgent {
 
         self.auth_manager.reload();
 
-        Ok(AuthenticateResponse { meta: None })
+        Ok(AuthenticateResponse::new())
     }
 
     async fn new_session(&self, request: NewSessionRequest) -> Result<NewSessionResponse, Error> {
@@ -228,9 +208,7 @@ impl Agent for CodexAgent {
         self.check_auth()?;
 
         let NewSessionRequest {
-            cwd,
-            mcp_servers,
-            meta: _meta,
+            cwd, mcp_servers, ..
         } = request;
         info!("Creating new session with cwd: {}", cwd.display());
 
@@ -245,8 +223,10 @@ impl Agent for CodexAgent {
         for mcp_server in mcp_servers {
             match mcp_server {
                 // Not supported in codex
-                McpServer::Sse { .. } => {}
-                McpServer::Http { name, url, headers } => {
+                McpServer::Sse(..) => {}
+                McpServer::Http(McpServerHttp {
+                    name, url, headers, ..
+                }) => {
                     config.mcp_servers.insert(
                         name,
                         McpServerConfig {
@@ -268,12 +248,13 @@ impl Agent for CodexAgent {
                         },
                     );
                 }
-                McpServer::Stdio {
+                McpServer::Stdio(McpServerStdio {
                     name,
                     command,
                     args,
                     env,
-                } => {
+                    ..
+                }) => {
                     config.mcp_servers.insert(
                         name,
                         McpServerConfig {
@@ -296,6 +277,7 @@ impl Agent for CodexAgent {
                         },
                     );
                 }
+                _ => {}
             }
         }
 
@@ -325,12 +307,14 @@ impl Agent for CodexAgent {
 
         debug!("Created new session with {} MCP servers", num_mcp_servers);
 
-        Ok(NewSessionResponse {
-            session_id,
-            modes: load.modes,
-            models: load.models,
-            meta: None,
-        })
+        let mut response = NewSessionResponse::new(session_id);
+        if let Some(modes) = load.modes {
+            response = response.modes(modes);
+        }
+        if let Some(models) = load.models {
+            response = response.models(models);
+        }
+        Ok(response)
     }
 
     async fn load_session(
@@ -361,10 +345,7 @@ impl Agent for CodexAgent {
         let conversation = self.get_conversation(&request.session_id)?;
         let stop_reason = conversation.prompt(request).await?;
 
-        Ok(PromptResponse {
-            stop_reason,
-            meta: None,
-        })
+        Ok(PromptResponse::new(stop_reason))
     }
 
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
@@ -407,45 +388,30 @@ enum CodexAuthMethod {
 
 impl From<CodexAuthMethod> for AuthMethodId {
     fn from(method: CodexAuthMethod) -> Self {
-        Self(
-            match method {
-                CodexAuthMethod::ChatGpt => "chatgpt",
-                CodexAuthMethod::CodexApiKey => "codex-api-key",
-                CodexAuthMethod::OpenAiApiKey => "openai-api-key",
-            }
-            .into(),
-        )
+        Self::new(match method {
+            CodexAuthMethod::ChatGpt => "chatgpt",
+            CodexAuthMethod::CodexApiKey => "codex-api-key",
+            CodexAuthMethod::OpenAiApiKey => "openai-api-key",
+        })
     }
 }
 
 impl From<CodexAuthMethod> for AuthMethod {
     fn from(method: CodexAuthMethod) -> Self {
         match method {
-            CodexAuthMethod::ChatGpt => Self {
-                id: method.into(),
-                name: "Login with ChatGPT".into(),
-                description: Some(
-                    "Use your ChatGPT login with Codex CLI (requires a paid ChatGPT subscription)"
-                        .into(),
-                ),
-                meta: None,
-            },
-            CodexAuthMethod::CodexApiKey => Self {
-                id: method.into(),
-                name: format!("Use {CODEX_API_KEY_ENV_VAR}"),
-                description: Some(format!(
+            CodexAuthMethod::ChatGpt => Self::new(method, "Login with ChatGPT").description(
+                "Use your ChatGPT login with Codex CLI (requires a paid ChatGPT subscription)",
+            ),
+            CodexAuthMethod::CodexApiKey => {
+                Self::new(method, format!("Use {CODEX_API_KEY_ENV_VAR}")).description(format!(
                     "Requires setting the `{CODEX_API_KEY_ENV_VAR}` environment variable."
-                )),
-                meta: None,
-            },
-            CodexAuthMethod::OpenAiApiKey => Self {
-                id: method.into(),
-                name: format!("Use {OPENAI_API_KEY_ENV_VAR}"),
-                description: Some(format!(
+                ))
+            }
+            CodexAuthMethod::OpenAiApiKey => {
+                Self::new(method, format!("Use {OPENAI_API_KEY_ENV_VAR}")).description(format!(
                     "Requires setting the `{OPENAI_API_KEY_ENV_VAR}` environment variable."
-                )),
-                meta: None,
-            },
+                ))
+            }
         }
     }
 }
@@ -458,7 +424,7 @@ impl TryFrom<AuthMethodId> for CodexAuthMethod {
             "chatgpt" => Ok(CodexAuthMethod::ChatGpt),
             "codex-api-key" => Ok(CodexAuthMethod::CodexApiKey),
             "openai-api-key" => Ok(CodexAuthMethod::OpenAiApiKey),
-            _ => Err(Error::invalid_params().with_data("unsupported authentication method")),
+            _ => Err(Error::invalid_params().data("unsupported authentication method")),
         }
     }
 }
