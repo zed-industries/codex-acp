@@ -39,9 +39,6 @@ tokio-util = { version = "0.7", features = ["compat"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
-[patch.crates-io]
-rmcp = { git = "https://github.com/bolinfest/rust-sdk", branch = "pr556" }
-
 [lints.rust]
 let-underscore = "warn"
 rust-2018-idioms = "warn"
