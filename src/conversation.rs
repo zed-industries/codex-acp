@@ -9,14 +9,15 @@ use std::{
 
 use agent_client_protocol::{
     Annotations, AudioContent, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
-    BlobResourceContents, Client, ClientCapabilities, ContentBlock, ContentChunk, Diff,
-    EmbeddedResource, EmbeddedResourceResource, Error, ImageContent, LoadSessionResponse, ModelId,
-    ModelInfo, PermissionOption, PermissionOptionId, PermissionOptionKind, Plan, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, PromptRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SessionId, SessionMode,
+    BlobResourceContents, Client, ClientCapabilities, Content, ContentBlock, ContentChunk, Diff,
+    EmbeddedResource, EmbeddedResourceResource, Error, ImageContent, LoadSessionResponse, Meta,
+    ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionId, SessionMode,
     SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate,
-    StopReason, TerminalId, TextContent, TextResourceContents, ToolCall, ToolCallContent,
-    ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    StopReason, Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    UnstructuredCommandInput,
 };
 use codex_common::{
     approval_presets::{ApprovalPreset, builtin_approval_presets},
@@ -91,7 +92,7 @@ impl Auth for Arc<AuthManager> {
     fn logout(&self) -> Result<bool, Error> {
         self.as_ref()
             .logout()
-            .map_err(|e| Error::internal_error().with_data(e.to_string()))
+            .map_err(|e| Error::internal_error().data(e.to_string()))
     }
 }
 
@@ -156,7 +157,7 @@ impl Conversation {
 
         response_rx
             .await
-            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
     }
 
     pub async fn prompt(&self, request: PromptRequest) -> Result<StopReason, Error> {
@@ -170,9 +171,9 @@ impl Conversation {
 
         response_rx
             .await
-            .map_err(|e| Error::internal_error().with_data(e.to_string()))??
+            .map_err(|e| Error::internal_error().data(e.to_string()))??
             .await
-            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
     }
 
     pub async fn set_mode(&self, mode: SessionModeId) -> Result<(), Error> {
@@ -183,7 +184,7 @@ impl Conversation {
 
         response_rx
             .await
-            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
     }
 
     pub async fn set_model(&self, model: ModelId) -> Result<(), Error> {
@@ -194,7 +195,7 @@ impl Conversation {
 
         response_rx
             .await
-            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
     }
 
     pub async fn cancel(&self) -> Result<(), Error> {
@@ -205,7 +206,7 @@ impl Conversation {
 
         response_rx
             .await
-            .map_err(|e| Error::internal_error().with_data(e.to_string()))?
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
     }
 }
 
@@ -473,7 +474,7 @@ impl PromptState {
             EventMsg::Error(ErrorEvent { message, codex_error_info }) => {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
                 if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Err(Error::internal_error().with_data(json!({ "message": message, "codex_error_info": codex_error_info })))).ok();
+                    response_tx.send(Err(Error::internal_error().data(json!({ "message": message, "codex_error_info": codex_error_info })))).ok();
                 }
             }
             EventMsg::TurnAborted(TurnAbortedEvent { reason }) => {
@@ -492,32 +493,14 @@ impl PromptState {
                 info!("ViewImageToolCallEvent received");
                 let display_path = path.display().to_string();
                 client
-                    .send_notification(SessionUpdate::ToolCall(ToolCall {
-                        id: ToolCallId(call_id.into()),
-                        title: format!("View Image {display_path}"),
-                        kind: ToolKind::Read,
-                        status: ToolCallStatus::Completed,
-                        content: vec![ToolCallContent::Content {
-                            content: ContentBlock::ResourceLink(ResourceLink {
-                                annotations: None,
-                                description: None,
-                                mime_type: None,
-                                name: display_path.clone(),
-                                size: None,
-                                title: None,
-                                uri: display_path.clone(),
-                                meta: None,
-                            }),
-                        }],
-                        locations: vec![ToolCallLocation {
-                            path,
-                            line: None,
-                            meta: None,
-                        }],
-                        raw_input: None,
-                        raw_output: None,
-                        meta: None,
-                    }))
+                    .send_notification(
+                        SessionUpdate::ToolCall(
+                            ToolCall::new(call_id, format!("View Image {display_path}"))
+                                .kind(ToolKind::Read).status(ToolCallStatus::Completed)
+                                .content(vec![ToolCallContent::Content(Content::new(ContentBlock::ResourceLink(ResourceLink::new(display_path.clone(), display_path.clone())
+                            )
+                        )
+                    )]).locations(vec![ToolCallLocation::new(path)])))
                     .await;
             }
             EventMsg::EnteredReviewMode(review_request) => {
@@ -590,54 +573,49 @@ impl PromptState {
             id,
             message,
         } = event;
-        let tool_call_id = ToolCallId(match &id {
-            RequestId::String(s) => s.clone().into(),
-            RequestId::Integer(i) => i.to_string().into(),
+        let tool_call_id = ToolCallId::new(match &id {
+            RequestId::String(s) => s.clone(),
+            RequestId::Integer(i) => i.to_string(),
         });
         let response = client
             .request_permission(
-                ToolCallUpdate {
-                    id: tool_call_id.clone(),
-                    fields: ToolCallUpdateFields {
-                        kind: Some(ToolKind::Other),
-                        status: Some(ToolCallStatus::Pending),
-                        title: Some(server_name.clone()),
-                        content: Some(vec![message.into()]),
-                        raw_input: Some(raw_input),
-                        ..Default::default()
-                    },
-                    meta: None,
-                },
+                ToolCallUpdate::new(
+                    tool_call_id.clone(),
+                    ToolCallUpdateFields::new()
+                        .title(server_name.clone())
+                        .status(ToolCallStatus::Pending)
+                        .content(vec![message.into()])
+                        .raw_input(raw_input),
+                ),
                 vec![
-                    PermissionOption {
-                        id: PermissionOptionId("approved".into()),
-                        name: "Yes, provide the requested info".into(),
-                        kind: PermissionOptionKind::AllowOnce,
-                        meta: None,
-                    },
-                    PermissionOption {
-                        id: PermissionOptionId("abort".into()),
-                        name: "No, but continue without it".into(),
-                        kind: PermissionOptionKind::RejectOnce,
-                        meta: None,
-                    },
-                    PermissionOption {
-                        id: PermissionOptionId("cancel".into()),
-                        name: "Cancel this request".into(),
-                        kind: PermissionOptionKind::RejectOnce,
-                        meta: None,
-                    },
+                    PermissionOption::new(
+                        "approved".into(),
+                        "Yes, provide the requested info",
+                        PermissionOptionKind::AllowOnce,
+                    ),
+                    PermissionOption::new(
+                        "abort".into(),
+                        "No, but continue without it",
+                        PermissionOptionKind::RejectOnce,
+                    ),
+                    PermissionOption::new(
+                        "cancel".into(),
+                        "Cancel this request",
+                        PermissionOptionKind::RejectOnce,
+                    ),
                 ],
             )
             .await?;
 
         let decision = match response.outcome {
-            RequestPermissionOutcome::Cancelled => ElicitationAction::Cancel,
-            RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
-                "approved" => ElicitationAction::Accept,
-                "abort" => ElicitationAction::Decline,
-                _ => ElicitationAction::Cancel,
-            },
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome { option_id, .. }) => {
+                match option_id.0.as_ref() {
+                    "approved" => ElicitationAction::Accept,
+                    "abort" => ElicitationAction::Decline,
+                    _ => ElicitationAction::Cancel,
+                }
+            }
+            RequestPermissionOutcome::Cancelled | _ => ElicitationAction::Cancel,
         };
 
         self.conversation
@@ -650,18 +628,14 @@ impl PromptState {
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
         client
-            .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                id: tool_call_id,
-                fields: ToolCallUpdateFields {
-                    status: Some(if decision == ElicitationAction::Accept {
-                        ToolCallStatus::Completed
-                    } else {
-                        ToolCallStatus::Failed
-                    }),
-                    ..Default::default()
-                },
-                meta: None,
-            }))
+            .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                tool_call_id,
+                ToolCallUpdateFields::new().status(if decision == ElicitationAction::Accept {
+                    ToolCallStatus::Completed
+                } else {
+                    ToolCallStatus::Failed
+                }),
+            )))
             .await;
 
         Ok(())
@@ -716,48 +690,39 @@ impl PromptState {
         let (title, locations, content) = extract_tool_call_content_from_changes(changes);
         let response = client
             .request_permission(
-                ToolCallUpdate {
-                    id: ToolCallId(call_id.into()),
-                    fields: ToolCallUpdateFields {
-                        kind: Some(ToolKind::Edit),
-                        status: Some(ToolCallStatus::Pending),
-                        title: Some(title),
-                        locations: Some(locations),
-                        content: Some(
-                            content
-                                .chain(
-                                    reason.map(|r| ToolCallContent::Content { content: r.into() }),
-                                )
-                                .collect(),
-                        ),
-                        raw_input: Some(raw_input),
-                        ..Default::default()
-                    },
-                    meta: None,
-                },
+                ToolCallUpdate::new(
+                    call_id,
+                    ToolCallUpdateFields::new()
+                        .kind(ToolKind::Edit)
+                        .status(ToolCallStatus::Pending)
+                        .title(title)
+                        .locations(locations)
+                        .content(content.chain(reason.map(|r| r.into())).collect())
+                        .raw_input(raw_input),
+                ),
                 vec![
-                    PermissionOption {
-                        id: PermissionOptionId("approved".into()),
-                        name: "Yes".into(),
-                        kind: PermissionOptionKind::AllowOnce,
-                        meta: None,
-                    },
-                    PermissionOption {
-                        id: PermissionOptionId("abort".into()),
-                        name: "No, provide feedback".into(),
-                        kind: PermissionOptionKind::RejectOnce,
-                        meta: None,
-                    },
+                    PermissionOption::new(
+                        "approved".into(),
+                        "Yes",
+                        PermissionOptionKind::AllowOnce,
+                    ),
+                    PermissionOption::new(
+                        "abort".into(),
+                        "No, provide feedback",
+                        PermissionOptionKind::RejectOnce,
+                    ),
                 ],
             )
             .await?;
 
         let decision = match response.outcome {
-            RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
-            RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
-                "approved" => ReviewDecision::Approved,
-                _ => ReviewDecision::Abort,
-            },
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome { option_id, .. }) => {
+                match option_id.0.as_ref() {
+                    "approved" => ReviewDecision::Approved,
+                    _ => ReviewDecision::Abort,
+                }
+            }
+            RequestPermissionOutcome::Cancelled | _ => ReviewDecision::Abort,
         };
 
         self.conversation
@@ -782,17 +747,14 @@ impl PromptState {
         let (title, locations, content) = extract_tool_call_content_from_changes(changes);
 
         client
-            .send_notification(SessionUpdate::ToolCall(ToolCall {
-                id: ToolCallId(call_id.into()),
-                title,
-                kind: ToolKind::Edit,
-                status: ToolCallStatus::InProgress,
-                locations,
-                content: content.collect(),
-                raw_input: Some(raw_input),
-                raw_output: None,
-                meta: None,
-            }))
+            .send_notification(SessionUpdate::ToolCall(
+                ToolCall::new(call_id, title)
+                    .kind(ToolKind::Edit)
+                    .status(ToolCallStatus::InProgress)
+                    .locations(locations)
+                    .content(content.collect())
+                    .raw_input(raw_input),
+            ))
             .await;
     }
 
@@ -807,30 +769,26 @@ impl PromptState {
             turn_id: _,
         } = event;
 
-        let (title, locations, content) = if !changes.is_empty() {
+        let mut fields = ToolCallUpdateFields::new()
+            .status(if success {
+                ToolCallStatus::Completed
+            } else {
+                ToolCallStatus::Failed
+            })
+            .raw_output(raw_output);
+
+        if !changes.is_empty() {
             let (title, locations, content) = extract_tool_call_content_from_changes(changes);
-            (Some(title), Some(locations), Some(content.collect()))
-        } else {
-            (None, None, None)
-        };
+            fields = fields
+                .title(title)
+                .locations(locations)
+                .content(content.collect())
+        }
 
         client
-            .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                id: ToolCallId(call_id.into()),
-                fields: ToolCallUpdateFields {
-                    title,
-                    locations,
-                    content,
-                    status: Some(if success {
-                        ToolCallStatus::Completed
-                    } else {
-                        ToolCallStatus::Failed
-                    }),
-                    raw_output: Some(raw_output),
-                    ..Default::default()
-                },
-                meta: None,
-            }))
+            .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                call_id, fields,
+            )))
             .await;
     }
 
@@ -840,20 +798,13 @@ impl PromptState {
         call_id: String,
         invocation: McpInvocation,
     ) {
-        let tool_call_id = ToolCallId(call_id.clone().into());
         let title = format!("Tool: {}/{}", invocation.server, invocation.tool);
         client
-            .send_notification(SessionUpdate::ToolCall(ToolCall {
-                id: tool_call_id,
-                title,
-                kind: ToolKind::Other,
-                status: ToolCallStatus::InProgress,
-                content: vec![],
-                locations: vec![],
-                raw_input: Some(serde_json::json!(&invocation)),
-                raw_output: None,
-                meta: None,
-            }))
+            .send_notification(SessionUpdate::ToolCall(
+                ToolCall::new(call_id, title)
+                    .status(ToolCallStatus::InProgress)
+                    .raw_input(serde_json::json!(&invocation)),
+            ))
             .await;
     }
 
@@ -871,29 +822,29 @@ impl PromptState {
             Ok(result) => serde_json::json!(result),
             Err(err) => serde_json::json!(err),
         };
+        let mut fields = ToolCallUpdateFields::new()
+            .status(if is_error {
+                ToolCallStatus::Failed
+            } else {
+                ToolCallStatus::Completed
+            })
+            .raw_output(raw_output);
+
+        if let Ok(result) = result
+            && !result.content.is_empty()
+        {
+            fields = fields.content(
+                result
+                    .content
+                    .into_iter()
+                    .map(codex_content_to_acp_content)
+                    .collect(),
+            );
+        }
         client
-            .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                id: ToolCallId(call_id.into()),
-                fields: ToolCallUpdateFields {
-                    status: Some(if is_error {
-                        ToolCallStatus::Failed
-                    } else {
-                        ToolCallStatus::Completed
-                    }),
-                    content: result.ok().filter(|result| !result.content.is_empty()).map(
-                        |result| {
-                            result
-                                .content
-                                .into_iter()
-                                .map(codex_content_to_acp_content)
-                                .collect()
-                        },
-                    ),
-                    raw_output: Some(raw_output),
-                    ..Default::default()
-                },
-                meta: None,
-            }))
+            .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                call_id, fields,
+            )))
             .await;
     }
 
@@ -914,7 +865,7 @@ impl PromptState {
         } = event;
 
         // Create a new tool call for the command execution
-        let tool_call_id = ToolCallId(call_id.clone().into());
+        let tool_call_id = ToolCallId::new(call_id.clone());
         let ParseCommandToolCall {
             title,
             terminal_output,
@@ -945,55 +896,51 @@ impl PromptState {
             (None, None) => None,
         };
 
+        let mut fields = ToolCallUpdateFields::new()
+            .kind(kind)
+            .status(ToolCallStatus::Pending)
+            .title(title)
+            .raw_input(raw_input);
+
+        if let Some(content) = content {
+            fields = fields.content(content);
+        }
+        if !locations.is_empty() {
+            fields = fields.locations(locations);
+        }
+
         let response = client
             .request_permission(
-                ToolCallUpdate {
-                    id: tool_call_id,
-                    fields: ToolCallUpdateFields {
-                        kind: Some(kind),
-                        status: Some(ToolCallStatus::Pending),
-                        title: Some(title),
-                        content,
-                        locations: if locations.is_empty() {
-                            None
-                        } else {
-                            Some(locations)
-                        },
-                        raw_input: Some(raw_input),
-                        raw_output: None,
-                    },
-                    meta: None,
-                },
+                ToolCallUpdate::new(tool_call_id, fields),
                 vec![
-                    PermissionOption {
-                        id: PermissionOptionId("approved-for-session".into()),
-                        name: "Always".into(),
-                        kind: PermissionOptionKind::AllowAlways,
-                        meta: None,
-                    },
-                    PermissionOption {
-                        id: PermissionOptionId("approved".into()),
-                        name: "Yes".into(),
-                        kind: PermissionOptionKind::AllowOnce,
-                        meta: None,
-                    },
-                    PermissionOption {
-                        id: PermissionOptionId("abort".into()),
-                        name: "No, provide feedback".into(),
-                        kind: PermissionOptionKind::RejectOnce,
-                        meta: None,
-                    },
+                    PermissionOption::new(
+                        "approved-for-session".into(),
+                        "Always",
+                        PermissionOptionKind::AllowAlways,
+                    ),
+                    PermissionOption::new(
+                        "approved".into(),
+                        "Yes",
+                        PermissionOptionKind::AllowOnce,
+                    ),
+                    PermissionOption::new(
+                        "abort".into(),
+                        "No, provide feedback",
+                        PermissionOptionKind::RejectOnce,
+                    ),
                 ],
             )
             .await?;
 
         let decision = match response.outcome {
-            RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
-            RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
-                "approved-for-session" => ReviewDecision::ApprovedForSession,
-                "approved" => ReviewDecision::Approved,
-                _ => ReviewDecision::Abort,
-            },
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome { option_id, .. }) => {
+                match option_id.0.as_ref() {
+                    "approved-for-session" => ReviewDecision::ApprovedForSession,
+                    "approved" => ReviewDecision::Approved,
+                    _ => ReviewDecision::Abort,
+                }
+            }
+            RequestPermissionOutcome::Cancelled | _ => ReviewDecision::Abort,
         };
 
         self.conversation
@@ -1020,7 +967,7 @@ impl PromptState {
             process_id: _,
         } = event;
         // Create a new tool call for the command execution
-        let tool_call_id = ToolCallId(call_id.clone().into());
+        let tool_call_id = ToolCallId::new(call_id.clone());
         let ParseCommandToolCall {
             title,
             file_extension,
@@ -1037,34 +984,29 @@ impl PromptState {
             terminal_output,
         };
 
-        let (content, meta) = if client.supports_terminal_output(&active_command) {
-            let content = vec![ToolCallContent::Terminal {
-                terminal_id: TerminalId(call_id.clone().into()),
-            }];
-            let meta = Some(serde_json::json!({
-                "terminal_info": {
-                    "terminal_id": call_id,
-                    "cwd": cwd
-                }
-            }));
-            (content, meta)
-        } else {
-            (vec![], None)
-        };
+        let mut tool_call = ToolCall::new(tool_call_id, title)
+            .kind(kind)
+            .status(ToolCallStatus::InProgress)
+            .locations(locations)
+            .raw_input(raw_input);
+
+        if client.supports_terminal_output(&active_command) {
+            tool_call = tool_call
+                .content(vec![ToolCallContent::Terminal(Terminal::new(
+                    call_id.clone(),
+                ))])
+                .meta(Meta::from_iter([(
+                    "terminal_info".to_owned(),
+                    serde_json::json!({
+                        "terminal_id": call_id,
+                        "cwd": cwd
+                    }),
+                )]));
+        }
         self.active_command = Some(active_command);
 
         client
-            .send_notification(SessionUpdate::ToolCall(ToolCall {
-                id: tool_call_id,
-                title,
-                kind,
-                status: ToolCallStatus::InProgress,
-                content,
-                locations,
-                raw_input: Some(raw_input),
-                raw_output: None,
-                meta,
-            }))
+            .send_notification(SessionUpdate::ToolCall(tool_call))
             .await;
     }
 
@@ -1084,14 +1026,18 @@ impl PromptState {
         {
             let data_str = String::from_utf8_lossy(&chunk).to_string();
 
-            let (fields, meta) = if client.supports_terminal_output(active_command) {
-                let meta = Some(serde_json::json!({
-                    "terminal_output": {
+            let update = if client.supports_terminal_output(active_command) {
+                ToolCallUpdate::new(
+                    active_command.tool_call_id.clone(),
+                    ToolCallUpdateFields::new(),
+                )
+                .meta(Meta::from_iter([(
+                    "terminal_output".to_owned(),
+                    serde_json::json!({
                         "terminal_id": call_id,
                         "data": data_str
-                    }
-                }));
-                (ToolCallUpdateFields::default(), meta)
+                    }),
+                )]))
             } else {
                 active_command.output.push_str(&data_str);
                 let content = match active_command.file_extension.as_deref() {
@@ -1105,21 +1051,14 @@ impl PromptState {
                         active_command.output.trim_end_matches('\n')
                     ),
                 };
-                (
-                    ToolCallUpdateFields {
-                        content: Some(vec![content.into()]),
-                        ..Default::default()
-                    },
-                    None,
+                ToolCallUpdate::new(
+                    active_command.tool_call_id.clone(),
+                    ToolCallUpdateFields::new().content(vec![content.into()]),
                 )
             };
 
             client
-                .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                    id: active_command.tool_call_id.clone(),
-                    fields,
-                    meta,
-                }))
+                .send_notification(SessionUpdate::ToolCallUpdate(update))
                 .await;
         }
     }
@@ -1147,30 +1086,30 @@ impl PromptState {
         {
             let is_success = exit_code == 0;
 
-            let meta = (client.supports_terminal_output(&active_command)).then(|| {
-                serde_json::json!({
-                    "terminal_exit": {
+            let mut update = ToolCallUpdate::new(
+                active_command.tool_call_id.clone(),
+                ToolCallUpdateFields::new()
+                    .status(if is_success {
+                        ToolCallStatus::Completed
+                    } else {
+                        ToolCallStatus::Failed
+                    })
+                    .raw_output(raw_output),
+            );
+
+            if client.supports_terminal_output(&active_command) {
+                update = update.meta(Meta::from_iter([(
+                    "terminal_exit".into(),
+                    serde_json::json!({
                         "terminal_id": call_id,
                         "exit_code": exit_code,
                         "signal": null
-                    }
-                })
-            });
+                    }),
+                )]));
+            }
 
             client
-                .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                    id: active_command.tool_call_id,
-                    fields: ToolCallUpdateFields {
-                        status: Some(if is_success {
-                            ToolCallStatus::Completed
-                        } else {
-                            ToolCallStatus::Failed
-                        }),
-                        raw_output: Some(raw_output),
-                        ..Default::default()
-                    },
-                    meta,
-                }))
+                .send_notification(SessionUpdate::ToolCallUpdate(update))
                 .await;
         }
     }
@@ -1178,17 +1117,9 @@ impl PromptState {
     async fn start_web_search(&mut self, client: &SessionClient, call_id: String) {
         self.active_web_search = Some(call_id.clone());
         client
-            .send_notification(SessionUpdate::ToolCall(ToolCall {
-                id: ToolCallId(call_id.into()),
-                title: "Searching the Web".to_string(),
-                kind: ToolKind::Fetch,
-                status: ToolCallStatus::Pending,
-                content: vec![],
-                locations: vec![],
-                raw_input: None,
-                raw_output: None,
-                meta: None,
-            }))
+            .send_notification(SessionUpdate::ToolCall(
+                ToolCall::new(call_id, "Searching the Web").kind(ToolKind::Fetch),
+            ))
             .await;
     }
 
@@ -1199,32 +1130,25 @@ impl PromptState {
         query: String,
     ) {
         client
-            .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                id: ToolCallId(call_id.into()),
-                fields: ToolCallUpdateFields {
-                    status: Some(ToolCallStatus::InProgress),
-                    title: Some(format!("Searching for: {query}")),
-                    raw_input: Some(serde_json::json!({
+            .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::InProgress)
+                    .title(format!("Searching for: {query}"))
+                    .raw_input(serde_json::json!({
                         "query": query
                     })),
-                    ..Default::default()
-                },
-                meta: None,
-            }))
+            )))
             .await;
     }
 
     async fn complete_web_search(&mut self, client: &SessionClient) {
         if let Some(call_id) = self.active_web_search.take() {
             client
-                .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                    id: ToolCallId(call_id.into()),
-                    fields: ToolCallUpdateFields {
-                        status: Some(ToolCallStatus::Completed),
-                        ..Default::default()
-                    },
-                    meta: None,
-                }))
+                .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    call_id,
+                    ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+                )))
                 .await;
         }
     }
@@ -1282,15 +1206,11 @@ fn parse_command_tool_call(parsed_cmd: Vec<ParsedCommand>, cwd: &Path) -> ParseC
         }
 
         if let Some(path) = cmd_path {
-            locations.push(ToolCallLocation {
-                path: if path.is_relative() {
-                    cwd.join(&path)
-                } else {
-                    path
-                },
-                line: None,
-                meta: None,
-            });
+            locations.push(ToolCallLocation::new(if path.is_relative() {
+                cwd.join(&path)
+            } else {
+                path
+            }));
         }
     }
 
@@ -1346,7 +1266,7 @@ impl TaskState {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx
-                        .send(Err(Error::internal_error().with_data(
+                        .send(Err(Error::internal_error().data(
                             json!({ "message": message, "codex_error_info": codex_error_info }),
                         )))
                         .ok();
@@ -1471,58 +1391,45 @@ impl SessionClient {
     }
 
     async fn send_notification(&self, update: SessionUpdate) {
-        let notification = SessionNotification {
-            session_id: self.session_id.clone(),
-            update,
-            meta: None,
-        };
-
-        if let Err(e) = self.client.session_notification(notification).await {
+        if let Err(e) = self
+            .client
+            .session_notification(SessionNotification::new(self.session_id.clone(), update))
+            .await
+        {
             error!("Failed to send session notification: {:?}", e);
         }
     }
 
     async fn send_agent_text(&self, text: impl Into<String>) {
-        self.send_notification(SessionUpdate::AgentMessageChunk(ContentChunk {
-            content: ContentBlock::Text(TextContent {
-                text: text.into(),
-                annotations: None,
-                meta: None,
-            }),
-            meta: None,
-        }))
+        self.send_notification(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+            text.into().into(),
+        )))
         .await;
     }
 
     async fn send_agent_thought(&self, text: impl Into<String>) {
-        self.send_notification(SessionUpdate::AgentThoughtChunk(ContentChunk {
-            content: ContentBlock::Text(TextContent {
-                text: text.into(),
-                annotations: None,
-                meta: None,
-            }),
-            meta: None,
-        }))
+        self.send_notification(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+            text.into().into(),
+        )))
         .await;
     }
 
     async fn update_plan(&self, plan: Vec<PlanItemArg>) {
-        self.send_notification(SessionUpdate::Plan(Plan {
-            entries: plan
-                .into_iter()
-                .map(|entry| PlanEntry {
-                    content: entry.step,
-                    priority: PlanEntryPriority::Medium,
-                    status: match entry.status {
-                        StepStatus::Pending => PlanEntryStatus::Pending,
-                        StepStatus::InProgress => PlanEntryStatus::InProgress,
-                        StepStatus::Completed => PlanEntryStatus::Completed,
-                    },
-                    meta: None,
+        self.send_notification(SessionUpdate::Plan(Plan::new(
+            plan.into_iter()
+                .map(|entry| {
+                    PlanEntry::new(
+                        entry.step,
+                        PlanEntryPriority::Medium,
+                        match entry.status {
+                            StepStatus::Pending => PlanEntryStatus::Pending,
+                            StepStatus::InProgress => PlanEntryStatus::InProgress,
+                            StepStatus::Completed => PlanEntryStatus::Completed,
+                        },
+                    )
                 })
                 .collect(),
-            meta: None,
-        }))
+        )))
         .await;
     }
 
@@ -1532,12 +1439,11 @@ impl SessionClient {
         options: Vec<PermissionOption>,
     ) -> Result<RequestPermissionResponse, Error> {
         self.client
-            .request_permission(RequestPermissionRequest {
-                session_id: self.session_id.clone(),
+            .request_permission(RequestPermissionRequest::new(
+                self.session_id.clone(),
                 tool_call,
                 options,
-                meta: None,
-            })
+            ))
             .await
     }
 }
@@ -1621,15 +1527,16 @@ impl<A: Auth> ConversationActor<A> {
                         .unwrap_or_default();
 
                     for prompt in &new_custom_prompts {
-                        available_commands.push(AvailableCommand {
-                            name: prompt.name.clone(),
-                            description: prompt.description.clone().unwrap_or_default(),
-                            input: prompt
-                                .argument_hint
-                                .clone()
-                                .map(|hint| AvailableCommandInput::Unstructured { hint }),
-                            meta: None,
-                        });
+                        let mut command = AvailableCommand::new(
+                            prompt.name.clone(),
+                            prompt.description.clone().unwrap_or_default(),
+                        );
+                        if let Some(hint) = &prompt.argument_hint {
+                            command = command.input(AvailableCommandInput::Unstructured(
+                                UnstructuredCommandInput::new(hint.clone()),
+                            ));
+                        }
+                        available_commands.push(command);
                     }
                     std::mem::swap(
                         custom_prompts.borrow_mut().deref_mut(),
@@ -1638,10 +1545,7 @@ impl<A: Auth> ConversationActor<A> {
 
                     client
                         .send_notification(SessionUpdate::AvailableCommandsUpdate(
-                            AvailableCommandsUpdate {
-                                available_commands,
-                                meta: None,
-                            },
+                            AvailableCommandsUpdate::new(available_commands),
                         ))
                         .await;
                 });
@@ -1670,48 +1574,34 @@ impl<A: Auth> ConversationActor<A> {
 
     fn builtin_commands() -> Vec<AvailableCommand> {
         vec![
-            AvailableCommand {
-                name: "review".to_string(),
-                description: "Review my current changes and find issues".into(),
-                input: Some(AvailableCommandInput::Unstructured {
-                    hint: "optional custom review instructions".into(),
-                }),
-                meta: None,
-            },
-            AvailableCommand {
-                name: "review-branch".to_string(),
-                description: "Review the code changes against a specific branch".into(),
-                input: Some(AvailableCommandInput::Unstructured {
-                    hint: "branch name".into(),
-                }),
-                meta: None,
-            },
-            AvailableCommand {
-                name: "review-commit".to_string(),
-                description: "Review the code changes introduced by a commit".into(),
-                input: Some(AvailableCommandInput::Unstructured {
-                    hint: "commit sha".into(),
-                }),
-                meta: None,
-            },
-            AvailableCommand {
-                name: "init".to_string(),
-                description: "create an AGENTS.md file with instructions for Codex".into(),
-                input: None,
-                meta: None,
-            },
-            AvailableCommand {
-                name: "compact".to_string(),
-                description: "summarize conversation to prevent hitting the context limit".into(),
-                input: None,
-                meta: None,
-            },
-            AvailableCommand {
-                name: "logout".to_string(),
-                description: "logout of Codex".into(),
-                input: None,
-                meta: None,
-            },
+            AvailableCommand::new("review", "Review my current changes and find issues").input(
+                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                    "optional custom review instructions",
+                )),
+            ),
+            AvailableCommand::new(
+                "review-branch",
+                "Review the code changes against a specific branch",
+            )
+            .input(AvailableCommandInput::Unstructured(
+                UnstructuredCommandInput::new("branch name"),
+            )),
+            AvailableCommand::new(
+                "review-commit",
+                "Review the code changes introduced by a commit",
+            )
+            .input(AvailableCommandInput::Unstructured(
+                UnstructuredCommandInput::new("commit sha"),
+            )),
+            AvailableCommand::new(
+                "init",
+                "create an AGENTS.md file with instructions for Codex",
+            ),
+            AvailableCommand::new(
+                "compact",
+                "summarize conversation to prevent hitting the context limit",
+            ),
+            AvailableCommand::new("logout", "logout of Codex"),
         ]
     }
 
@@ -1720,7 +1610,7 @@ impl<A: Auth> ConversationActor<A> {
         let submission_id = match self.conversation.submit(Op::ListCustomPrompts).await {
             Ok(id) => id,
             Err(e) => {
-                drop(response_tx.send(Err(Error::internal_error().with_data(e.to_string()))));
+                drop(response_tx.send(Err(Error::internal_error().data(e.to_string()))));
                 return response_rx;
             }
         };
@@ -1740,21 +1630,17 @@ impl<A: Auth> ConversationActor<A> {
                 preset.approval == self.config.approval_policy
                     && preset.sandbox == self.config.sandbox_policy
             })
-            .map(|preset| SessionModeId(preset.id.into()))?;
+            .map(|preset| SessionModeId::new(preset.id))?;
 
-        Some(SessionModeState {
+        Some(SessionModeState::new(
             current_mode_id,
-            available_modes: APPROVAL_PRESETS
+            APPROVAL_PRESETS
                 .iter()
-                .map(|preset| SessionMode {
-                    id: SessionModeId(preset.id.into()),
-                    name: preset.label.to_owned(),
-                    description: Some(preset.description.to_owned()),
-                    meta: None,
+                .map(|preset| {
+                    SessionMode::new(preset.id, preset.label).description(preset.description)
                 })
                 .collect(),
-            meta: None,
-        })
+        ))
     }
 
     fn find_current_model(&self) -> Option<ModelId> {
@@ -1777,7 +1663,7 @@ impl<A: Auth> ConversationActor<A> {
     }
 
     fn model_id(id: &'static str, effort: ReasoningEffort) -> ModelId {
-        ModelId(format!("{id}/{effort}").into())
+        ModelId::new(format!("{id}/{effort}"))
     }
 
     fn parse_model_id(id: &ModelId) -> Option<(String, ReasoningEffort)> {
@@ -1789,51 +1675,42 @@ impl<A: Auth> ConversationActor<A> {
     fn models(&self) -> Result<SessionModelState, Error> {
         let current_model_id = self.find_current_model().unwrap_or_else(|| {
             // If no preset found, return the current model string as-is
-            ModelId(self.config.model.clone().into())
+            ModelId::new(self.config.model.clone())
         });
 
         // If the user is using a custom provider, don't return the list
         if self.config.model_provider_id != "openai" {
-            return Ok(SessionModelState {
-                available_models: vec![ModelInfo {
-                    model_id: current_model_id.clone(),
-                    name: format!("{current_model_id} ({})", self.config.model_provider.name),
-                    description: None,
-                    meta: None,
-                }],
-                current_model_id,
-                meta: None,
-            });
+            return Ok(SessionModelState::new(
+                current_model_id.clone(),
+                vec![ModelInfo::new(
+                    current_model_id.clone(),
+                    format!("{current_model_id} ({})", self.config.model_provider.name),
+                )],
+            ));
         }
 
         let available_models = MODEL_PRESETS
             .iter()
             .flat_map(|preset| {
-                preset
-                    .supported_reasoning_efforts
-                    .iter()
-                    .map(|effort| ModelInfo {
-                        model_id: Self::model_id(preset.id, effort.effort),
-                        name: format!("{} ({})", preset.display_name, effort.effort),
-                        description: Some(format!("{} {}", preset.description, effort.description)),
-                        meta: None,
-                    })
+                preset.supported_reasoning_efforts.iter().map(|effort| {
+                    ModelInfo::new(
+                        Self::model_id(preset.id, effort.effort),
+                        format!("{} ({})", preset.display_name, effort.effort),
+                    )
+                    .description(format!("{} {}", preset.description, effort.description))
+                })
             })
             .collect();
 
-        Ok(SessionModelState {
-            current_model_id,
-            available_models,
-            meta: None,
-        })
+        Ok(SessionModelState::new(current_model_id, available_models))
     }
 
     fn handle_load(&mut self) -> Result<LoadSessionResponse, Error> {
-        Ok(LoadSessionResponse {
-            modes: self.modes(),
-            models: Some(self.models()?),
-            meta: None,
-        })
+        let mut response = LoadSessionResponse::new().models(self.models()?);
+        if let Some(modes) = self.modes() {
+            response = response.modes(modes);
+        }
+        Ok(response)
     }
 
     async fn handle_prompt(
@@ -1901,7 +1778,7 @@ impl<A: Auth> ConversationActor<A> {
                 _ => {
                     if let Some(prompt) =
                         expand_custom_prompt(name, rest, self.custom_prompts.borrow().as_ref())
-                            .map_err(|e| Error::invalid_params().with_data(e.user_message()))?
+                            .map_err(|e| Error::invalid_params().data(e.user_message()))?
                     {
                         op = Op::UserInput {
                             items: vec![UserInput::Text { text: prompt }],
@@ -1919,7 +1796,7 @@ impl<A: Auth> ConversationActor<A> {
             .conversation
             .submit(op.clone())
             .await
-            .map_err(|e| Error::internal_error().with_data(e.to_string()))?;
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
         info!("Submitted prompt with submission_id: {submission_id}");
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
@@ -1989,7 +1866,7 @@ impl<A: Auth> ConversationActor<A> {
             });
 
         if model_to_use.is_empty() {
-            return Err(Error::invalid_params().with_data("No model parsed or configured"));
+            return Err(Error::invalid_params().data("No model parsed or configured"));
         }
 
         self.conversation
@@ -2037,28 +1914,17 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<UserInput> {
             ContentBlock::Image(image_block) => Some(UserInput::Image {
                 image_url: format!("data:{};base64,{}", image_block.mime_type, image_block.data),
             }),
-            ContentBlock::ResourceLink(ResourceLink {
-                annotations: _,
-                description: _,
-                mime_type: _,
-                name,
-                size: _,
-                title: _,
-                uri,
-                meta: _,
-            }) => Some(UserInput::Text {
+            ContentBlock::ResourceLink(ResourceLink { name, uri, .. }) => Some(UserInput::Text {
                 text: format_uri_as_link(Some(name), uri),
             }),
             ContentBlock::Resource(EmbeddedResource {
-                annotations: _,
                 resource:
                     EmbeddedResourceResource::TextResourceContents(TextResourceContents {
-                        mime_type: _,
                         text,
                         uri,
-                        meta: _,
+                        ..
                     }),
-                meta: _,
+                ..
             }) => Some(UserInput::Text {
                 text: format!(
                     "{}\n<context ref=\"{uri}\">\n{text}\n</context>",
@@ -2066,7 +1932,7 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<UserInput> {
                 ),
             }),
             // Skip other content types for now
-            ContentBlock::Audio(..) | ContentBlock::Resource(..) => None,
+            ContentBlock::Audio(..) | ContentBlock::Resource(..) | _ => None,
         })
         .collect()
 }
@@ -2088,85 +1954,136 @@ fn format_uri_as_link(name: Option<String>, uri: String) -> String {
 }
 
 fn codex_content_to_acp_content(content: mcp_types::ContentBlock) -> ToolCallContent {
-    ToolCallContent::Content {
-        content: match content {
-            mcp_types::ContentBlock::TextContent(text_content) => ContentBlock::Text(TextContent {
-                annotations: text_content.annotations.map(convert_annotations),
-                text: text_content.text,
-                meta: None,
-            }),
-            mcp_types::ContentBlock::ImageContent(image_content) => {
-                ContentBlock::Image(ImageContent {
-                    annotations: image_content.annotations.map(convert_annotations),
-                    data: image_content.data,
-                    mime_type: image_content.mime_type,
-                    uri: None,
-                    meta: None,
-                })
+    ToolCallContent::Content(Content::new(match content {
+        mcp_types::ContentBlock::TextContent(mcp_types::TextContent {
+            annotations, text, ..
+        }) => {
+            let mut text_content = TextContent::new(text);
+            if let Some(annotations) = annotations {
+                text_content = text_content.annotations(convert_annotations(annotations))
             }
-            mcp_types::ContentBlock::AudioContent(audio_content) => {
-                ContentBlock::Audio(AudioContent {
-                    annotations: audio_content.annotations.map(convert_annotations),
-                    data: audio_content.data,
-                    mime_type: audio_content.mime_type,
-                    meta: None,
-                })
+            ContentBlock::Text(text_content)
+        }
+        mcp_types::ContentBlock::ImageContent(mcp_types::ImageContent {
+            annotations,
+            data,
+            mime_type,
+            ..
+        }) => {
+            let mut image_content = ImageContent::new(data, mime_type);
+            if let Some(annotations) = annotations {
+                image_content = image_content.annotations(convert_annotations(annotations));
             }
-            mcp_types::ContentBlock::ResourceLink(resource_link) => {
-                ContentBlock::ResourceLink(ResourceLink {
-                    annotations: resource_link.annotations.map(convert_annotations),
-                    description: resource_link.description,
-                    mime_type: resource_link.mime_type,
-                    name: resource_link.name,
-                    size: resource_link.size,
-                    title: resource_link.title,
-                    uri: resource_link.uri,
-                    meta: None,
-                })
-            }
-            mcp_types::ContentBlock::EmbeddedResource(embedded_resource) => {
-                ContentBlock::Resource(EmbeddedResource {
-                    annotations: embedded_resource.annotations.map(convert_annotations),
-                    resource: match embedded_resource.resource {
-                        mcp_types::EmbeddedResourceResource::TextResourceContents(
-                            text_resource_contents,
-                        ) => EmbeddedResourceResource::TextResourceContents(TextResourceContents {
-                            mime_type: text_resource_contents.mime_type,
-                            text: text_resource_contents.text,
-                            uri: text_resource_contents.uri,
-                            meta: None,
-                        }),
-                        mcp_types::EmbeddedResourceResource::BlobResourceContents(
-                            blob_resource_contents,
-                        ) => EmbeddedResourceResource::BlobResourceContents(BlobResourceContents {
-                            blob: blob_resource_contents.blob,
-                            mime_type: blob_resource_contents.mime_type,
-                            uri: blob_resource_contents.uri,
-                            meta: None,
-                        }),
+            ContentBlock::Image(image_content)
+        }
+        mcp_types::ContentBlock::AudioContent(mcp_types::AudioContent {
+            annotations,
+            data,
+            mime_type,
+            ..
+        }) => {
+            let mut audio_content = AudioContent::new(data, mime_type);
+            if let Some(annotations) = annotations {
+                audio_content = audio_content.annotations(convert_annotations(annotations));
+            };
+            ContentBlock::Audio(audio_content)
+        }
+        mcp_types::ContentBlock::ResourceLink(mcp_types::ResourceLink {
+            annotations,
+            description,
+            mime_type,
+            name,
+            size,
+            title,
+            uri,
+            ..
+        }) => {
+            let mut resource_link = ResourceLink::new(name, uri);
+            if let Some(annotations) = annotations {
+                resource_link = resource_link.annotations(convert_annotations(annotations));
+            };
+            if let Some(description) = description {
+                resource_link = resource_link.description(description);
+            };
+            if let Some(mime_type) = mime_type {
+                resource_link = resource_link.mime_type(mime_type);
+            };
+            if let Some(size) = size {
+                resource_link = resource_link.size(size);
+            };
+            if let Some(title) = title {
+                resource_link = resource_link.title(title);
+            };
+            ContentBlock::ResourceLink(resource_link)
+        }
+        mcp_types::ContentBlock::EmbeddedResource(mcp_types::EmbeddedResource {
+            annotations,
+            resource,
+            ..
+        }) => {
+            let resource = match resource {
+                mcp_types::EmbeddedResourceResource::TextResourceContents(
+                    mcp_types::TextResourceContents {
+                        mime_type,
+                        text,
+                        uri,
                     },
-                    meta: None,
-                })
-            }
-        },
-    }
+                ) => {
+                    let mut text_resource_contents = TextResourceContents::new(text, uri);
+                    if let Some(mime_type) = mime_type {
+                        text_resource_contents = text_resource_contents.mime_type(mime_type);
+                    };
+                    EmbeddedResourceResource::TextResourceContents(text_resource_contents)
+                }
+                mcp_types::EmbeddedResourceResource::BlobResourceContents(
+                    mcp_types::BlobResourceContents {
+                        blob,
+                        mime_type,
+                        uri,
+                    },
+                ) => {
+                    let mut blob_resource_contents = BlobResourceContents::new(blob, uri);
+                    if let Some(mime_type) = mime_type {
+                        blob_resource_contents = blob_resource_contents.mime_type(mime_type);
+                    }
+                    EmbeddedResourceResource::BlobResourceContents(blob_resource_contents)
+                }
+            };
+            let mut embedded_resource = EmbeddedResource::new(resource);
+            if let Some(annotations) = annotations {
+                embedded_resource = embedded_resource.annotations(convert_annotations(annotations));
+            };
+            ContentBlock::Resource(embedded_resource)
+        }
+    }))
 }
 
-fn convert_annotations(annotations: mcp_types::Annotations) -> Annotations {
-    Annotations {
-        audience: annotations.audience.map(|audience| {
+fn convert_annotations(
+    mcp_types::Annotations {
+        audience,
+        last_modified,
+        priority,
+    }: mcp_types::Annotations,
+) -> Annotations {
+    let mut annotations = Annotations::new();
+    if let Some(audience) = audience {
+        annotations = annotations.audience(
             audience
                 .into_iter()
                 .map(|audience| match audience {
                     mcp_types::Role::Assistant => agent_client_protocol::Role::Assistant,
                     mcp_types::Role::User => agent_client_protocol::Role::User,
                 })
-                .collect()
-        }),
-        last_modified: annotations.last_modified,
-        priority: annotations.priority,
-        meta: None,
+                .collect(),
+        );
     }
+    if let Some(last_modified) = last_modified {
+        annotations = annotations.last_modified(last_modified);
+    }
+    if let Some(priority) = priority {
+        annotations = annotations.priority(priority);
+    }
+    annotations
 }
 
 fn extract_tool_call_content_from_changes(
@@ -2181,43 +2098,21 @@ fn extract_tool_call_content_from_changes(
             "Edit {}",
             changes.keys().map(|p| p.display().to_string()).join(", ")
         ),
-        changes
-            .keys()
-            .map(|p| ToolCallLocation {
-                path: p.clone(),
-                line: None,
-                meta: None,
+        changes.keys().map(ToolCallLocation::new).collect(),
+        changes.into_iter().map(|(path, change)| {
+            ToolCallContent::Diff(match change {
+                codex_core::protocol::FileChange::Add { content } => Diff::new(path, content),
+                codex_core::protocol::FileChange::Delete { content } => {
+                    Diff::new(path, String::new()).old_text(content)
+                }
+                codex_core::protocol::FileChange::Update {
+                    unified_diff: _,
+                    move_path,
+                    old_content,
+                    new_content,
+                } => Diff::new(move_path.unwrap_or(path), new_content).old_text(old_content),
             })
-            .collect(),
-        changes
-            .into_iter()
-            .map(|(path, change)| ToolCallContent::Diff {
-                diff: match change {
-                    codex_core::protocol::FileChange::Add { content } => Diff {
-                        path,
-                        old_text: None,
-                        new_text: content,
-                        meta: None,
-                    },
-                    codex_core::protocol::FileChange::Delete { content } => Diff {
-                        path,
-                        old_text: Some(content),
-                        new_text: String::new(),
-                        meta: None,
-                    },
-                    codex_core::protocol::FileChange::Update {
-                        unified_diff: _,
-                        move_path,
-                        old_content,
-                        new_content,
-                    } => Diff {
-                        path: move_path.unwrap_or(path),
-                        old_text: Some(old_content),
-                        new_text: new_content,
-                        meta: None,
-                    },
-                },
-            }),
+        }),
     )
 }
 
@@ -2249,11 +2144,7 @@ mod tests {
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ConversationMessage::Prompt {
-            request: PromptRequest {
-                session_id: session_id.clone(),
-                prompt: vec!["Hi".into()],
-                meta: None,
-            },
+            request: PromptRequest::new(session_id.clone(), vec!["Hi".into()]),
             response_tx: prompt_response_tx,
         })?;
 
@@ -2289,11 +2180,7 @@ mod tests {
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ConversationMessage::Prompt {
-            request: PromptRequest {
-                session_id: session_id.clone(),
-                prompt: vec!["/compact".into()],
-                meta: None,
-            },
+            request: PromptRequest::new(session_id.clone(), vec!["/compact".into()]),
             response_tx: prompt_response_tx,
         })?;
 
@@ -2331,11 +2218,7 @@ mod tests {
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ConversationMessage::Prompt {
-            request: PromptRequest {
-                session_id: session_id.clone(),
-                prompt: vec!["/init".into()],
-                meta: None,
-            },
+            request: PromptRequest::new(session_id.clone(), vec!["/init".into()]),
             response_tx: prompt_response_tx,
         })?;
 
@@ -2383,11 +2266,7 @@ mod tests {
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ConversationMessage::Prompt {
-            request: PromptRequest {
-                session_id: session_id.clone(),
-                prompt: vec!["/review".into()],
-                meta: None,
-            },
+            request: PromptRequest::new(session_id.clone(), vec!["/review".into()]),
             response_tx: prompt_response_tx,
         })?;
 
@@ -2439,11 +2318,10 @@ mod tests {
         let instructions = "Review what we did in agents.md";
 
         message_tx.send(ConversationMessage::Prompt {
-            request: PromptRequest {
-                session_id: session_id.clone(),
-                prompt: vec![format!("/review {instructions}").into()],
-                meta: None,
-            },
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec![format!("/review {instructions}").into()],
+            ),
             response_tx: prompt_response_tx,
         })?;
 
@@ -2498,11 +2376,7 @@ mod tests {
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ConversationMessage::Prompt {
-            request: PromptRequest {
-                session_id: session_id.clone(),
-                prompt: vec!["/review-commit 123456".into()],
-                meta: None,
-            },
+            request: PromptRequest::new(session_id.clone(), vec!["/review-commit 123456".into()]),
             response_tx: prompt_response_tx,
         })?;
 
@@ -2559,11 +2433,7 @@ mod tests {
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ConversationMessage::Prompt {
-            request: PromptRequest {
-                session_id: session_id.clone(),
-                prompt: vec!["/review-branch feature".into()],
-                meta: None,
-            },
+            request: PromptRequest::new(session_id.clone(), vec!["/review-branch feature".into()]),
             response_tx: prompt_response_tx,
         })?;
 
@@ -2626,11 +2496,7 @@ mod tests {
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ConversationMessage::Prompt {
-            request: PromptRequest {
-                session_id: session_id.clone(),
-                prompt: vec!["/custom foo".into()],
-                meta: None,
-            },
+            request: PromptRequest::new(session_id.clone(), vec!["/custom foo".into()]),
             response_tx: prompt_response_tx,
         })?;
 
@@ -2680,11 +2546,7 @@ mod tests {
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ConversationMessage::Prompt {
-            request: PromptRequest {
-                session_id: session_id.clone(),
-                prompt: vec!["test delta".into()],
-                meta: None,
-            },
+            request: PromptRequest::new(session_id.clone(), vec!["test delta".into()]),
             response_tx: prompt_response_tx,
         })?;
 
@@ -2728,7 +2590,7 @@ mod tests {
         UnboundedSender<ConversationMessage>,
         LocalSet,
     )> {
-        let session_id = SessionId("test".into());
+        let session_id = SessionId::new("test");
         let client = Arc::new(StubClient::new());
         let session_client =
             SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
