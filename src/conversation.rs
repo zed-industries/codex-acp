@@ -35,11 +35,12 @@ use codex_core::{
         McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
         Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
-        SandboxPolicy, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent,
-        UserMessageEvent, ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent,
-        WebSearchEndEvent,
+        ReviewTarget, SandboxPolicy, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent,
+        TurnAbortedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
+        WebSearchBeginEvent, WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
+    review_prompts::user_facing_hint,
 };
 use codex_protocol::{
     approvals::ElicitationRequestEvent,
@@ -558,6 +559,7 @@ impl PromptState {
             | EventMsg::TurnDiff(..)
             // Revisit when we can emit status updates
             | EventMsg::BackgroundEvent(..)
+            | EventMsg::ContextCompacted(..)
             // Old events
             | EventMsg::AgentMessageDelta(..) | EventMsg::AgentReasoningDelta(..) | EventMsg::AgentReasoningRawContentDelta(..)
             | EventMsg::RawResponseItem(..)
@@ -1015,6 +1017,7 @@ impl PromptState {
             command: _,
             cwd,
             parsed_cmd,
+            process_id: _,
         } = event;
         // Create a new tool call for the command execution
         let tool_call_id = ToolCallId(call_id.clone().into());
@@ -1137,6 +1140,7 @@ impl PromptState {
             aggregated_output: _,
             duration: _,
             formatted_output: _,
+            process_id: _,
         } = event;
         if let Some(active_command) = self.active_command.take()
             && active_command.call_id == call_id
@@ -1389,7 +1393,8 @@ impl TaskState {
             | EventMsg::ReasoningRawContentDelta(..)
             | EventMsg::AgentReasoningSectionBreak(..)
             | EventMsg::RawResponseItem(..)
-            | EventMsg::BackgroundEvent(..) => {}
+            | EventMsg::BackgroundEvent(..)
+            | EventMsg::ContextCompacted(..) => {}
             // Unexpected events for this submission
             e @ (EventMsg::UserMessage(..)
             | EventMsg::SessionConfigured(..)
@@ -1850,47 +1855,42 @@ impl<A: Auth> ConversationActor<A> {
                     }
                 }
                 "review" => {
-                    let (prompt, user_facing_hint) = if rest.is_empty() {
-                        (
-                            "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.",
-                            "current changes",
-                        )
+                    let instructions = rest.trim();
+                    let target = if instructions.is_empty() {
+                        ReviewTarget::UncommittedChanges
                     } else {
-                        let trimmed = rest.trim();
-                        (trimmed, trimmed)
+                        ReviewTarget::Custom {
+                            instructions: instructions.to_owned(),
+                        }
                     };
 
                     op = Op::Review {
                         review_request: ReviewRequest {
-                            prompt: prompt.to_string(),
-                            user_facing_hint: user_facing_hint.to_string(),
-                            append_to_original_thread: true,
+                            user_facing_hint: Some(user_facing_hint(&target)),
+                            target,
                         },
                     }
                 }
                 "review-branch" if !rest.is_empty() => {
-                    let branch = rest.trim();
-                    // https://github.com/zed-industries/codex/blob/9baf30493dd9f531af1e4dc49a781654b1b2c966/codex-rs/tui/src/chatwidget.rs#L1995-L2002
+                    let target = ReviewTarget::BaseBranch {
+                        branch: rest.trim().to_owned(),
+                    };
                     op = Op::Review {
                         review_request: ReviewRequest {
-                            prompt: format!(
-                                "Review the code changes against the base branch '{branch}'. Start by finding the merge diff between the current branch and {branch}'s upstream e.g. (`git merge-base HEAD \"$(git rev-parse --abbrev-ref \"{branch}@{{upstream}}\")\"`), then run `git diff` against that SHA to see what changes we would merge into the {branch} branch. Provide prioritized, actionable findings."
-                            ),
-                            user_facing_hint: format!("changes against '{branch}'"),
-                            append_to_original_thread: true,
+                            user_facing_hint: Some(user_facing_hint(&target)),
+                            target,
                         },
                     }
                 }
                 "review-commit" if !rest.is_empty() => {
-                    let sha = rest.trim();
-                    // https://github.com/zed-industries/codex/blob/9baf30493dd9f531af1e4dc49a781654b1b2c966/codex-rs/tui/src/chatwidget.rs#L2033-L2042
+                    let target = ReviewTarget::Commit {
+                        sha: rest.trim().to_owned(),
+                        title: None,
+                    };
                     op = Op::Review {
                         review_request: ReviewRequest {
-                            prompt: format!(
-                                "Review the code changes introduced by commit {sha}. Provide prioritized, actionable findings."
-                            ),
-                            user_facing_hint: format!("commit {sha}"),
-                            append_to_original_thread: true,
+                            user_facing_hint: Some(user_facing_hint(&target)),
+                            target,
                         },
                     }
                 }
@@ -2422,9 +2422,8 @@ mod tests {
             ops.as_slice(),
             &[Op::Review {
                 review_request: ReviewRequest {
-                    prompt: "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.".into(),
-                    user_facing_hint: "current changes".into(),
-                    append_to_original_thread: true,
+                    user_facing_hint: Some(user_facing_hint(&ReviewTarget::UncommittedChanges)),
+                    target: ReviewTarget::UncommittedChanges,
                 }
             }],
             "ops don't match {ops:?}"
@@ -2437,11 +2436,12 @@ mod tests {
     async fn test_custom_review() -> anyhow::Result<()> {
         let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+        let instructions = "Review what we did in agents.md";
 
         message_tx.send(ConversationMessage::Prompt {
             request: PromptRequest {
                 session_id: session_id.clone(),
-                prompt: vec!["/review Review what we did in agents.md".into()],
+                prompt: vec![format!("/review {instructions}").into()],
                 meta: None,
             },
             response_tx: prompt_response_tx,
@@ -2478,9 +2478,12 @@ mod tests {
             ops.as_slice(),
             &[Op::Review {
                 review_request: ReviewRequest {
-                    prompt: "Review what we did in agents.md".into(),
-                    user_facing_hint: "Review what we did in agents.md".into(),
-                    append_to_original_thread: true,
+                    user_facing_hint: Some(user_facing_hint(&ReviewTarget::Custom {
+                        instructions: instructions.to_owned()
+                    })),
+                    target: ReviewTarget::Custom {
+                        instructions: instructions.to_owned()
+                    },
                 }
             }],
             "ops don't match {ops:?}"
@@ -2534,9 +2537,14 @@ mod tests {
             ops.as_slice(),
             &[Op::Review {
                 review_request: ReviewRequest {
-                    prompt: "Review the code changes introduced by commit 123456. Provide prioritized, actionable findings.".into(),
-                    user_facing_hint: "commit 123456".into(),
-                    append_to_original_thread: true,
+                    user_facing_hint: Some(user_facing_hint(&ReviewTarget::Commit {
+                        sha: "123456".to_owned(),
+                        title: None
+                    })),
+                    target: ReviewTarget::Commit {
+                        sha: "123456".to_owned(),
+                        title: None
+                    },
                 }
             }],
             "ops don't match {ops:?}"
@@ -2590,9 +2598,12 @@ mod tests {
             ops.as_slice(),
             &[Op::Review {
                 review_request: ReviewRequest {
-                    prompt: "Review the code changes against the base branch 'feature'. Start by finding the merge diff between the current branch and feature's upstream e.g. (`git merge-base HEAD \"$(git rev-parse --abbrev-ref \"feature@{upstream}\")\"`), then run `git diff` against that SHA to see what changes we would merge into the feature branch. Provide prioritized, actionable findings.".into(),
-                    user_facing_hint: "changes against 'feature'".into(),
-                    append_to_original_thread: true,
+                    user_facing_hint: Some(user_facing_hint(&ReviewTarget::BaseBranch {
+                        branch: "feature".to_owned()
+                    })),
+                    target: ReviewTarget::BaseBranch {
+                        branch: "feature".to_owned()
+                    },
                 }
             }],
             "ops don't match {ops:?}"
@@ -2854,7 +2865,10 @@ mod tests {
                                 review_output: Some(ReviewOutputEvent {
                                     findings: vec![],
                                     overall_correctness: String::new(),
-                                    overall_explanation: review_request.user_facing_hint.clone(),
+                                    overall_explanation: review_request
+                                        .user_facing_hint
+                                        .clone()
+                                        .unwrap_or_default(),
                                     overall_confidence_score: 1.,
                                 }),
                             }),
