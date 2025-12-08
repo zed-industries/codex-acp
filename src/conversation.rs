@@ -19,14 +19,12 @@ use agent_client_protocol::{
     ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     UnstructuredCommandInput,
 };
-use codex_common::{
-    approval_presets::{ApprovalPreset, builtin_approval_presets},
-    model_presets::{ModelPreset, all_model_presets},
-};
+use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
     AuthManager, CodexConversation,
     config::{Config, set_project_trust_level},
     error::CodexErr,
+    openai_models::model_presets::all_model_presets,
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
         AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ElicitationAction,
@@ -45,8 +43,9 @@ use codex_core::{
 };
 use codex_protocol::{
     approvals::ElicitationRequestEvent,
-    config_types::{ReasoningEffort, TrustLevel},
+    config_types::TrustLevel,
     custom_prompts::CustomPrompt,
+    openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     user_input::UserInput,
@@ -857,6 +856,7 @@ impl PromptState {
             reason,
             parsed_cmd,
             risk,
+            proposed_execpolicy_amendment,
         } = event;
 
         // Create a new tool call for the command execution
@@ -876,19 +876,29 @@ impl PromptState {
             file_extension,
         });
 
-        let risk = risk.map(|risk| {
-            format!(
+        let mut content = vec![];
+
+        if let Some(reason) = reason {
+            content.push(reason);
+        }
+        if let Some(risk) = risk {
+            content.push(format!(
                 "Risk Assessment: {}\nRisk Level: {}",
                 risk.description,
                 risk.risk_level.as_str()
-            )
-        });
+            ));
+        }
+        if let Some(amendment) = proposed_execpolicy_amendment {
+            content.push(format!(
+                "Proposed Amendment: {}",
+                amendment.command().join("\n")
+            ));
+        }
 
-        let content = match (reason, risk) {
-            (Some(reason), Some(risk)) => Some(vec![[reason, risk].join("\n").into()]),
-            (Some(reason), None) => Some(vec![reason.into()]),
-            (None, Some(risk)) => Some(vec![risk.into()]),
-            (None, None) => None,
+        let content = if content.is_empty() {
+            None
+        } else {
+            Some(vec![content.join("\n").into()])
         };
 
         let response = client
@@ -1656,10 +1666,10 @@ impl<A: Auth> ConversationActor<A> {
             })
             .unwrap_or(preset.default_reasoning_effort);
 
-        Some(Self::model_id(preset.id, effort))
+        Some(Self::model_id(&preset.id, effort))
     }
 
-    fn model_id(id: &'static str, effort: ReasoningEffort) -> ModelId {
+    fn model_id(id: &str, effort: ReasoningEffort) -> ModelId {
         ModelId::new(format!("{id}/{effort}"))
     }
 
@@ -1691,7 +1701,7 @@ impl<A: Auth> ConversationActor<A> {
             .flat_map(|preset| {
                 preset.supported_reasoning_efforts.iter().map(|effort| {
                     ModelInfo::new(
-                        Self::model_id(preset.id, effort.effort),
+                        Self::model_id(&preset.id, effort.effort),
                         format!("{} ({})", preset.display_name, effort.effort),
                     )
                     .description(format!("{} {}", preset.description, effort.description))
