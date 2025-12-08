@@ -589,17 +589,17 @@ impl PromptState {
                 ),
                 vec![
                     PermissionOption::new(
-                        "approved".into(),
+                        "approved",
                         "Yes, provide the requested info",
                         PermissionOptionKind::AllowOnce,
                     ),
                     PermissionOption::new(
-                        "abort".into(),
+                        "abort",
                         "No, but continue without it",
                         PermissionOptionKind::RejectOnce,
                     ),
                     PermissionOption::new(
-                        "cancel".into(),
+                        "cancel",
                         "Cancel this request",
                         PermissionOptionKind::RejectOnce,
                     ),
@@ -697,17 +697,13 @@ impl PromptState {
                         .status(ToolCallStatus::Pending)
                         .title(title)
                         .locations(locations)
-                        .content(content.chain(reason.map(|r| r.into())).collect())
+                        .content(content.chain(reason.map(|r| r.into())).collect::<Vec<_>>())
                         .raw_input(raw_input),
                 ),
                 vec![
+                    PermissionOption::new("approved", "Yes", PermissionOptionKind::AllowOnce),
                     PermissionOption::new(
-                        "approved".into(),
-                        "Yes",
-                        PermissionOptionKind::AllowOnce,
-                    ),
-                    PermissionOption::new(
-                        "abort".into(),
+                        "abort",
                         "No, provide feedback",
                         PermissionOptionKind::RejectOnce,
                     ),
@@ -769,25 +765,26 @@ impl PromptState {
             turn_id: _,
         } = event;
 
-        let mut fields = ToolCallUpdateFields::new()
-            .status(if success {
-                ToolCallStatus::Completed
-            } else {
-                ToolCallStatus::Failed
-            })
-            .raw_output(raw_output);
-
-        if !changes.is_empty() {
+        let (title, locations, content) = if !changes.is_empty() {
             let (title, locations, content) = extract_tool_call_content_from_changes(changes);
-            fields = fields
-                .title(title)
-                .locations(locations)
-                .content(content.collect())
-        }
+            (Some(title), Some(locations), Some(content.collect()))
+        } else {
+            (None, None, None)
+        };
 
         client
             .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                call_id, fields,
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(if success {
+                        ToolCallStatus::Completed
+                    } else {
+                        ToolCallStatus::Failed
+                    })
+                    .raw_output(raw_output)
+                    .title(title)
+                    .locations(locations)
+                    .content(content),
             )))
             .await;
     }
@@ -822,28 +819,26 @@ impl PromptState {
             Ok(result) => serde_json::json!(result),
             Err(err) => serde_json::json!(err),
         };
-        let mut fields = ToolCallUpdateFields::new()
-            .status(if is_error {
-                ToolCallStatus::Failed
-            } else {
-                ToolCallStatus::Completed
-            })
-            .raw_output(raw_output);
 
-        if let Ok(result) = result
-            && !result.content.is_empty()
-        {
-            fields = fields.content(
-                result
-                    .content
-                    .into_iter()
-                    .map(codex_content_to_acp_content)
-                    .collect(),
-            );
-        }
         client
             .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                call_id, fields,
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(if is_error {
+                        ToolCallStatus::Failed
+                    } else {
+                        ToolCallStatus::Completed
+                    })
+                    .raw_output(raw_output)
+                    .content(result.ok().filter(|result| !result.content.is_empty()).map(
+                        |result| {
+                            result
+                                .content
+                                .into_iter()
+                                .map(codex_content_to_acp_content)
+                                .collect()
+                        },
+                    )),
             )))
             .await;
     }
@@ -896,35 +891,31 @@ impl PromptState {
             (None, None) => None,
         };
 
-        let mut fields = ToolCallUpdateFields::new()
-            .kind(kind)
-            .status(ToolCallStatus::Pending)
-            .title(title)
-            .raw_input(raw_input);
-
-        if let Some(content) = content {
-            fields = fields.content(content);
-        }
-        if !locations.is_empty() {
-            fields = fields.locations(locations);
-        }
-
         let response = client
             .request_permission(
-                ToolCallUpdate::new(tool_call_id, fields),
+                ToolCallUpdate::new(
+                    tool_call_id,
+                    ToolCallUpdateFields::new()
+                        .kind(kind)
+                        .status(ToolCallStatus::Pending)
+                        .title(title)
+                        .raw_input(raw_input)
+                        .content(content)
+                        .locations(if locations.is_empty() {
+                            None
+                        } else {
+                            Some(locations)
+                        }),
+                ),
                 vec![
                     PermissionOption::new(
-                        "approved-for-session".into(),
+                        "approved-for-session",
                         "Always",
                         PermissionOptionKind::AllowAlways,
                     ),
+                    PermissionOption::new("approved", "Yes", PermissionOptionKind::AllowOnce),
                     PermissionOption::new(
-                        "approved".into(),
-                        "Yes",
-                        PermissionOptionKind::AllowOnce,
-                    ),
-                    PermissionOption::new(
-                        "abort".into(),
+                        "abort",
                         "No, provide feedback",
                         PermissionOptionKind::RejectOnce,
                     ),
@@ -983,30 +974,32 @@ impl PromptState {
             file_extension,
             terminal_output,
         };
+        let (content, meta) = if client.supports_terminal_output(&active_command) {
+            let content = vec![ToolCallContent::Terminal(Terminal::new(call_id.clone()))];
+            let meta = Some(Meta::from_iter([(
+                "terminal_info".to_owned(),
+                serde_json::json!({
+                    "terminal_id": call_id,
+                    "cwd": cwd
+                }),
+            )]));
+            (content, meta)
+        } else {
+            (vec![], None)
+        };
 
-        let mut tool_call = ToolCall::new(tool_call_id, title)
-            .kind(kind)
-            .status(ToolCallStatus::InProgress)
-            .locations(locations)
-            .raw_input(raw_input);
-
-        if client.supports_terminal_output(&active_command) {
-            tool_call = tool_call
-                .content(vec![ToolCallContent::Terminal(Terminal::new(
-                    call_id.clone(),
-                ))])
-                .meta(Meta::from_iter([(
-                    "terminal_info".to_owned(),
-                    serde_json::json!({
-                        "terminal_id": call_id,
-                        "cwd": cwd
-                    }),
-                )]));
-        }
         self.active_command = Some(active_command);
 
         client
-            .send_notification(SessionUpdate::ToolCall(tool_call))
+            .send_notification(SessionUpdate::ToolCall(
+                ToolCall::new(tool_call_id, title)
+                    .kind(kind)
+                    .status(ToolCallStatus::InProgress)
+                    .locations(locations)
+                    .raw_input(raw_input)
+                    .content(content)
+                    .meta(meta),
+            ))
             .await;
     }
 
@@ -1086,30 +1079,31 @@ impl PromptState {
         {
             let is_success = exit_code == 0;
 
-            let mut update = ToolCallUpdate::new(
-                active_command.tool_call_id.clone(),
-                ToolCallUpdateFields::new()
-                    .status(if is_success {
-                        ToolCallStatus::Completed
-                    } else {
-                        ToolCallStatus::Failed
-                    })
-                    .raw_output(raw_output),
-            );
-
-            if client.supports_terminal_output(&active_command) {
-                update = update.meta(Meta::from_iter([(
-                    "terminal_exit".into(),
-                    serde_json::json!({
-                        "terminal_id": call_id,
-                        "exit_code": exit_code,
-                        "signal": null
-                    }),
-                )]));
-            }
-
             client
-                .send_notification(SessionUpdate::ToolCallUpdate(update))
+                .send_notification(SessionUpdate::ToolCallUpdate(
+                    ToolCallUpdate::new(
+                        active_command.tool_call_id.clone(),
+                        ToolCallUpdateFields::new()
+                            .status(if is_success {
+                                ToolCallStatus::Completed
+                            } else {
+                                ToolCallStatus::Failed
+                            })
+                            .raw_output(raw_output),
+                    )
+                    .meta(
+                        client.supports_terminal_output(&active_command).then(|| {
+                            Meta::from_iter([(
+                                "terminal_exit".into(),
+                                serde_json::json!({
+                                    "terminal_id": call_id,
+                                    "exit_code": exit_code,
+                                    "signal": null
+                                }),
+                            )])
+                        }),
+                    ),
+                ))
                 .await;
         }
     }
@@ -1527,16 +1521,19 @@ impl<A: Auth> ConversationActor<A> {
                         .unwrap_or_default();
 
                     for prompt in &new_custom_prompts {
-                        let mut command = AvailableCommand::new(
-                            prompt.name.clone(),
-                            prompt.description.clone().unwrap_or_default(),
+                        available_commands.push(
+                            AvailableCommand::new(
+                                prompt.name.clone(),
+                                prompt.description.clone().unwrap_or_default(),
+                            )
+                            .input(prompt.argument_hint.as_ref().map(
+                                |hint| {
+                                    AvailableCommandInput::Unstructured(
+                                        UnstructuredCommandInput::new(hint.clone()),
+                                    )
+                                },
+                            )),
                         );
-                        if let Some(hint) = &prompt.argument_hint {
-                            command = command.input(AvailableCommandInput::Unstructured(
-                                UnstructuredCommandInput::new(hint.clone()),
-                            ));
-                        }
-                        available_commands.push(command);
                     }
                     std::mem::swap(
                         custom_prompts.borrow_mut().deref_mut(),
@@ -1706,11 +1703,9 @@ impl<A: Auth> ConversationActor<A> {
     }
 
     fn handle_load(&mut self) -> Result<LoadSessionResponse, Error> {
-        let mut response = LoadSessionResponse::new().models(self.models()?);
-        if let Some(modes) = self.modes() {
-            response = response.modes(modes);
-        }
-        Ok(response)
+        Ok(LoadSessionResponse::new()
+            .models(self.models()?)
+            .modes(self.modes()))
     }
 
     async fn handle_prompt(
@@ -1957,37 +1952,25 @@ fn codex_content_to_acp_content(content: mcp_types::ContentBlock) -> ToolCallCon
     ToolCallContent::Content(Content::new(match content {
         mcp_types::ContentBlock::TextContent(mcp_types::TextContent {
             annotations, text, ..
-        }) => {
-            let mut text_content = TextContent::new(text);
-            if let Some(annotations) = annotations {
-                text_content = text_content.annotations(convert_annotations(annotations))
-            }
-            ContentBlock::Text(text_content)
-        }
+        }) => ContentBlock::Text(
+            TextContent::new(text).annotations(annotations.map(convert_annotations)),
+        ),
         mcp_types::ContentBlock::ImageContent(mcp_types::ImageContent {
             annotations,
             data,
             mime_type,
             ..
-        }) => {
-            let mut image_content = ImageContent::new(data, mime_type);
-            if let Some(annotations) = annotations {
-                image_content = image_content.annotations(convert_annotations(annotations));
-            }
-            ContentBlock::Image(image_content)
-        }
+        }) => ContentBlock::Image(
+            ImageContent::new(data, mime_type).annotations(annotations.map(convert_annotations)),
+        ),
         mcp_types::ContentBlock::AudioContent(mcp_types::AudioContent {
             annotations,
             data,
             mime_type,
             ..
-        }) => {
-            let mut audio_content = AudioContent::new(data, mime_type);
-            if let Some(annotations) = annotations {
-                audio_content = audio_content.annotations(convert_annotations(annotations));
-            };
-            ContentBlock::Audio(audio_content)
-        }
+        }) => ContentBlock::Audio(
+            AudioContent::new(data, mime_type).annotations(annotations.map(convert_annotations)),
+        ),
         mcp_types::ContentBlock::ResourceLink(mcp_types::ResourceLink {
             annotations,
             description,
@@ -1997,25 +1980,14 @@ fn codex_content_to_acp_content(content: mcp_types::ContentBlock) -> ToolCallCon
             title,
             uri,
             ..
-        }) => {
-            let mut resource_link = ResourceLink::new(name, uri);
-            if let Some(annotations) = annotations {
-                resource_link = resource_link.annotations(convert_annotations(annotations));
-            };
-            if let Some(description) = description {
-                resource_link = resource_link.description(description);
-            };
-            if let Some(mime_type) = mime_type {
-                resource_link = resource_link.mime_type(mime_type);
-            };
-            if let Some(size) = size {
-                resource_link = resource_link.size(size);
-            };
-            if let Some(title) = title {
-                resource_link = resource_link.title(title);
-            };
-            ContentBlock::ResourceLink(resource_link)
-        }
+        }) => ContentBlock::ResourceLink(
+            ResourceLink::new(name, uri)
+                .annotations(annotations.map(convert_annotations))
+                .description(description)
+                .mime_type(mime_type)
+                .size(size)
+                .title(title),
+        ),
         mcp_types::ContentBlock::EmbeddedResource(mcp_types::EmbeddedResource {
             annotations,
             resource,
@@ -2028,32 +2000,22 @@ fn codex_content_to_acp_content(content: mcp_types::ContentBlock) -> ToolCallCon
                         text,
                         uri,
                     },
-                ) => {
-                    let mut text_resource_contents = TextResourceContents::new(text, uri);
-                    if let Some(mime_type) = mime_type {
-                        text_resource_contents = text_resource_contents.mime_type(mime_type);
-                    };
-                    EmbeddedResourceResource::TextResourceContents(text_resource_contents)
-                }
+                ) => EmbeddedResourceResource::TextResourceContents(
+                    TextResourceContents::new(text, uri).mime_type(mime_type),
+                ),
                 mcp_types::EmbeddedResourceResource::BlobResourceContents(
                     mcp_types::BlobResourceContents {
                         blob,
                         mime_type,
                         uri,
                     },
-                ) => {
-                    let mut blob_resource_contents = BlobResourceContents::new(blob, uri);
-                    if let Some(mime_type) = mime_type {
-                        blob_resource_contents = blob_resource_contents.mime_type(mime_type);
-                    }
-                    EmbeddedResourceResource::BlobResourceContents(blob_resource_contents)
-                }
+                ) => EmbeddedResourceResource::BlobResourceContents(
+                    BlobResourceContents::new(blob, uri).mime_type(mime_type),
+                ),
             };
-            let mut embedded_resource = EmbeddedResource::new(resource);
-            if let Some(annotations) = annotations {
-                embedded_resource = embedded_resource.annotations(convert_annotations(annotations));
-            };
-            ContentBlock::Resource(embedded_resource)
+            ContentBlock::Resource(
+                EmbeddedResource::new(resource).annotations(annotations.map(convert_annotations)),
+            )
         }
     }))
 }
@@ -2065,25 +2027,17 @@ fn convert_annotations(
         priority,
     }: mcp_types::Annotations,
 ) -> Annotations {
-    let mut annotations = Annotations::new();
-    if let Some(audience) = audience {
-        annotations = annotations.audience(
-            audience
-                .into_iter()
+    Annotations::new()
+        .audience(audience.map(|a| {
+            a.into_iter()
                 .map(|audience| match audience {
                     mcp_types::Role::Assistant => agent_client_protocol::Role::Assistant,
                     mcp_types::Role::User => agent_client_protocol::Role::User,
                 })
-                .collect(),
-        );
-    }
-    if let Some(last_modified) = last_modified {
-        annotations = annotations.last_modified(last_modified);
-    }
-    if let Some(priority) = priority {
-        annotations = annotations.priority(priority);
-    }
-    annotations
+                .collect::<Vec<_>>()
+        }))
+        .last_modified(last_modified)
+        .priority(priority)
 }
 
 fn extract_tool_call_content_from_changes(
