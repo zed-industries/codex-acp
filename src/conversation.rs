@@ -24,7 +24,7 @@ use codex_core::{
     AuthManager, CodexConversation,
     config::{Config, set_project_trust_level},
     error::CodexErr,
-    openai_models::model_presets::all_model_presets,
+    openai_models::models_manager::ModelsManager,
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
         AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ElicitationAction,
@@ -62,7 +62,6 @@ use crate::{
 };
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
-static MODEL_PRESETS: LazyLock<&Vec<ModelPreset>> = LazyLock::new(all_model_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 
 /// Trait for abstracting over the `CodexConversation` to make testing easier.
@@ -80,6 +79,18 @@ impl CodexConversationImpl for CodexConversation {
 
     async fn next_event(&self) -> Result<Event, CodexErr> {
         self.next_event().await
+    }
+}
+
+#[async_trait::async_trait]
+pub trait ModelsManagerImpl {
+    async fn list_models(&self) -> Vec<ModelPreset>;
+}
+
+#[async_trait::async_trait]
+impl ModelsManagerImpl for ModelsManager {
+    async fn list_models(&self) -> Vec<ModelPreset> {
+        self.list_models().await
     }
 }
 
@@ -128,6 +139,7 @@ impl Conversation {
         session_id: SessionId,
         conversation: Arc<dyn CodexConversationImpl>,
         auth: Arc<AuthManager>,
+        models_manager: Arc<dyn ModelsManagerImpl>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         config: Config,
     ) -> Self {
@@ -137,6 +149,7 @@ impl Conversation {
             auth,
             SessionClient::new(session_id, client_capabilities),
             conversation,
+            models_manager,
             config,
             message_rx,
         );
@@ -1463,6 +1476,8 @@ struct ConversationActor<A> {
     config: Config,
     /// The custom prompts loaded for this workspace.
     custom_prompts: Rc<RefCell<Vec<CustomPrompt>>>,
+    /// The models available for this conversation.
+    models_manager: Arc<dyn ModelsManagerImpl>,
     /// A sender for each interested `Op` submission that needs events routed.
     submissions: HashMap<String, SubmissionState>,
     /// A receiver for incoming conversation messages.
@@ -1474,6 +1489,7 @@ impl<A: Auth> ConversationActor<A> {
         auth: A,
         client: SessionClient,
         conversation: Arc<dyn CodexConversationImpl>,
+        models_manager: Arc<dyn ModelsManagerImpl>,
         config: Config,
         message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
     ) -> Self {
@@ -1483,6 +1499,7 @@ impl<A: Auth> ConversationActor<A> {
             conversation,
             config,
             custom_prompts: Rc::default(),
+            models_manager,
             submissions: HashMap::new(),
             message_rx,
         }
@@ -1513,7 +1530,7 @@ impl<A: Auth> ConversationActor<A> {
     async fn handle_message(&mut self, message: ConversationMessage) {
         match message {
             ConversationMessage::Load { response_tx } => {
-                let result = self.handle_load();
+                let result = self.handle_load().await;
                 drop(response_tx.send(result));
                 let client = self.client.clone();
                 let mut available_commands = Self::builtin_commands();
@@ -1650,8 +1667,9 @@ impl<A: Auth> ConversationActor<A> {
         ))
     }
 
-    fn find_current_model(&self) -> Option<ModelId> {
-        let preset = MODEL_PRESETS
+    async fn find_current_model(&self) -> Option<ModelId> {
+        let model_presets = self.models_manager.list_models().await;
+        let preset = model_presets
             .iter()
             .find(|preset| preset.model == self.config.model)?;
 
@@ -1679,26 +1697,33 @@ impl<A: Auth> ConversationActor<A> {
         Some((model.to_owned(), reasoning))
     }
 
-    fn models(&self) -> Result<SessionModelState, Error> {
-        let current_model_id = self.find_current_model().unwrap_or_else(|| {
+    async fn models(&self) -> Result<SessionModelState, Error> {
+        let mut available_models = Vec::new();
+
+        let current_model_id = self.find_current_model().await.unwrap_or_else(|| {
             // If no preset found, return the current model string as-is
-            ModelId::new(self.config.model.clone())
+            let model_id = ModelId::new(self.config.model.clone());
+            available_models.push(ModelInfo::new(
+                model_id.clone(),
+                if self.config.model_provider_id == "openai" {
+                    model_id.to_string()
+                } else {
+                    format!("{model_id} ({})", self.config.model_provider.name)
+                },
+            ));
+            model_id
         });
 
         // If the user is using a custom provider, don't return the list
         if self.config.model_provider_id != "openai" {
             return Ok(SessionModelState::new(
                 current_model_id.clone(),
-                vec![ModelInfo::new(
-                    current_model_id.clone(),
-                    format!("{current_model_id} ({})", self.config.model_provider.name),
-                )],
+                available_models,
             ));
         }
 
-        let available_models = MODEL_PRESETS
-            .iter()
-            .flat_map(|preset| {
+        available_models.extend(self.models_manager.list_models().await.iter().flat_map(
+            |preset| {
                 preset.supported_reasoning_efforts.iter().map(|effort| {
                     ModelInfo::new(
                         Self::model_id(&preset.id, effort.effort),
@@ -1706,15 +1731,15 @@ impl<A: Auth> ConversationActor<A> {
                     )
                     .description(format!("{} {}", preset.description, effort.description))
                 })
-            })
-            .collect();
+            },
+        ));
 
         Ok(SessionModelState::new(current_model_id, available_models))
     }
 
-    fn handle_load(&mut self) -> Result<LoadSessionResponse, Error> {
+    async fn handle_load(&mut self) -> Result<LoadSessionResponse, Error> {
         Ok(LoadSessionResponse::new()
-            .models(self.models()?)
+            .models(self.models().await?)
             .modes(self.modes()))
     }
 
@@ -2094,7 +2119,10 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
-    use codex_core::{config::ConfigOverrides, protocol::AgentMessageEvent};
+    use codex_core::{
+        config::ConfigOverrides, openai_models::model_presets::all_model_presets,
+        protocol::AgentMessageEvent,
+    };
     use tokio::{
         sync::{Mutex, mpsc::UnboundedSender},
         task::LocalSet,
@@ -2559,6 +2587,7 @@ mod tests {
         let session_client =
             SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
         let conversation = Arc::new(StubCodexConversation::new());
+        let models_manager = Arc::new(StubModelsManager);
         let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default()).await?;
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -2566,6 +2595,7 @@ mod tests {
             StubAuth,
             session_client,
             conversation.clone(),
+            models_manager,
             config,
             message_rx,
         );
@@ -2581,6 +2611,15 @@ mod tests {
     impl Auth for StubAuth {
         fn logout(&self) -> Result<bool, Error> {
             Ok(true)
+        }
+    }
+
+    struct StubModelsManager;
+
+    #[async_trait::async_trait]
+    impl ModelsManagerImpl for StubModelsManager {
+        async fn list_models(&self) -> Vec<ModelPreset> {
+            all_model_presets().to_owned()
         }
     }
 

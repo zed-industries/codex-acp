@@ -296,6 +296,7 @@ impl Agent for CodexAgent {
             session_id.clone(),
             conversation,
             self.auth_manager.clone(),
+            self.conversation_manager.get_models_manager(),
             self.client_capabilities.clone(),
             config.clone(),
         ));
