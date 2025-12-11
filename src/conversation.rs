@@ -35,8 +35,8 @@ use codex_core::{
         Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
         ReviewTarget, SandboxPolicy, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent,
-        TurnAbortedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
-        WebSearchBeginEvent, WebSearchEndEvent,
+        TerminalInteractionEvent, TurnAbortedEvent, UserMessageEvent, ViewImageToolCallEvent,
+        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
@@ -84,13 +84,18 @@ impl CodexConversationImpl for CodexConversation {
 
 #[async_trait::async_trait]
 pub trait ModelsManagerImpl {
-    async fn list_models(&self) -> Vec<ModelPreset>;
+    async fn get_model(&self, model_id: &Option<String>, config: &Config) -> String;
+    async fn list_models(&self, config: &Config) -> Vec<ModelPreset>;
 }
 
 #[async_trait::async_trait]
 impl ModelsManagerImpl for ModelsManager {
-    async fn list_models(&self) -> Vec<ModelPreset> {
-        self.list_models().await
+    async fn get_model(&self, model_id: &Option<String>, config: &Config) -> String {
+        self.get_model(model_id, config).await
+    }
+
+    async fn list_models(&self, config: &Config) -> Vec<ModelPreset> {
+        self.list_models(config).await
     }
 }
 
@@ -446,6 +451,13 @@ impl PromptState {
                     end_event.call_id, end_event.exit_code
                 );
                 self.exec_command_end(client, end_event).await;
+            }
+            EventMsg::TerminalInteraction(event) => {
+                info!(
+                    "Terminal interaction: call_id={}, process_id={}, stdin={}",
+                    event.call_id, event.process_id, event.stdin
+                );
+                self.terminal_interaction(client, event).await;
             }
             EventMsg::McpToolCallBegin(McpToolCallBeginEvent { call_id, invocation }) => {
                 info!("MCP tool call begin: call_id={call_id}, invocation={} {}", invocation.server, invocation.tool);
@@ -868,7 +880,6 @@ impl PromptState {
             cwd,
             reason,
             parsed_cmd,
-            risk,
             proposed_execpolicy_amendment,
         } = event;
 
@@ -893,13 +904,6 @@ impl PromptState {
 
         if let Some(reason) = reason {
             content.push(reason);
-        }
-        if let Some(risk) = risk {
-            content.push(format!(
-                "Risk Assessment: {}\nRisk Level: {}",
-                risk.description,
-                risk.risk_level.as_str()
-            ));
         }
         if let Some(amendment) = proposed_execpolicy_amendment {
             content.push(format!(
@@ -1131,6 +1135,59 @@ impl PromptState {
         }
     }
 
+    async fn terminal_interaction(
+        &mut self,
+        client: &SessionClient,
+        event: TerminalInteractionEvent,
+    ) {
+        let TerminalInteractionEvent {
+            call_id,
+            process_id: _,
+            stdin,
+        } = event;
+
+        let stdin = format!("\n{stdin}\n");
+        // Stream output bytes to the display-only terminal via ToolCallUpdate meta.
+        if let Some(active_command) = &mut self.active_command
+            && *active_command.call_id == call_id
+        {
+            let update = if client.supports_terminal_output(active_command) {
+                ToolCallUpdate::new(
+                    active_command.tool_call_id.clone(),
+                    ToolCallUpdateFields::new(),
+                )
+                .meta(Meta::from_iter([(
+                    "terminal_output".to_owned(),
+                    serde_json::json!({
+                        "terminal_id": call_id,
+                        "data": stdin
+                    }),
+                )]))
+            } else {
+                active_command.output.push_str(&stdin);
+                let content = match active_command.file_extension.as_deref() {
+                    Some("md") => active_command.output.clone(),
+                    Some(ext) => format!(
+                        "```{ext}\n{}\n```\n",
+                        active_command.output.trim_end_matches('\n')
+                    ),
+                    None => format!(
+                        "```sh\n{}\n```\n",
+                        active_command.output.trim_end_matches('\n')
+                    ),
+                };
+                ToolCallUpdate::new(
+                    active_command.tool_call_id.clone(),
+                    ToolCallUpdateFields::new().content(vec![content.into()]),
+                )
+            };
+
+            client
+                .send_notification(SessionUpdate::ToolCallUpdate(update))
+                .await;
+        }
+    }
+
     async fn start_web_search(&mut self, client: &SessionClient, call_id: String) {
         self.active_web_search = Some(call_id.clone());
         client
@@ -1342,6 +1399,7 @@ impl TaskState {
             | EventMsg::ExecCommandBegin(..)
             | EventMsg::ExecCommandOutputDelta(..)
             | EventMsg::ExecCommandEnd(..)
+            | EventMsg::TerminalInteraction(..)
             | EventMsg::ViewImageToolCall(..)
             | EventMsg::ExecApprovalRequest(..)
             | EventMsg::ApplyPatchApprovalRequest(..)
@@ -1668,10 +1726,11 @@ impl<A: Auth> ConversationActor<A> {
     }
 
     async fn find_current_model(&self) -> Option<ModelId> {
-        let model_presets = self.models_manager.list_models().await;
+        let model_presets = self.models_manager.list_models(&self.config).await;
+        let config_model = self.get_current_model().await;
         let preset = model_presets
             .iter()
-            .find(|preset| preset.model == self.config.model)?;
+            .find(|preset| preset.model == config_model)?;
 
         let effort = self
             .config
@@ -1700,9 +1759,11 @@ impl<A: Auth> ConversationActor<A> {
     async fn models(&self) -> Result<SessionModelState, Error> {
         let mut available_models = Vec::new();
 
-        let current_model_id = self.find_current_model().await.unwrap_or_else(|| {
+        let current_model_id = if let Some(model_id) = self.find_current_model().await {
+            model_id
+        } else {
             // If no preset found, return the current model string as-is
-            let model_id = ModelId::new(self.config.model.clone());
+            let model_id = ModelId::new(self.get_current_model().await);
             available_models.push(ModelInfo::new(
                 model_id.clone(),
                 if self.config.model_provider_id == "openai" {
@@ -1712,7 +1773,7 @@ impl<A: Auth> ConversationActor<A> {
                 },
             ));
             model_id
-        });
+        };
 
         // If the user is using a custom provider, don't return the list
         if self.config.model_provider_id != "openai" {
@@ -1722,17 +1783,21 @@ impl<A: Auth> ConversationActor<A> {
             ));
         }
 
-        available_models.extend(self.models_manager.list_models().await.iter().flat_map(
-            |preset| {
-                preset.supported_reasoning_efforts.iter().map(|effort| {
-                    ModelInfo::new(
-                        Self::model_id(&preset.id, effort.effort),
-                        format!("{} ({})", preset.display_name, effort.effort),
-                    )
-                    .description(format!("{} {}", preset.description, effort.description))
-                })
-            },
-        ));
+        available_models.extend(
+            self.models_manager
+                .list_models(&self.config)
+                .await
+                .iter()
+                .flat_map(|preset| {
+                    preset.supported_reasoning_efforts.iter().map(|effort| {
+                        ModelInfo::new(
+                            Self::model_id(&preset.id, effort.effort),
+                            format!("{} ({})", preset.display_name, effort.effort),
+                        )
+                        .description(format!("{} {}", preset.description, effort.description))
+                    })
+                }),
+        );
 
         Ok(SessionModelState::new(current_model_id, available_models))
     }
@@ -1881,19 +1946,25 @@ impl<A: Auth> ConversationActor<A> {
         Ok(())
     }
 
+    async fn get_current_model(&self) -> String {
+        self.models_manager
+            .get_model(&self.config.model, &self.config)
+            .await
+    }
+
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
         // Try parsing as preset format, otherwise use as-is, fallback to config
-        let (model_to_use, effort_to_use) = Self::parse_model_id(&model)
-            .map(|(m, e)| (m, Some(e)))
-            .unwrap_or_else(|| {
-                let model_str = model.0.to_string();
-                let fallback = if !model_str.is_empty() {
-                    model_str
-                } else {
-                    self.config.model.clone()
-                };
-                (fallback, self.config.model_reasoning_effort)
-            });
+        let (model_to_use, effort_to_use) = if let Some((m, e)) = Self::parse_model_id(&model) {
+            (m, Some(e))
+        } else {
+            let model_str = model.0.to_string();
+            let fallback = if !model_str.is_empty() {
+                model_str
+            } else {
+                self.get_current_model().await
+            };
+            (fallback, self.config.model_reasoning_effort)
+        };
 
         if model_to_use.is_empty() {
             return Err(Error::invalid_params().data("No model parsed or configured"));
@@ -1911,7 +1982,7 @@ impl<A: Auth> ConversationActor<A> {
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
-        self.config.model = model_to_use;
+        self.config.model = Some(model_to_use);
         self.config.model_reasoning_effort = effort_to_use;
 
         Ok(())
@@ -2618,7 +2689,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ModelsManagerImpl for StubModelsManager {
-        async fn list_models(&self) -> Vec<ModelPreset> {
+        async fn get_model(&self, _model_id: &Option<String>, _config: &Config) -> String {
+            all_model_presets()[0].to_owned().id
+        }
+
+        async fn list_models(&self, _config: &Config) -> Vec<ModelPreset> {
             all_model_presets().to_owned()
         }
     }
