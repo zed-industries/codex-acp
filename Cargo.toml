@@ -39,6 +39,9 @@ tokio-util = { version = "0.7", features = ["compat"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+[dev-dependencies]
+codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["test-support"] }
+
 [lints.rust]
 let-underscore = "warn"
 rust-2018-idioms = "warn"
