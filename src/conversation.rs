@@ -576,6 +576,7 @@ impl PromptState {
             e @ (EventMsg::McpListToolsResponse(..)
             // returned from Op::ListCustomPrompts, ignore
             | EventMsg::ListCustomPromptsResponse(..)
+            | EventMsg::ListSkillsResponse(..)
             // Used for returning a single history entry
             | EventMsg::GetHistoryEntryResponse(..)
             | EventMsg::DeprecationNotice(..)
@@ -1409,6 +1410,7 @@ impl TaskState {
             | EventMsg::GetHistoryEntryResponse(..)
             | EventMsg::McpListToolsResponse(..)
             | EventMsg::ListCustomPromptsResponse(..)
+            | EventMsg::ListSkillsResponse(..)
             | EventMsg::PlanUpdate(..)
             | EventMsg::EnteredReviewMode(..)
             | EventMsg::ExitedReviewMode(..)
