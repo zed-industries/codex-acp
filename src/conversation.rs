@@ -1287,7 +1287,6 @@ fn parse_command_tool_call(parsed_cmd: Vec<ParsedCommand>, cwd: &Path) -> ParseC
                     (Some(query), None) => format!("Search {query}"),
                     _ => format!("Search {cmd}"),
                 });
-                cmd_path = path.map(PathBuf::from);
                 kind = ToolKind::Search;
             }
             ParsedCommand::Unknown { cmd } => {
