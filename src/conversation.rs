@@ -1359,7 +1359,9 @@ impl TaskState {
                 } else {
                     "Undo failed.".to_string()
                 };
-                client.send_agent_text(event.message.unwrap_or(fallback)).await;
+                client
+                    .send_agent_text(event.message.unwrap_or(fallback))
+                    .await;
             }
             EventMsg::StreamError(StreamErrorEvent {
                 message,
@@ -2334,7 +2336,11 @@ mod tests {
         )?;
 
         let notifications = client.notifications.lock().unwrap();
-        assert_eq!(notifications.len(), 2, "notifications don't match {notifications:?}");
+        assert_eq!(
+            notifications.len(),
+            2,
+            "notifications don't match {notifications:?}"
+        );
         assert!(matches!(
             &notifications[0].update,
             SessionUpdate::AgentMessageChunk(ContentChunk {
