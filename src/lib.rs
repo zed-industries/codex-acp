@@ -50,14 +50,15 @@ pub async fn run_main(
         ..ConfigOverrides::default()
     };
 
-    let config = Config::load_with_cli_overrides(cli_kv_overrides, config_overrides)
-        .await
-        .map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("error loading config: {e}"),
-            )
-        })?;
+    let config =
+        Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, config_overrides)
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("error loading config: {e}"),
+                )
+            })?;
 
     // Create our Agent implementation with notification channel
     let agent = Rc::new(codex_agent::CodexAgent::new(config));
