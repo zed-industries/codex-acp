@@ -584,6 +584,7 @@ impl PromptState {
             // Revisit when we can emit status updates
             | EventMsg::BackgroundEvent(..)
             | EventMsg::ContextCompacted(..)
+            | EventMsg::SkillsUpdateAvailable
             // Old events
             | EventMsg::AgentMessageDelta(..) | EventMsg::AgentReasoningDelta(..) | EventMsg::AgentReasoningRawContentDelta(..)
             | EventMsg::RawResponseItem(..)
@@ -1423,6 +1424,7 @@ impl TaskState {
             | EventMsg::AgentReasoningSectionBreak(..)
             | EventMsg::RawResponseItem(..)
             | EventMsg::BackgroundEvent(..)
+            | EventMsg::SkillsUpdateAvailable
             | EventMsg::ContextCompacted(..) => {}
             // Unexpected events for this submission
             e @ (EventMsg::UserMessage(..)
@@ -1744,7 +1746,7 @@ impl<A: Auth> ConversationActor<A> {
         let current_mode_id = APPROVAL_PRESETS
             .iter()
             .find(|preset| {
-                preset.approval == self.config.approval_policy
+                &preset.approval == self.config.approval_policy.get()
                     && preset.sandbox == self.config.sandbox_policy
             })
             .map(|preset| SessionModeId::new(preset.id))?;
@@ -1949,7 +1951,10 @@ impl<A: Auth> ConversationActor<A> {
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
-        self.config.approval_policy = preset.approval;
+        self.config
+            .approval_policy
+            .set(preset.approval)
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
         self.config.sandbox_policy = preset.sandbox.clone();
 
         match preset.sandbox {
@@ -2730,7 +2735,11 @@ mod tests {
             SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
         let conversation = Arc::new(StubCodexConversation::new());
         let models_manager = Arc::new(StubModelsManager);
-        let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default()).await?;
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let mut actor = ConversationActor::new(
