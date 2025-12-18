@@ -1799,24 +1799,9 @@ impl<A: Auth> ConversationActor<A> {
         } else {
             // If no preset found, return the current model string as-is
             let model_id = ModelId::new(self.get_current_model().await);
-            available_models.push(ModelInfo::new(
-                model_id.clone(),
-                if self.config.model_provider_id == "openai" {
-                    model_id.to_string()
-                } else {
-                    format!("{model_id} ({})", self.config.model_provider.name)
-                },
-            ));
+            available_models.push(ModelInfo::new(model_id.clone(), model_id.to_string()));
             model_id
         };
-
-        // If the user is using a custom provider, don't return the list
-        if self.config.model_provider_id != "openai" {
-            return Ok(SessionModelState::new(
-                current_model_id.clone(),
-                available_models,
-            ));
-        }
 
         available_models.extend(
             self.models_manager
