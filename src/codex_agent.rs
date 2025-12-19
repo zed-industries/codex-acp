@@ -3,8 +3,9 @@ use agent_client_protocol::{
     CancelNotification, ClientCapabilities, Error, Implementation, InitializeRequest,
     InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
     McpServerHttp, McpServerStdio, NewSessionRequest, NewSessionResponse, PromptCapabilities,
-    PromptRequest, PromptResponse, ProtocolVersion, SessionId, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
+    PromptRequest, PromptResponse, ProtocolVersion, SessionId, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
+    SetSessionModelRequest, SetSessionModelResponse,
 };
 use codex_core::{
     ConversationManager, NewConversation,
@@ -310,7 +311,8 @@ impl Agent for CodexAgent {
 
         Ok(NewSessionResponse::new(session_id)
             .modes(load.modes)
-            .models(load.models))
+            .models(load.models)
+            .config_options(load.config_options))
     }
 
     async fn load_session(
@@ -372,6 +374,26 @@ impl Agent for CodexAgent {
             .await?;
 
         Ok(SetSessionModelResponse::default())
+    }
+
+    async fn set_session_config_option(
+        &self,
+        args: SetSessionConfigOptionRequest,
+    ) -> Result<SetSessionConfigOptionResponse, Error> {
+        info!(
+            "Setting session config option for session: {} (config_id: {}, value: {})",
+            args.session_id, args.config_id.0, args.value.0
+        );
+
+        let conversation = self.get_conversation(&args.session_id)?;
+
+        conversation
+            .set_config_option(args.config_id, args.value)
+            .await?;
+
+        let config_options = conversation.config_options().await?;
+
+        Ok(SetSessionConfigOptionResponse::new(config_options))
     }
 }
 

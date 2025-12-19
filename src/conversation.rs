@@ -9,15 +9,16 @@ use std::{
 
 use agent_client_protocol::{
     Annotations, AudioContent, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
-    BlobResourceContents, Client, ClientCapabilities, Content, ContentBlock, ContentChunk, Diff,
-    EmbeddedResource, EmbeddedResourceResource, Error, ImageContent, LoadSessionResponse, Meta,
-    ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionId, SessionMode,
-    SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate,
-    StopReason, Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-    UnstructuredCommandInput,
+    BlobResourceContents, Client, ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock,
+    ContentChunk, Diff, EmbeddedResource, EmbeddedResourceResource, Error, ImageContent,
+    LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan,
+    PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome,
+    SessionConfigId, SessionConfigOption, SessionConfigSelectOption, SessionConfigValueId,
+    SessionId, SessionMode, SessionModeId, SessionModeState, SessionModelState,
+    SessionNotification, SessionUpdate, StopReason, Terminal, TextContent, TextResourceContents,
+    ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
@@ -115,6 +116,9 @@ enum ConversationMessage {
     Load {
         response_tx: oneshot::Sender<Result<LoadSessionResponse, Error>>,
     },
+    GetConfigOptions {
+        response_tx: oneshot::Sender<Result<Vec<SessionConfigOption>, Error>>,
+    },
     Prompt {
         request: PromptRequest,
         response_tx: oneshot::Sender<Result<oneshot::Receiver<Result<StopReason, Error>>, Error>>,
@@ -125,6 +129,11 @@ enum ConversationMessage {
     },
     SetModel {
         model: ModelId,
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
+    SetConfigOption {
+        config_id: SessionConfigId,
+        value: SessionConfigValueId,
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
     Cancel {
@@ -177,6 +186,17 @@ impl Conversation {
             .map_err(|e| Error::internal_error().data(e.to_string()))?
     }
 
+    pub async fn config_options(&self) -> Result<Vec<SessionConfigOption>, Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ConversationMessage::GetConfigOptions { response_tx };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
     pub async fn prompt(&self, request: PromptRequest) -> Result<StopReason, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -208,6 +228,25 @@ impl Conversation {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ConversationMessage::SetModel { model, response_tx };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
+    pub async fn set_config_option(
+        &self,
+        config_id: SessionConfigId,
+        value: SessionConfigValueId,
+    ) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ConversationMessage::SetConfigOption {
+            config_id,
+            value,
+            response_tx,
+        };
         drop(self.message_tx.send(message));
 
         response_rx
@@ -1576,6 +1615,8 @@ struct ConversationActor<A> {
     submissions: HashMap<String, SubmissionState>,
     /// A receiver for incoming conversation messages.
     message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
+    /// Last config options state we emitted to the client, used for deduping updates.
+    last_sent_config_options: Option<Vec<SessionConfigOption>>,
 }
 
 impl<A: Auth> ConversationActor<A> {
@@ -1596,6 +1637,7 @@ impl<A: Auth> ConversationActor<A> {
             models_manager,
             submissions: HashMap::new(),
             message_rx,
+            last_sent_config_options: None,
         }
     }
 
@@ -1668,6 +1710,10 @@ impl<A: Auth> ConversationActor<A> {
                         .await;
                 });
             }
+            ConversationMessage::GetConfigOptions { response_tx } => {
+                let result = self.config_options().await;
+                drop(response_tx.send(result));
+            }
             ConversationMessage::Prompt {
                 request,
                 response_tx,
@@ -1678,9 +1724,19 @@ impl<A: Auth> ConversationActor<A> {
             ConversationMessage::SetMode { mode, response_tx } => {
                 let result = self.handle_set_mode(mode).await;
                 drop(response_tx.send(result));
+                self.maybe_emit_config_options_update().await;
             }
             ConversationMessage::SetModel { model, response_tx } => {
                 let result = self.handle_set_model(model).await;
+                drop(response_tx.send(result));
+                self.maybe_emit_config_options_update().await;
+            }
+            ConversationMessage::SetConfigOption {
+                config_id,
+                value,
+                response_tx,
+            } => {
+                let result = self.handle_set_config_option(config_id, value).await;
                 drop(response_tx.send(result));
             }
             ConversationMessage::Cancel { response_tx } => {
@@ -1793,6 +1849,213 @@ impl<A: Auth> ConversationActor<A> {
         Some((model.to_owned(), reasoning))
     }
 
+    async fn config_options(&self) -> Result<Vec<SessionConfigOption>, Error> {
+        let mut options = Vec::new();
+
+        if let Some(modes) = self.modes() {
+            let select_options = modes
+                .available_modes
+                .into_iter()
+                .map(|m| SessionConfigSelectOption::new(m.id.0, m.name).description(m.description))
+                .collect::<Vec<_>>();
+
+            options.push(
+                SessionConfigOption::select(
+                    "mode",
+                    "Approval Preset",
+                    modes.current_mode_id.0,
+                    select_options,
+                )
+                .description("Choose an approval and sandboxing preset for your session"),
+            );
+        }
+
+        let presets = self.models_manager.list_models(&self.config).await;
+
+        let current_model = self.get_current_model().await;
+        let current_preset = presets.iter().find(|p| p.model == current_model).cloned();
+
+        let mut model_select_options = Vec::new();
+
+        if current_preset.is_none() {
+            // If no preset found, return the current model string as-is
+            model_select_options.push(SessionConfigSelectOption::new(
+                current_model.clone(),
+                current_model.clone(),
+            ));
+        };
+
+        model_select_options.extend(presets.into_iter().map(|preset| {
+            SessionConfigSelectOption::new(preset.id, preset.display_name)
+                .description(preset.description)
+        }));
+
+        options.push(
+            SessionConfigOption::select("model", "Model", current_model, model_select_options)
+                .description("Choose which model Codex should use"),
+        );
+
+        // Reasoning effort selector (only if the current preset exists and has >1 supported effort)
+        if let Some(preset) = current_preset
+            && preset.supported_reasoning_efforts.len() > 1
+        {
+            let supported = &preset.supported_reasoning_efforts;
+
+            let current_effort = self
+                .config
+                .model_reasoning_effort
+                .and_then(|effort| {
+                    supported
+                        .iter()
+                        .find_map(|e| (e.effort == effort).then_some(effort))
+                })
+                .unwrap_or(preset.default_reasoning_effort);
+
+            let effort_select_options = supported
+                .iter()
+                .map(|e| {
+                    SessionConfigSelectOption::new(e.effort.to_string(), e.effort.to_string())
+                        .description(e.description.clone())
+                })
+                .collect::<Vec<_>>();
+
+            options.push(
+                SessionConfigOption::select(
+                    "reasoning_effort",
+                    "Reasoning Effort",
+                    current_effort.to_string(),
+                    effort_select_options,
+                )
+                .description("Choose how much reasoning effort the model should use"),
+            );
+        }
+
+        Ok(options)
+    }
+
+    async fn maybe_emit_config_options_update(&mut self) {
+        let config_options = self.config_options().await.unwrap_or_default();
+
+        if self
+            .last_sent_config_options
+            .as_ref()
+            .is_some_and(|prev| prev == &config_options)
+        {
+            return;
+        }
+
+        self.last_sent_config_options = Some(config_options.clone());
+
+        self.client
+            .send_notification(SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+                config_options,
+            )))
+            .await;
+    }
+
+    async fn handle_set_config_option(
+        &mut self,
+        config_id: SessionConfigId,
+        value: SessionConfigValueId,
+    ) -> Result<(), Error> {
+        match config_id.0.as_ref() {
+            "mode" => self.handle_set_mode(SessionModeId::new(value.0)).await,
+            "model" => self.handle_set_config_model(value).await,
+            "reasoning_effort" => self.handle_set_config_reasoning_effort(value).await,
+            _ => Err(Error::invalid_params().data("Unsupported config option")),
+        }
+    }
+
+    async fn handle_set_config_model(&mut self, value: SessionConfigValueId) -> Result<(), Error> {
+        let model_id = value.0;
+
+        let presets = self.models_manager.list_models(&self.config).await;
+        let preset = presets.iter().find(|p| p.id.as_str() == &*model_id);
+
+        let model_to_use = preset
+            .map(|p| p.model.clone())
+            .unwrap_or_else(|| model_id.to_string());
+
+        if model_to_use.is_empty() {
+            return Err(Error::invalid_params().data("No model selected"));
+        }
+
+        let effort_to_use = if let Some(preset) = preset {
+            if let Some(effort) = self.config.model_reasoning_effort
+                && preset
+                    .supported_reasoning_efforts
+                    .iter()
+                    .any(|e| e.effort == effort)
+            {
+                Some(effort)
+            } else {
+                Some(preset.default_reasoning_effort)
+            }
+        } else {
+            // If the user selected a raw model string (not a known preset), don't invent a default.
+            // Keep whatever was previously configured (or leave unset) so Codex can decide.
+            self.config.model_reasoning_effort
+        };
+
+        self.conversation
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                model: Some(model_to_use.clone()),
+                effort: Some(effort_to_use),
+                summary: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.config.model = Some(model_to_use);
+        self.config.model_reasoning_effort = effort_to_use;
+
+        Ok(())
+    }
+
+    async fn handle_set_config_reasoning_effort(
+        &mut self,
+        value: SessionConfigValueId,
+    ) -> Result<(), Error> {
+        let effort: ReasoningEffort =
+            serde_json::from_value(value.0.as_ref().into()).map_err(|_| Error::invalid_params())?;
+
+        let current_model = self.get_current_model().await;
+        let presets = self.models_manager.list_models(&self.config).await;
+        let Some(preset) = presets.iter().find(|p| p.model == current_model) else {
+            return Err(Error::invalid_params()
+                .data("Reasoning effort can only be set for known model presets"));
+        };
+
+        if !preset
+            .supported_reasoning_efforts
+            .iter()
+            .any(|e| e.effort == effort)
+        {
+            return Err(
+                Error::invalid_params().data("Unsupported reasoning effort for selected model")
+            );
+        }
+
+        self.conversation
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                model: None,
+                effort: Some(Some(effort)),
+                summary: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.config.model_reasoning_effort = Some(effort);
+
+        Ok(())
+    }
+
     async fn models(&self) -> Result<SessionModelState, Error> {
         let mut available_models = Vec::new();
 
@@ -1827,7 +2090,8 @@ impl<A: Auth> ConversationActor<A> {
     async fn handle_load(&mut self) -> Result<LoadSessionResponse, Error> {
         Ok(LoadSessionResponse::new()
             .models(self.models().await?)
-            .modes(self.modes()))
+            .modes(self.modes())
+            .config_options(self.config_options().await?))
     }
 
     async fn handle_prompt(
