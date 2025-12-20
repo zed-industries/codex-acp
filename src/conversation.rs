@@ -27,7 +27,8 @@ use codex_core::{
     openai_models::models_manager::ModelsManager,
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
-        AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ElicitationAction,
+        AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent,
+        ApplyPatchApprovalRequestEvent, ElicitationAction,
         ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExitedReviewModeEvent, FileChange,
         ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation,
@@ -494,21 +495,34 @@ impl PromptState {
                 info!("Agent reasoning (non-delta) received: {text:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_reasoning_deltas) {
-                    let kind = if self.show_raw_agent_reasoning {
-                        "raw"
-                    } else {
-                        "summary"
-                    };
                     client
                         .send_agent_thought_with_meta(
                             text,
                             Some(codex_reasoning_meta(
-                                kind,
+                                "summary",
                                 None,
                                 None,
                                 None,
                                 false,
                                 Some("non_delta"),
+                            )),
+                        )
+                        .await;
+                }
+            }
+            EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text }) => {
+                info!("Agent reasoning raw content (non-delta) received: {text:?}");
+                if !std::mem::take(&mut self.seen_reasoning_deltas) {
+                    client
+                        .send_agent_thought_with_meta(
+                            text,
+                            Some(codex_reasoning_meta(
+                                "raw",
+                                None,
+                                None,
+                                None,
+                                false,
+                                Some("non_delta_raw"),
                             )),
                         )
                         .await;
@@ -679,7 +693,6 @@ impl PromptState {
             }
 
             // Ignore these events
-            EventMsg::AgentReasoningRawContent(..)
             // In the future we can use this to update usage stats
             | EventMsg::TokenCount(..)
             // we already have a way to diff the turn, so ignore
@@ -2988,6 +3001,53 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_reasoning_meta_raw_non_delta() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["reasoning raw nondelta".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1, "notifications don't match {notifications:?}");
+
+        let meta = match &notifications[0].update {
+            SessionUpdate::AgentThoughtChunk(chunk) => chunk.meta.as_ref(),
+            _ => None,
+        }
+        .expect("missing meta");
+        let codex = meta
+            .get("codex")
+            .and_then(|value| value.as_object())
+            .expect("missing codex meta");
+        assert_eq!(
+            codex.get("reasoning_kind"),
+            Some(&serde_json::json!("raw"))
+        );
+        assert_eq!(
+            codex.get("source"),
+            Some(&serde_json::json!("non_delta_raw"))
+        );
+
+        Ok(())
+    }
+
     async fn setup(
         custom_prompts: Vec<CustomPrompt>,
     ) -> anyhow::Result<(
@@ -3138,6 +3198,26 @@ mod tests {
                                 id: id.to_string(),
                                 msg: EventMsg::AgentReasoning(AgentReasoningEvent {
                                     text: "non-delta reasoning".to_string(),
+                                }),
+                            })
+                            .unwrap();
+                        self.op_tx
+                            .send(Event {
+                                id: id.to_string(),
+                                msg: EventMsg::TaskComplete(TaskCompleteEvent {
+                                    last_agent_message: None,
+                                }),
+                            })
+                            .unwrap();
+                        return Ok(id.to_string());
+                    }
+
+                    if prompt == "reasoning raw nondelta" {
+                        self.op_tx
+                            .send(Event {
+                                id: id.to_string(),
+                                msg: EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent {
+                                    text: "non-delta raw reasoning".to_string(),
                                 }),
                             })
                             .unwrap();
