@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::Cursor,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -91,6 +92,7 @@ pub struct AcpFs {
     client_capabilities: Arc<Mutex<ClientCapabilities>>,
     local_spawner: LocalSpawner,
     session_id: SessionId,
+    session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>>,
 }
 
 impl AcpFs {
@@ -98,11 +100,44 @@ impl AcpFs {
         session_id: SessionId,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         local_spawner: LocalSpawner,
+        session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>>,
     ) -> Self {
         Self {
             client_capabilities,
             local_spawner,
             session_id,
+            session_roots,
+        }
+    }
+
+    fn session_root(&self) -> std::io::Result<PathBuf> {
+        self.session_roots
+            .lock()
+            .unwrap()
+            .get(&self.session_id)
+            .cloned()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "session root not registered",
+                )
+            })
+    }
+
+    fn ensure_within_root(&self, path: &std::path::Path) -> std::io::Result<PathBuf> {
+        let root = std::path::absolute(self.session_root()?)?;
+        let abs_path = std::path::absolute(path)?;
+        if abs_path.starts_with(&root) {
+            Ok(abs_path)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "access to {} denied (outside session root {})",
+                    abs_path.display(),
+                    root.display()
+                ),
+            ))
         }
     }
 }
@@ -112,10 +147,11 @@ impl codex_apply_patch::Fs for AcpFs {
         if !self.client_capabilities.lock().unwrap().fs.read_text_file {
             return StdFs.read_to_string(path);
         }
+        let path = self.ensure_within_root(path)?;
         let (tx, rx) = std::sync::mpsc::channel();
         self.local_spawner.spawn(FsTask::ReadFile {
             session_id: self.session_id.clone(),
-            path: std::path::absolute(path)?,
+            path,
             tx,
         });
         rx.recv()
@@ -127,10 +163,11 @@ impl codex_apply_patch::Fs for AcpFs {
         if !self.client_capabilities.lock().unwrap().fs.write_text_file {
             return StdFs.write(path, contents);
         }
+        let path = self.ensure_within_root(path)?;
         let (tx, rx) = std::sync::mpsc::channel();
         self.local_spawner.spawn(FsTask::WriteFile {
             session_id: self.session_id.clone(),
-            path: std::path::absolute(path)?,
+            path,
             content: String::from_utf8(contents.to_vec())
                 .map_err(|e| std::io::Error::other(e.to_string()))?,
             tx,
@@ -155,11 +192,11 @@ impl codex_core::codex::Fs for AcpFs {
         if !self.client_capabilities.lock().unwrap().fs.read_text_file {
             return StdFs.file_buffer(path, limit);
         }
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let path = match std::path::absolute(path) {
+        let path = match self.ensure_within_root(path) {
             Ok(path) => path,
-            Err(e) => return Box::pin(async move { Err(std::io::Error::other(e.to_string())) }),
+            Err(e) => return Box::pin(async move { Err(e) }),
         };
+        let (tx, rx) = tokio::sync::oneshot::channel();
         self.local_spawner.spawn(FsTask::ReadFileLimit {
             session_id: self.session_id.clone(),
             path,
