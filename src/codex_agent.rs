@@ -21,6 +21,7 @@ use codex_protocol::ConversationId;
 use std::{
     cell::RefCell,
     collections::HashMap,
+    path::PathBuf,
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -46,6 +47,8 @@ pub struct CodexAgent {
     conversation_manager: ConversationManager,
     /// Active sessions mapped by `SessionId`
     sessions: Rc<RefCell<HashMap<SessionId, Rc<Conversation>>>>,
+    /// Session working directories for filesystem sandboxing
+    session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>>,
 }
 
 impl CodexAgent {
@@ -61,6 +64,8 @@ impl CodexAgent {
 
         let local_spawner = LocalSpawner::new();
         let capabilities_clone = client_capabilities.clone();
+        let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
+        let session_roots_clone = session_roots.clone();
         let conversation_manager =
             ConversationManager::new(auth_manager.clone(), SessionSource::Unknown).with_fs(
                 Box::new(move |conversation_id| {
@@ -68,6 +73,7 @@ impl CodexAgent {
                         Self::session_id_from_conversation_id(conversation_id),
                         capabilities_clone.clone(),
                         local_spawner.clone(),
+                        session_roots_clone.clone(),
                     ))
                 }),
             );
@@ -77,6 +83,7 @@ impl CodexAgent {
             config,
             conversation_manager,
             sessions: Rc::default(),
+            session_roots,
         }
     }
 
@@ -293,6 +300,11 @@ impl Agent for CodexAgent {
             .map_err(|_e| Error::internal_error())?;
 
         let session_id = Self::session_id_from_conversation_id(conversation_id);
+        // Record the session root for filesystem sandboxing.
+        self.session_roots
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), config.cwd.clone());
         let conversation = Rc::new(Conversation::new(
             session_id.clone(),
             conversation,
