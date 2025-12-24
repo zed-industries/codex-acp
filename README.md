@@ -38,6 +38,8 @@ Read the docs on [External Agent](https://zed.dev/docs/ai/external-agents) suppo
 
 ### Other clients
 
+- [Aizen](https://aizen.win)
+
 [Submit a PR](https://github.com/zed-industries/codex-acp/pulls) to add yours!
 
 #### Installation
