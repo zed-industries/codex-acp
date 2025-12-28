@@ -91,6 +91,7 @@ pub struct AcpFs {
     client_capabilities: Arc<Mutex<ClientCapabilities>>,
     local_spawner: LocalSpawner,
     session_id: SessionId,
+    session_cwds: Arc<Mutex<std::collections::HashMap<SessionId, PathBuf>>>,
 }
 
 impl AcpFs {
@@ -98,24 +99,41 @@ impl AcpFs {
         session_id: SessionId,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         local_spawner: LocalSpawner,
+        session_cwds: Arc<Mutex<std::collections::HashMap<SessionId, PathBuf>>>,
     ) -> Self {
         Self {
             client_capabilities,
             local_spawner,
             session_id,
+            session_cwds,
         }
+    }
+
+    fn resolve_path(&self, path: &std::path::Path) -> std::io::Result<PathBuf> {
+        if path.is_absolute() {
+            return Ok(path.to_path_buf());
+        }
+
+        if let Ok(map) = self.session_cwds.lock() {
+            if let Some(cwd) = map.get(&self.session_id) {
+                return Ok(cwd.join(path));
+            }
+        }
+
+        std::path::absolute(path)
     }
 }
 
 impl codex_apply_patch::Fs for AcpFs {
     fn read_to_string(&self, path: &std::path::Path) -> std::io::Result<String> {
+        let path = self.resolve_path(path)?;
         if !self.client_capabilities.lock().unwrap().fs.read_text_file {
-            return StdFs.read_to_string(path);
+            return StdFs.read_to_string(&path);
         }
         let (tx, rx) = std::sync::mpsc::channel();
         self.local_spawner.spawn(FsTask::ReadFile {
             session_id: self.session_id.clone(),
-            path: std::path::absolute(path)?,
+            path,
             tx,
         });
         rx.recv()
@@ -124,13 +142,14 @@ impl codex_apply_patch::Fs for AcpFs {
     }
 
     fn write(&self, path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+        let path = self.resolve_path(path)?;
         if !self.client_capabilities.lock().unwrap().fs.write_text_file {
-            return StdFs.write(path, contents);
+            return StdFs.write(&path, contents);
         }
         let (tx, rx) = std::sync::mpsc::channel();
         self.local_spawner.spawn(FsTask::WriteFile {
             session_id: self.session_id.clone(),
-            path: std::path::absolute(path)?,
+            path,
             content: String::from_utf8(contents.to_vec())
                 .map_err(|e| std::io::Error::other(e.to_string()))?,
             tx,
@@ -152,14 +171,14 @@ impl codex_core::codex::Fs for AcpFs {
                 + Send,
         >,
     > {
-        if !self.client_capabilities.lock().unwrap().fs.read_text_file {
-            return StdFs.file_buffer(path, limit);
-        }
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let path = match std::path::absolute(path) {
+        let path = match self.resolve_path(path) {
             Ok(path) => path,
             Err(e) => return Box::pin(async move { Err(std::io::Error::other(e.to_string())) }),
         };
+        if !self.client_capabilities.lock().unwrap().fs.read_text_file {
+            return StdFs.file_buffer(&path, limit);
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
         self.local_spawner.spawn(FsTask::ReadFileLimit {
             session_id: self.session_id.clone(),
             path,
@@ -214,5 +233,33 @@ impl LocalSpawner {
         self.send
             .send(task)
             .expect("Thread with LocalSet has shut down.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_relative_paths_using_session_cwd() {
+        let session_id = SessionId::new("sess-test".to_string());
+        let session_cwds: Arc<Mutex<std::collections::HashMap<SessionId, PathBuf>>> =
+            Arc::default();
+        session_cwds
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), PathBuf::from("/tmp/worktree"));
+
+        let fs = AcpFs::new(
+            session_id,
+            Arc::new(Mutex::new(ClientCapabilities::default())),
+            LocalSpawner::new(),
+            session_cwds,
+        );
+
+        let resolved = fs
+            .resolve_path(std::path::Path::new("hello.txt"))
+            .expect("resolve path");
+        assert_eq!(resolved, PathBuf::from("/tmp/worktree/hello.txt"));
     }
 }

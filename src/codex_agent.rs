@@ -20,6 +20,7 @@ use codex_protocol::ConversationId;
 use std::{
     cell::RefCell,
     collections::HashMap,
+    path::PathBuf,
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -45,6 +46,8 @@ pub struct CodexAgent {
     conversation_manager: ConversationManager,
     /// Active sessions mapped by `SessionId`
     sessions: Rc<RefCell<HashMap<SessionId, Rc<Conversation>>>>,
+    /// Working directory per session id (ACP cwd is immutable per session).
+    session_cwds: Arc<Mutex<HashMap<SessionId, PathBuf>>>,
 }
 
 impl CodexAgent {
@@ -57,9 +60,11 @@ impl CodexAgent {
         );
 
         let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
+        let session_cwds: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
 
         let local_spawner = LocalSpawner::new();
         let capabilities_clone = client_capabilities.clone();
+        let session_cwds_clone = Arc::clone(&session_cwds);
         let conversation_manager =
             ConversationManager::new(auth_manager.clone(), SessionSource::Unknown).with_fs(
                 Box::new(move |conversation_id| {
@@ -67,6 +72,7 @@ impl CodexAgent {
                         Self::session_id_from_conversation_id(conversation_id),
                         capabilities_clone.clone(),
                         local_spawner.clone(),
+                        session_cwds_clone.clone(),
                     ))
                 }),
             );
@@ -76,6 +82,7 @@ impl CodexAgent {
             config,
             conversation_manager,
             sessions: Rc::default(),
+            session_cwds,
         }
     }
 
@@ -301,6 +308,10 @@ impl Agent for CodexAgent {
             config.clone(),
         ));
         let load = conversation.load().await?;
+
+        if let Ok(mut map) = self.session_cwds.lock() {
+            map.insert(session_id.clone(), cwd.clone());
+        }
 
         self.sessions
             .borrow_mut()
