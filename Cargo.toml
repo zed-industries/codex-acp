@@ -38,6 +38,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-
 tokio-util = { version = "0.7", features = ["compat"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+heck = "0.5.0"
 
 [dev-dependencies]
 codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["test-support"] }
