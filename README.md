@@ -38,7 +38,7 @@ Read the docs on [External Agent](https://zed.dev/docs/ai/external-agents) suppo
 
 ### Other clients
 
-[Submit a PR](https://github.com/zed-industries/codex-acp/pulls) to add yours!
+Or try it with any of the other [ACP compatible clients](https://agentclientprotocol.com/overview/clients)!
 
 #### Installation
 
