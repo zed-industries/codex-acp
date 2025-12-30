@@ -221,8 +221,6 @@ impl Agent for CodexAgent {
         info!("Creating new session with cwd: {}", cwd.display());
 
         let mut config = self.config.clone();
-        // Allows us to support HTTP MCP servers
-        config.use_experimental_use_rmcp_client = true;
         // Make sure we are going through the `apply_patch` code path
         config.include_apply_patch_tool = true;
         config.cwd.clone_from(&cwd);

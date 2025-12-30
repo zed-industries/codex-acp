@@ -25,7 +25,7 @@ use codex_core::{
     AuthManager, CodexConversation,
     config::{Config, set_project_trust_level},
     error::CodexErr,
-    openai_models::models_manager::ModelsManager,
+    models_manager::manager::ModelsManager,
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
         AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ElicitationAction,
@@ -51,6 +51,7 @@ use codex_protocol::{
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     user_input::UserInput,
 };
+use heck::ToTitleCase;
 use itertools::Itertools;
 use mcp_types::{CallToolResult, RequestId};
 use serde_json::json;
@@ -548,8 +549,8 @@ impl PromptState {
                 };
                 client.send_agent_text(event.message.unwrap_or(fallback)).await;
             }
-            EventMsg::StreamError(StreamErrorEvent { message , codex_error_info}) => {
-                error!("Handled error during turn: {message} {codex_error_info:?}");
+            EventMsg::StreamError(StreamErrorEvent { message , codex_error_info, additional_details }) => {
+                error!("Handled error during turn: {message} {codex_error_info:?} {additional_details:?}");
             }
             EventMsg::Error(ErrorEvent { message, codex_error_info }) => {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
@@ -1405,8 +1406,11 @@ impl TaskState {
             EventMsg::StreamError(StreamErrorEvent {
                 message,
                 codex_error_info,
+                additional_details,
             }) => {
-                error!("Handled error during turn: {message} {codex_error_info:?}");
+                error!(
+                    "Handled error during turn: {message} {codex_error_info:?} {additional_details:?}"
+                );
             }
             EventMsg::Error(ErrorEvent {
                 message,
@@ -1803,7 +1807,7 @@ impl<A: Auth> ConversationActor<A> {
             .iter()
             .find(|preset| {
                 &preset.approval == self.config.approval_policy.get()
-                    && preset.sandbox == self.config.sandbox_policy
+                    && &preset.sandbox == self.config.sandbox_policy.get()
             })
             .map(|preset| SessionModeId::new(preset.id))?;
 
@@ -1914,8 +1918,11 @@ impl<A: Auth> ConversationActor<A> {
             let effort_select_options = supported
                 .iter()
                 .map(|e| {
-                    SessionConfigSelectOption::new(e.effort.to_string(), e.effort.to_string())
-                        .description(e.description.clone())
+                    SessionConfigSelectOption::new(
+                        e.effort.to_string(),
+                        e.effort.to_string().to_title_case(),
+                    )
+                    .description(e.description.clone())
                 })
                 .collect::<Vec<_>>();
 
@@ -2219,11 +2226,16 @@ impl<A: Auth> ConversationActor<A> {
             .approval_policy
             .set(preset.approval)
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-        self.config.sandbox_policy = preset.sandbox.clone();
+        self.config
+            .sandbox_policy
+            .set(preset.sandbox.clone())
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
         match preset.sandbox {
             // Treat this user action as a trusted dir
-            SandboxPolicy::DangerFullAccess | SandboxPolicy::WorkspaceWrite { .. } => {
+            SandboxPolicy::DangerFullAccess
+            | SandboxPolicy::WorkspaceWrite { .. }
+            | SandboxPolicy::ExternalSandbox { .. } => {
                 set_project_trust_level(
                     &self.config.codex_home,
                     &self.config.cwd,
@@ -2481,7 +2493,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use codex_core::{
-        config::ConfigOverrides, openai_models::model_presets::all_model_presets,
+        config::ConfigOverrides, models_manager::model_presets::all_model_presets,
         protocol::AgentMessageEvent,
     };
     use tokio::{
