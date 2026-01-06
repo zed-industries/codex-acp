@@ -2118,6 +2118,7 @@ impl<A: Auth> ConversationActor<A> {
                         items: vec![UserInput::Text {
                             text: INIT_COMMAND_PROMPT.into(),
                         }],
+                        final_output_json_schema: None,
                     }
                 }
                 "review" => {
@@ -2171,14 +2172,21 @@ impl<A: Auth> ConversationActor<A> {
                     {
                         op = Op::UserInput {
                             items: vec![UserInput::Text { text: prompt }],
+                            final_output_json_schema: None,
                         }
                     } else {
-                        op = Op::UserInput { items }
+                        op = Op::UserInput {
+                            items,
+                            final_output_json_schema: None,
+                        }
                     }
                 }
             }
         } else {
-            op = Op::UserInput { items }
+            op = Op::UserInput {
+                items,
+                final_output_json_schema: None,
+            }
         }
 
         let submission_id = self
@@ -2667,7 +2675,8 @@ mod tests {
             &[Op::UserInput {
                 items: vec![UserInput::Text {
                     text: INIT_COMMAND_PROMPT.to_string()
-                }]
+                }],
+                final_output_json_schema: None,
             }],
             "ops don't match {ops:?}"
         );
@@ -2947,7 +2956,8 @@ mod tests {
             &[Op::UserInput {
                 items: vec![UserInput::Text {
                     text: "Custom prompt with foo arg.".into()
-                }]
+                }],
+                final_output_json_schema: None,
             }],
             "ops don't match {ops:?}"
         );
@@ -3083,7 +3093,7 @@ mod tests {
             self.ops.lock().unwrap().push(op.clone());
 
             match op {
-                Op::UserInput { items } => {
+                Op::UserInput { items, .. } => {
                     let prompt = items
                         .into_iter()
                         .map(|i| match i {
