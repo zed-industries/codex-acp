@@ -66,17 +66,18 @@ impl CodexAgent {
         let capabilities_clone = client_capabilities.clone();
         let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
         let session_roots_clone = session_roots.clone();
-        let conversation_manager =
-            ConversationManager::new(auth_manager.clone(), SessionSource::Unknown).with_fs(
-                Box::new(move |conversation_id| {
-                    Arc::new(AcpFs::new(
-                        Self::session_id_from_conversation_id(conversation_id),
-                        capabilities_clone.clone(),
-                        local_spawner.clone(),
-                        session_roots_clone.clone(),
-                    ))
-                }),
-            );
+        let conversation_manager = ConversationManager::new_with_fs(
+            auth_manager.clone(),
+            SessionSource::Unknown,
+            Box::new(move |conversation_id| {
+                Arc::new(AcpFs::new(
+                    Self::session_id_from_conversation_id(conversation_id),
+                    capabilities_clone.clone(),
+                    local_spawner.clone(),
+                    session_roots_clone.clone(),
+                ))
+            }),
+        );
         Self {
             auth_manager,
             client_capabilities,
