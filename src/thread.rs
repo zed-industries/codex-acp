@@ -1892,10 +1892,15 @@ impl<A: Auth> ThreadActor<A> {
             ));
         };
 
-        model_select_options.extend(presets.into_iter().map(|preset| {
-            SessionConfigSelectOption::new(preset.id, preset.display_name)
-                .description(preset.description)
-        }));
+        model_select_options.extend(
+            presets
+                .into_iter()
+                .filter(|model| model.show_in_picker || model.model == current_model)
+                .map(|preset| {
+                    SessionConfigSelectOption::new(preset.id, preset.display_name)
+                        .description(preset.description)
+                }),
+        );
 
         options.push(
             SessionConfigOption::select("model", "Model", current_model, model_select_options)
@@ -2070,6 +2075,7 @@ impl<A: Auth> ThreadActor<A> {
 
     async fn models(&self) -> Result<SessionModelState, Error> {
         let mut available_models = Vec::new();
+        let config_model = self.get_current_model().await;
 
         let current_model_id = if let Some(model_id) = self.find_current_model().await {
             model_id
@@ -2085,6 +2091,7 @@ impl<A: Auth> ThreadActor<A> {
                 .list_models(&self.config)
                 .await
                 .iter()
+                .filter(|model| model.show_in_picker || model.model == config_model)
                 .flat_map(|preset| {
                     preset.supported_reasoning_efforts.iter().map(|effort| {
                         ModelInfo::new(
