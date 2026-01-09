@@ -14,11 +14,11 @@ use agent_client_protocol::{
     LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan,
     PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigOption, SessionConfigSelectOption, SessionConfigValueId,
-    SessionId, SessionMode, SessionModeId, SessionModeState, SessionModelState,
-    SessionNotification, SessionUpdate, StopReason, Terminal, TextContent, TextResourceContents,
-    ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    SessionConfigId, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
+    SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
+    TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
@@ -1870,6 +1870,7 @@ impl<A: Auth> ConversationActor<A> {
                     modes.current_mode_id.0,
                     select_options,
                 )
+                .category(SessionConfigOptionCategory::Mode)
                 .description("Choose an approval and sandboxing preset for your session"),
             );
         }
@@ -1896,6 +1897,7 @@ impl<A: Auth> ConversationActor<A> {
 
         options.push(
             SessionConfigOption::select("model", "Model", current_model, model_select_options)
+                .category(SessionConfigOptionCategory::Model)
                 .description("Choose which model Codex should use"),
         );
 
@@ -1933,6 +1935,7 @@ impl<A: Auth> ConversationActor<A> {
                     current_effort.to_string(),
                     effort_select_options,
                 )
+                .category(SessionConfigOptionCategory::ThoughtLevel)
                 .description("Choose how much reasoning effort the model should use"),
             );
         }
