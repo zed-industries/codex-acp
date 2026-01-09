@@ -22,7 +22,7 @@ use agent_client_protocol::{
 };
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
-    AuthManager, CodexConversation,
+    AuthManager, CodexThread,
     config::{Config, set_project_trust_level},
     error::CodexErr,
     models_manager::manager::ModelsManager,
@@ -35,8 +35,8 @@ use codex_core::{
         McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
         Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
-        ReviewTarget, SandboxPolicy, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent,
-        TerminalInteractionEvent, TurnAbortedEvent, UserMessageEvent, ViewImageToolCallEvent,
+        ReviewTarget, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent, TurnAbortedEvent,
+        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
         WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
@@ -66,15 +66,15 @@ use crate::{
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 
-/// Trait for abstracting over the `CodexConversation` to make testing easier.
+/// Trait for abstracting over the `CodexThread` to make testing easier.
 #[async_trait::async_trait]
-pub trait CodexConversationImpl {
+pub trait CodexThreadImpl {
     async fn submit(&self, op: Op) -> Result<String, CodexErr>;
     async fn next_event(&self) -> Result<Event, CodexErr>;
 }
 
 #[async_trait::async_trait]
-impl CodexConversationImpl for CodexConversation {
+impl CodexThreadImpl for CodexThread {
     async fn submit(&self, op: Op) -> Result<String, CodexErr> {
         self.submit(op).await
     }
@@ -113,7 +113,7 @@ impl Auth for Arc<AuthManager> {
     }
 }
 
-enum ConversationMessage {
+enum ThreadMessage {
     Load {
         response_tx: oneshot::Sender<Result<LoadSessionResponse, Error>>,
     },
@@ -142,17 +142,17 @@ enum ConversationMessage {
     },
 }
 
-pub struct Conversation {
-    /// A sender for interacting with the conversation.
-    message_tx: mpsc::UnboundedSender<ConversationMessage>,
+pub struct Thread {
+    /// A sender for interacting with the thread.
+    message_tx: mpsc::UnboundedSender<ThreadMessage>,
     /// A handle to the spawned task.
     _handle: tokio::task::JoinHandle<()>,
 }
 
-impl Conversation {
+impl Thread {
     pub fn new(
         session_id: SessionId,
-        conversation: Arc<dyn CodexConversationImpl>,
+        thread: Arc<dyn CodexThreadImpl>,
         auth: Arc<AuthManager>,
         models_manager: Arc<dyn ModelsManagerImpl>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
@@ -160,10 +160,10 @@ impl Conversation {
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
 
-        let actor = ConversationActor::new(
+        let actor = ThreadActor::new(
             auth,
             SessionClient::new(session_id, client_capabilities),
-            conversation,
+            thread,
             models_manager,
             config,
             message_rx,
@@ -179,7 +179,7 @@ impl Conversation {
     pub async fn load(&self) -> Result<LoadSessionResponse, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let message = ConversationMessage::Load { response_tx };
+        let message = ThreadMessage::Load { response_tx };
         drop(self.message_tx.send(message));
 
         response_rx
@@ -190,7 +190,7 @@ impl Conversation {
     pub async fn config_options(&self) -> Result<Vec<SessionConfigOption>, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let message = ConversationMessage::GetConfigOptions { response_tx };
+        let message = ThreadMessage::GetConfigOptions { response_tx };
         drop(self.message_tx.send(message));
 
         response_rx
@@ -201,7 +201,7 @@ impl Conversation {
     pub async fn prompt(&self, request: PromptRequest) -> Result<StopReason, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let message = ConversationMessage::Prompt {
+        let message = ThreadMessage::Prompt {
             request,
             response_tx,
         };
@@ -217,7 +217,7 @@ impl Conversation {
     pub async fn set_mode(&self, mode: SessionModeId) -> Result<(), Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let message = ConversationMessage::SetMode { mode, response_tx };
+        let message = ThreadMessage::SetMode { mode, response_tx };
         drop(self.message_tx.send(message));
 
         response_rx
@@ -228,7 +228,7 @@ impl Conversation {
     pub async fn set_model(&self, model: ModelId) -> Result<(), Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let message = ConversationMessage::SetModel { model, response_tx };
+        let message = ThreadMessage::SetModel { model, response_tx };
         drop(self.message_tx.send(message));
 
         response_rx
@@ -243,7 +243,7 @@ impl Conversation {
     ) -> Result<(), Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let message = ConversationMessage::SetConfigOption {
+        let message = ThreadMessage::SetConfigOption {
             config_id,
             value,
             response_tx,
@@ -258,7 +258,7 @@ impl Conversation {
     pub async fn cancel(&self) -> Result<(), Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let message = ConversationMessage::Cancel { response_tx };
+        let message = ThreadMessage::Cancel { response_tx };
         drop(self.message_tx.send(message));
 
         response_rx
@@ -339,7 +339,7 @@ struct ActiveCommand {
 struct PromptState {
     active_command: Option<ActiveCommand>,
     active_web_search: Option<String>,
-    conversation: Arc<dyn CodexConversationImpl>,
+    thread: Arc<dyn CodexThreadImpl>,
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     submission_id: String,
@@ -349,14 +349,14 @@ struct PromptState {
 
 impl PromptState {
     fn new(
-        conversation: Arc<dyn CodexConversationImpl>,
+        thread: Arc<dyn CodexThreadImpl>,
         response_tx: oneshot::Sender<Result<StopReason, Error>>,
         submission_id: String,
     ) -> Self {
         Self {
             active_command: None,
             active_web_search: None,
-            conversation,
+            thread,
             event_count: 0,
             response_tx: Some(response_tx),
             submission_id,
@@ -391,8 +391,8 @@ impl PromptState {
             | EventMsg::ApplyPatchApprovalRequest(..)
             | EventMsg::PatchApplyBegin(..)
             | EventMsg::PatchApplyEnd(..)
-            | EventMsg::TaskStarted(..)
-            | EventMsg::TaskComplete(..)
+            | EventMsg::TurnStarted(..)
+            | EventMsg::TurnComplete(..)
             | EventMsg::TokenCount(..)
             | EventMsg::TurnDiff(..)
             | EventMsg::TurnAborted(..)
@@ -405,7 +405,7 @@ impl PromptState {
         }
 
         match event {
-            EventMsg::TaskStarted(TaskStartedEvent {
+            EventMsg::TurnStarted(TurnStartedEvent {
                 model_context_window,
             }) => {
                 info!("Task started with context window of {model_context_window:?}");
@@ -524,7 +524,7 @@ impl PromptState {
             EventMsg::ItemCompleted(ItemCompletedEvent { thread_id, turn_id, item }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
             }
-            EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message}) => {
+            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message}) => {
                 info!(
                     "Task completed successfully after {} events. Last agent message: {last_agent_message:?}", self.event_count
                 );
@@ -617,6 +617,7 @@ impl PromptState {
 
             // Ignore these events
             EventMsg::AgentReasoningRawContent(..)
+            | EventMsg::ThreadRolledBack(..)
             // In the future we can use this to update usage stats
             | EventMsg::TokenCount(..)
             // we already have a way to diff the turn, so ignore
@@ -700,7 +701,7 @@ impl PromptState {
             RequestPermissionOutcome::Cancelled | _ => ElicitationAction::Cancel,
         };
 
-        self.conversation
+        self.thread
             .submit(Op::ResolveElicitation {
                 server_name,
                 request_id: id,
@@ -803,7 +804,7 @@ impl PromptState {
             RequestPermissionOutcome::Cancelled | _ => ReviewDecision::Abort,
         };
 
-        self.conversation
+        self.thread
             .submit(Op::PatchApproval {
                 id: self.submission_id.clone(),
                 decision,
@@ -1019,7 +1020,7 @@ impl PromptState {
             RequestPermissionOutcome::Cancelled | _ => ReviewDecision::Abort,
         };
 
-        self.conversation
+        self.thread
             .submit(Op::ExecApproval {
                 id: self.submission_id.clone(),
                 decision,
@@ -1371,7 +1372,7 @@ impl TaskState {
 
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         match event {
-            EventMsg::TaskComplete(..) => {
+            EventMsg::TurnComplete(..) => {
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
@@ -1453,7 +1454,8 @@ impl TaskState {
                 );
             }
             // Expected but ignore
-            EventMsg::TaskStarted(..)
+            EventMsg::TurnStarted(..)
+            | EventMsg::ThreadRolledBack(..)
             | EventMsg::ItemStarted(..)
             | EventMsg::ItemCompleted(..)
             | EventMsg::TokenCount(..)
@@ -1602,40 +1604,40 @@ impl SessionClient {
     }
 }
 
-struct ConversationActor<A> {
+struct ThreadActor<A> {
     /// Allows for logging out from slash commands
     auth: A,
     /// Used for sending messages back to the client.
     client: SessionClient,
-    /// The conversation associated with this task.
-    conversation: Arc<dyn CodexConversationImpl>,
-    /// The configuration for the conversation.
+    /// The thread associated with this task.
+    thread: Arc<dyn CodexThreadImpl>,
+    /// The configuration for the thread.
     config: Config,
     /// The custom prompts loaded for this workspace.
     custom_prompts: Rc<RefCell<Vec<CustomPrompt>>>,
-    /// The models available for this conversation.
+    /// The models available for this thread.
     models_manager: Arc<dyn ModelsManagerImpl>,
     /// A sender for each interested `Op` submission that needs events routed.
     submissions: HashMap<String, SubmissionState>,
-    /// A receiver for incoming conversation messages.
-    message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
+    /// A receiver for incoming thread messages.
+    message_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     /// Last config options state we emitted to the client, used for deduping updates.
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
 }
 
-impl<A: Auth> ConversationActor<A> {
+impl<A: Auth> ThreadActor<A> {
     fn new(
         auth: A,
         client: SessionClient,
-        conversation: Arc<dyn CodexConversationImpl>,
+        thread: Arc<dyn CodexThreadImpl>,
         models_manager: Arc<dyn ModelsManagerImpl>,
         config: Config,
-        message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
+        message_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     ) -> Self {
         Self {
             auth,
             client,
-            conversation,
+            thread,
             config,
             custom_prompts: Rc::default(),
             models_manager,
@@ -1653,7 +1655,7 @@ impl<A: Auth> ConversationActor<A> {
                     Some(message) => self.handle_message(message).await,
                     None => break,
                 },
-                event = self.conversation.next_event() => match event {
+                event = self.thread.next_event() => match event {
                     Ok(event) => self.handle_event(event).await,
                     Err(e) => {
                         error!("Error getting next event: {:?}", e);
@@ -1667,9 +1669,9 @@ impl<A: Auth> ConversationActor<A> {
         }
     }
 
-    async fn handle_message(&mut self, message: ConversationMessage) {
+    async fn handle_message(&mut self, message: ThreadMessage) {
         match message {
-            ConversationMessage::Load { response_tx } => {
+            ThreadMessage::Load { response_tx } => {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
                 let client = self.client.clone();
@@ -1714,28 +1716,28 @@ impl<A: Auth> ConversationActor<A> {
                         .await;
                 });
             }
-            ConversationMessage::GetConfigOptions { response_tx } => {
+            ThreadMessage::GetConfigOptions { response_tx } => {
                 let result = self.config_options().await;
                 drop(response_tx.send(result));
             }
-            ConversationMessage::Prompt {
+            ThreadMessage::Prompt {
                 request,
                 response_tx,
             } => {
                 let result = self.handle_prompt(request).await;
                 drop(response_tx.send(result));
             }
-            ConversationMessage::SetMode { mode, response_tx } => {
+            ThreadMessage::SetMode { mode, response_tx } => {
                 let result = self.handle_set_mode(mode).await;
                 drop(response_tx.send(result));
                 self.maybe_emit_config_options_update().await;
             }
-            ConversationMessage::SetModel { model, response_tx } => {
+            ThreadMessage::SetModel { model, response_tx } => {
                 let result = self.handle_set_model(model).await;
                 drop(response_tx.send(result));
                 self.maybe_emit_config_options_update().await;
             }
-            ConversationMessage::SetConfigOption {
+            ThreadMessage::SetConfigOption {
                 config_id,
                 value,
                 response_tx,
@@ -1743,7 +1745,7 @@ impl<A: Auth> ConversationActor<A> {
                 let result = self.handle_set_config_option(config_id, value).await;
                 drop(response_tx.send(result));
             }
-            ConversationMessage::Cancel { response_tx } => {
+            ThreadMessage::Cancel { response_tx } => {
                 let result = self.handle_cancel().await;
                 drop(response_tx.send(result));
             }
@@ -1786,7 +1788,7 @@ impl<A: Auth> ConversationActor<A> {
 
     async fn load_custom_prompts(&mut self) -> oneshot::Receiver<Result<Vec<CustomPrompt>, Error>> {
         let (response_tx, response_rx) = oneshot::channel();
-        let submission_id = match self.conversation.submit(Op::ListCustomPrompts).await {
+        let submission_id = match self.thread.submit(Op::ListCustomPrompts).await {
             Ok(id) => id,
             Err(e) => {
                 drop(response_tx.send(Err(Error::internal_error().data(e.to_string()))));
@@ -1890,10 +1892,15 @@ impl<A: Auth> ConversationActor<A> {
             ));
         };
 
-        model_select_options.extend(presets.into_iter().map(|preset| {
-            SessionConfigSelectOption::new(preset.id, preset.display_name)
-                .description(preset.description)
-        }));
+        model_select_options.extend(
+            presets
+                .into_iter()
+                .filter(|model| model.show_in_picker || model.model == current_model)
+                .map(|preset| {
+                    SessionConfigSelectOption::new(preset.id, preset.display_name)
+                        .description(preset.description)
+                }),
+        );
 
         options.push(
             SessionConfigOption::select("model", "Model", current_model, model_select_options)
@@ -2007,7 +2014,7 @@ impl<A: Auth> ConversationActor<A> {
             self.config.model_reasoning_effort
         };
 
-        self.conversation
+        self.thread
             .submit(Op::OverrideTurnContext {
                 cwd: None,
                 approval_policy: None,
@@ -2049,7 +2056,7 @@ impl<A: Auth> ConversationActor<A> {
             );
         }
 
-        self.conversation
+        self.thread
             .submit(Op::OverrideTurnContext {
                 cwd: None,
                 approval_policy: None,
@@ -2068,6 +2075,7 @@ impl<A: Auth> ConversationActor<A> {
 
     async fn models(&self) -> Result<SessionModelState, Error> {
         let mut available_models = Vec::new();
+        let config_model = self.get_current_model().await;
 
         let current_model_id = if let Some(model_id) = self.find_current_model().await {
             model_id
@@ -2083,6 +2091,7 @@ impl<A: Auth> ConversationActor<A> {
                 .list_models(&self.config)
                 .await
                 .iter()
+                .filter(|model| model.show_in_picker || model.model == config_model)
                 .flat_map(|preset| {
                     preset.supported_reasoning_efforts.iter().map(|effort| {
                         ModelInfo::new(
@@ -2193,7 +2202,7 @@ impl<A: Auth> ConversationActor<A> {
         }
 
         let submission_id = self
-            .conversation
+            .thread
             .submit(op.clone())
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
@@ -2204,7 +2213,7 @@ impl<A: Auth> ConversationActor<A> {
         let state = match op {
             Op::Compact | Op::Undo => SubmissionState::Task(TaskState::new(response_tx)),
             _ => SubmissionState::Prompt(PromptState::new(
-                self.conversation.clone(),
+                self.thread.clone(),
                 response_tx,
                 submission_id.clone(),
             )),
@@ -2221,7 +2230,7 @@ impl<A: Auth> ConversationActor<A> {
             .find(|preset| mode.0.as_ref() == preset.id)
             .ok_or_else(Error::invalid_params)?;
 
-        self.conversation
+        self.thread
             .submit(Op::OverrideTurnContext {
                 cwd: None,
                 approval_policy: Some(preset.approval),
@@ -2283,7 +2292,7 @@ impl<A: Auth> ConversationActor<A> {
             return Err(Error::invalid_params().data("No model parsed or configured"));
         }
 
-        self.conversation
+        self.thread
             .submit(Op::OverrideTurnContext {
                 cwd: None,
                 approval_policy: None,
@@ -2302,7 +2311,7 @@ impl<A: Auth> ConversationActor<A> {
     }
 
     async fn handle_cancel(&mut self) -> Result<(), Error> {
-        self.conversation
+        self.thread
             .submit(Op::Interrupt)
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2519,7 +2528,7 @@ mod tests {
         let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
-        message_tx.send(ConversationMessage::Prompt {
+        message_tx.send(ThreadMessage::Prompt {
             request: PromptRequest::new(session_id.clone(), vec!["Hi".into()]),
             response_tx: prompt_response_tx,
         })?;
@@ -2552,10 +2561,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_compact() -> anyhow::Result<()> {
-        let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
-        message_tx.send(ConversationMessage::Prompt {
+        message_tx.send(ThreadMessage::Prompt {
             request: PromptRequest::new(session_id.clone(), vec!["/compact".into()]),
             response_tx: prompt_response_tx,
         })?;
@@ -2582,7 +2591,7 @@ mod tests {
                 ..
             }) if text == "Compact task completed"
         ));
-        let ops = conversation.ops.lock().unwrap();
+        let ops = thread.ops.lock().unwrap();
         assert_eq!(ops.as_slice(), &[Op::Compact]);
 
         Ok(())
@@ -2590,10 +2599,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_undo() -> anyhow::Result<()> {
-        let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
-        message_tx.send(ConversationMessage::Prompt {
+        message_tx.send(ThreadMessage::Prompt {
             request: PromptRequest::new(session_id.clone(), vec!["/undo".into()]),
             response_tx: prompt_response_tx,
         })?;
@@ -2632,7 +2641,7 @@ mod tests {
             }) if text == "Undo completed."
         ));
 
-        let ops = conversation.ops.lock().unwrap();
+        let ops = thread.ops.lock().unwrap();
         assert_eq!(ops.as_slice(), &[Op::Undo]);
 
         Ok(())
@@ -2640,10 +2649,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_init() -> anyhow::Result<()> {
-        let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
-        message_tx.send(ConversationMessage::Prompt {
+        message_tx.send(ThreadMessage::Prompt {
             request: PromptRequest::new(session_id.clone(), vec!["/init".into()]),
             response_tx: prompt_response_tx,
         })?;
@@ -2672,7 +2681,7 @@ mod tests {
             ),
             "notifications don't match {notifications:?}"
         );
-        let ops = conversation.ops.lock().unwrap();
+        let ops = thread.ops.lock().unwrap();
         assert_eq!(
             ops.as_slice(),
             &[Op::UserInput {
@@ -2689,10 +2698,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_review() -> anyhow::Result<()> {
-        let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
-        message_tx.send(ConversationMessage::Prompt {
+        message_tx.send(ThreadMessage::Prompt {
             request: PromptRequest::new(session_id.clone(), vec!["/review".into()]),
             response_tx: prompt_response_tx,
         })?;
@@ -2723,7 +2732,7 @@ mod tests {
             "notifications don't match {notifications:?}"
         );
 
-        let ops = conversation.ops.lock().unwrap();
+        let ops = thread.ops.lock().unwrap();
         assert_eq!(
             ops.as_slice(),
             &[Op::Review {
@@ -2740,11 +2749,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_custom_review() -> anyhow::Result<()> {
-        let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
         let instructions = "Review what we did in agents.md";
 
-        message_tx.send(ConversationMessage::Prompt {
+        message_tx.send(ThreadMessage::Prompt {
             request: PromptRequest::new(
                 session_id.clone(),
                 vec![format!("/review {instructions}").into()],
@@ -2778,7 +2787,7 @@ mod tests {
             "notifications don't match {notifications:?}"
         );
 
-        let ops = conversation.ops.lock().unwrap();
+        let ops = thread.ops.lock().unwrap();
         assert_eq!(
             ops.as_slice(),
             &[Op::Review {
@@ -2799,10 +2808,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_review() -> anyhow::Result<()> {
-        let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
-        message_tx.send(ConversationMessage::Prompt {
+        message_tx.send(ThreadMessage::Prompt {
             request: PromptRequest::new(session_id.clone(), vec!["/review-commit 123456".into()]),
             response_tx: prompt_response_tx,
         })?;
@@ -2833,7 +2842,7 @@ mod tests {
             "notifications don't match {notifications:?}"
         );
 
-        let ops = conversation.ops.lock().unwrap();
+        let ops = thread.ops.lock().unwrap();
         assert_eq!(
             ops.as_slice(),
             &[Op::Review {
@@ -2856,10 +2865,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_branch_review() -> anyhow::Result<()> {
-        let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
-        message_tx.send(ConversationMessage::Prompt {
+        message_tx.send(ThreadMessage::Prompt {
             request: PromptRequest::new(session_id.clone(), vec!["/review-branch feature".into()]),
             response_tx: prompt_response_tx,
         })?;
@@ -2890,7 +2899,7 @@ mod tests {
             "notifications don't match {notifications:?}"
         );
 
-        let ops = conversation.ops.lock().unwrap();
+        let ops = thread.ops.lock().unwrap();
         assert_eq!(
             ops.as_slice(),
             &[Op::Review {
@@ -2918,11 +2927,10 @@ mod tests {
             description: None,
             argument_hint: None,
         }];
-        let (session_id, client, conversation, message_tx, local_set) =
-            setup(custom_prompts).await?;
+        let (session_id, client, thread, message_tx, local_set) = setup(custom_prompts).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
-        message_tx.send(ConversationMessage::Prompt {
+        message_tx.send(ThreadMessage::Prompt {
             request: PromptRequest::new(session_id.clone(), vec!["/custom foo".into()]),
             response_tx: prompt_response_tx,
         })?;
@@ -2953,7 +2961,7 @@ mod tests {
             "notifications don't match {notifications:?}"
         );
 
-        let ops = conversation.ops.lock().unwrap();
+        let ops = thread.ops.lock().unwrap();
         assert_eq!(
             ops.as_slice(),
             &[Op::UserInput {
@@ -2973,7 +2981,7 @@ mod tests {
         let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
-        message_tx.send(ConversationMessage::Prompt {
+        message_tx.send(ThreadMessage::Prompt {
             request: PromptRequest::new(session_id.clone(), vec!["test delta".into()]),
             response_tx: prompt_response_tx,
         })?;
@@ -3014,15 +3022,15 @@ mod tests {
     ) -> anyhow::Result<(
         SessionId,
         Arc<StubClient>,
-        Arc<StubCodexConversation>,
-        UnboundedSender<ConversationMessage>,
+        Arc<StubCodexThread>,
+        UnboundedSender<ThreadMessage>,
         LocalSet,
     )> {
         let session_id = SessionId::new("test");
         let client = Arc::new(StubClient::new());
         let session_client =
             SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
-        let conversation = Arc::new(StubCodexConversation::new());
+        let conversation = Arc::new(StubCodexThread::new());
         let models_manager = Arc::new(StubModelsManager);
         let config = Config::load_with_cli_overrides_and_harness_overrides(
             vec![],
@@ -3031,7 +3039,7 @@ mod tests {
         .await?;
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let mut actor = ConversationActor::new(
+        let mut actor = ThreadActor::new(
             StubAuth,
             session_client,
             conversation.clone(),
@@ -3067,17 +3075,17 @@ mod tests {
         }
     }
 
-    struct StubCodexConversation {
+    struct StubCodexThread {
         current_id: AtomicUsize,
         ops: std::sync::Mutex<Vec<Op>>,
         op_tx: mpsc::UnboundedSender<Event>,
         op_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
     }
 
-    impl StubCodexConversation {
+    impl StubCodexThread {
         fn new() -> Self {
             let (op_tx, op_rx) = mpsc::unbounded_channel();
-            StubCodexConversation {
+            StubCodexThread {
                 current_id: AtomicUsize::new(0),
                 ops: std::sync::Mutex::default(),
                 op_tx,
@@ -3087,7 +3095,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl CodexConversationImpl for StubCodexConversation {
+    impl CodexThreadImpl for StubCodexThread {
         async fn submit(&self, op: Op) -> Result<String, CodexErr> {
             let id = self
                 .current_id
@@ -3128,7 +3136,7 @@ mod tests {
                     self.op_tx
                         .send(Event {
                             id: id.to_string(),
-                            msg: EventMsg::TaskComplete(TaskCompleteEvent {
+                            msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                             }),
                         })
@@ -3138,7 +3146,7 @@ mod tests {
                     self.op_tx
                         .send(Event {
                             id: id.to_string(),
-                            msg: EventMsg::TaskStarted(TaskStartedEvent {
+                            msg: EventMsg::TurnStarted(TurnStartedEvent {
                                 model_context_window: None,
                             }),
                         })
@@ -3154,7 +3162,7 @@ mod tests {
                     self.op_tx
                         .send(Event {
                             id: id.to_string(),
-                            msg: EventMsg::TaskComplete(TaskCompleteEvent {
+                            msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                             }),
                         })
@@ -3183,7 +3191,7 @@ mod tests {
                     self.op_tx
                         .send(Event {
                             id: id.to_string(),
-                            msg: EventMsg::TaskComplete(TaskCompleteEvent {
+                            msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                             }),
                         })
@@ -3215,7 +3223,7 @@ mod tests {
                     self.op_tx
                         .send(Event {
                             id: id.to_string(),
-                            msg: EventMsg::TaskComplete(TaskCompleteEvent {
+                            msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                             }),
                         })
