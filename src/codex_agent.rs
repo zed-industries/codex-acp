@@ -8,7 +8,7 @@ use agent_client_protocol::{
     SetSessionModelRequest, SetSessionModelResponse,
 };
 use codex_core::{
-    ConversationManager, NewConversation,
+    NewThread, ThreadManager,
     auth::{AuthManager, read_codex_api_key_from_env, read_openai_api_key_from_env},
     config::{
         Config,
@@ -17,7 +17,7 @@ use codex_core::{
     protocol::SessionSource,
 };
 use codex_login::{AuthMode, CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
-use codex_protocol::ConversationId;
+use codex_protocol::ThreadId;
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -28,8 +28,8 @@ use std::{
 use tracing::{debug, info};
 
 use crate::{
-    conversation::Conversation,
     local_spawner::{AcpFs, LocalSpawner},
+    thread::Thread,
 };
 
 /// The Codex implementation of the ACP Agent trait.
@@ -43,10 +43,10 @@ pub struct CodexAgent {
     client_capabilities: Arc<Mutex<ClientCapabilities>>,
     /// The underlying codex configuration
     config: Config,
-    /// Conversation manager for handling sessions
-    conversation_manager: ConversationManager,
+    /// Thread manager for handling sessions
+    thread_manager: ThreadManager,
     /// Active sessions mapped by `SessionId`
-    sessions: Rc<RefCell<HashMap<SessionId, Rc<Conversation>>>>,
+    sessions: Rc<RefCell<HashMap<SessionId, Rc<Thread>>>>,
     /// Session working directories for filesystem sandboxing
     session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>>,
 }
@@ -66,12 +66,13 @@ impl CodexAgent {
         let capabilities_clone = client_capabilities.clone();
         let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
         let session_roots_clone = session_roots.clone();
-        let conversation_manager = ConversationManager::new_with_fs(
+        let thread_manager = ThreadManager::new_with_fs(
+            config.codex_home.clone(),
             auth_manager.clone(),
             SessionSource::Unknown,
-            Box::new(move |conversation_id| {
+            Box::new(move |thread_id| {
                 Arc::new(AcpFs::new(
-                    Self::session_id_from_conversation_id(conversation_id),
+                    Self::session_id_from_thread_id(thread_id),
                     capabilities_clone.clone(),
                     local_spawner.clone(),
                     session_roots_clone.clone(),
@@ -82,17 +83,17 @@ impl CodexAgent {
             auth_manager,
             client_capabilities,
             config,
-            conversation_manager,
+            thread_manager,
             sessions: Rc::default(),
             session_roots,
         }
     }
 
-    fn session_id_from_conversation_id(conversation_id: ConversationId) -> SessionId {
-        SessionId::new(conversation_id.to_string())
+    fn session_id_from_thread_id(thread_id: ThreadId) -> SessionId {
+        SessionId::new(thread_id.to_string())
     }
 
-    fn get_conversation(&self, session_id: &SessionId) -> Result<Rc<Conversation>, Error> {
+    fn get_thread(&self, session_id: &SessionId) -> Result<Rc<Thread>, Error> {
         Ok(self
             .sessions
             .borrow()
@@ -101,8 +102,8 @@ impl CodexAgent {
             .clone())
     }
 
-    fn check_auth(&self) -> Result<(), Error> {
-        if self.config.model_provider_id == "openai" && self.auth_manager.auth().is_none() {
+    async fn check_auth(&self) -> Result<(), Error> {
+        if self.config.model_provider_id == "openai" && self.auth_manager.auth().await.is_none() {
             return Err(Error::auth_required());
         }
         Ok(())
@@ -150,7 +151,7 @@ impl Agent for CodexAgent {
         let auth_method = CodexAuthMethod::try_from(request.method_id)?;
 
         // Check before starting login flow if already authenticated with the same method
-        if let Some(auth) = self.auth_manager.auth() {
+        if let Some(auth) = self.auth_manager.auth().await {
             match (auth.mode, auth_method) {
                 (
                     AuthMode::ApiKey,
@@ -214,7 +215,7 @@ impl Agent for CodexAgent {
 
     async fn new_session(&self, request: NewSessionRequest) -> Result<NewSessionResponse, Error> {
         // Check before sending if authentication was successful or not
-        self.check_auth()?;
+        self.check_auth().await?;
 
         let NewSessionRequest {
             cwd, mcp_servers, ..
@@ -290,33 +291,33 @@ impl Agent for CodexAgent {
 
         let num_mcp_servers = config.mcp_servers.len();
 
-        let NewConversation {
-            conversation_id,
-            conversation,
+        let NewThread {
+            thread_id,
+            thread,
             session_configured: _,
-        } = Box::pin(self.conversation_manager.new_conversation(config.clone()))
+        } = Box::pin(self.thread_manager.start_thread(config.clone()))
             .await
             .map_err(|_e| Error::internal_error())?;
 
-        let session_id = Self::session_id_from_conversation_id(conversation_id);
+        let session_id = Self::session_id_from_thread_id(thread_id);
         // Record the session root for filesystem sandboxing.
         self.session_roots
             .lock()
             .unwrap()
             .insert(session_id.clone(), config.cwd.clone());
-        let conversation = Rc::new(Conversation::new(
+        let thread = Rc::new(Thread::new(
             session_id.clone(),
-            conversation,
+            thread,
             self.auth_manager.clone(),
-            self.conversation_manager.get_models_manager(),
+            self.thread_manager.get_models_manager(),
             self.client_capabilities.clone(),
             config.clone(),
         ));
-        let load = conversation.load().await?;
+        let load = thread.load().await?;
 
         self.sessions
             .borrow_mut()
-            .insert(session_id.clone(), conversation);
+            .insert(session_id.clone(), thread);
 
         debug!("Created new session with {} MCP servers", num_mcp_servers);
 
@@ -332,34 +333,34 @@ impl Agent for CodexAgent {
     ) -> Result<LoadSessionResponse, Error> {
         info!("Loading session: {}", request.session_id);
         // Check before sending if authentication was successful or not
-        self.check_auth()?;
+        self.check_auth().await?;
 
         // Check if we have this session already
-        let Some(conversation) = self.sessions.borrow().get(&request.session_id).cloned() else {
+        let Some(thread) = self.sessions.borrow().get(&request.session_id).cloned() else {
             // For now, we can't actually load sessions from disk
-            // The conversation manager doesn't have a direct load method
-            // We would need to use resume_conversation_from_rollout with a rollout path
+            // The thread manager doesn't have a direct load method
+            // We would need to use resume_thread_from_rollout with a rollout path
             return Err(Error::resource_not_found(None));
         };
 
-        Ok(conversation.load().await?)
+        Ok(thread.load().await?)
     }
 
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {
         info!("Processing prompt for session: {}", request.session_id);
         // Check before sending if authentication was successful or not
-        self.check_auth()?;
+        self.check_auth().await?;
 
         // Get the session state
-        let conversation = self.get_conversation(&request.session_id)?;
-        let stop_reason = conversation.prompt(request).await?;
+        let thread = self.get_thread(&request.session_id)?;
+        let stop_reason = thread.prompt(request).await?;
 
         Ok(PromptResponse::new(stop_reason))
     }
 
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
         info!("Cancelling operations for session: {}", args.session_id);
-        self.get_conversation(&args.session_id)?.cancel().await?;
+        self.get_thread(&args.session_id)?.cancel().await?;
         Ok(())
     }
 
@@ -368,7 +369,7 @@ impl Agent for CodexAgent {
         args: SetSessionModeRequest,
     ) -> Result<SetSessionModeResponse, Error> {
         info!("Setting session mode for session: {}", args.session_id);
-        self.get_conversation(&args.session_id)?
+        self.get_thread(&args.session_id)?
             .set_mode(args.mode_id)
             .await?;
         Ok(SetSessionModeResponse::default())
@@ -380,7 +381,7 @@ impl Agent for CodexAgent {
     ) -> Result<SetSessionModelResponse, Error> {
         info!("Setting session model for session: {}", args.session_id);
 
-        self.get_conversation(&args.session_id)?
+        self.get_thread(&args.session_id)?
             .set_model(args.model_id)
             .await?;
 
@@ -396,13 +397,11 @@ impl Agent for CodexAgent {
             args.session_id, args.config_id.0, args.value.0
         );
 
-        let conversation = self.get_conversation(&args.session_id)?;
+        let thread = self.get_thread(&args.session_id)?;
 
-        conversation
-            .set_config_option(args.config_id, args.value)
-            .await?;
+        thread.set_config_option(args.config_id, args.value).await?;
 
-        let config_options = conversation.config_options().await?;
+        let config_options = thread.config_options().await?;
 
         Ok(SetSessionConfigOptionResponse::new(config_options))
     }
