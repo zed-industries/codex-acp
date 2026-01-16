@@ -15,8 +15,8 @@ use codex_core::{
         Config,
         types::{McpServerConfig, McpServerTransportConfig},
     },
-    parse_cursor, parse_turn_item,
-    protocol::SessionSource,
+    find_thread_path_by_id_str, parse_cursor, parse_turn_item,
+    protocol::{InitialHistory, SessionSource},
 };
 use codex_login::{AuthMode, CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
 use codex_protocol::{ThreadId, protocol::SessionMetaLine};
@@ -113,6 +113,78 @@ impl CodexAgent {
             return Err(Error::auth_required());
         }
         Ok(())
+    }
+
+    /// Build a session config from base config, working directory, and MCP servers.
+    /// This is shared between `new_session` and `load_session`.
+    fn build_session_config(&self, cwd: &PathBuf, mcp_servers: Vec<McpServer>) -> Config {
+        let mut config = self.config.clone();
+        config.include_apply_patch_tool = true;
+        config.cwd.clone_from(cwd);
+
+        // Propagate any client-provided MCP servers that codex-rs supports.
+        for mcp_server in mcp_servers {
+            match mcp_server {
+                // Not supported in codex
+                McpServer::Sse(..) => {}
+                McpServer::Http(McpServerHttp {
+                    name, url, headers, ..
+                }) => {
+                    config.mcp_servers.insert(
+                        name,
+                        McpServerConfig {
+                            transport: McpServerTransportConfig::StreamableHttp {
+                                url,
+                                bearer_token_env_var: None,
+                                http_headers: if headers.is_empty() {
+                                    None
+                                } else {
+                                    Some(headers.into_iter().map(|h| (h.name, h.value)).collect())
+                                },
+                                env_http_headers: None,
+                            },
+                            enabled: true,
+                            startup_timeout_sec: None,
+                            tool_timeout_sec: None,
+                            disabled_tools: None,
+                            enabled_tools: None,
+                        },
+                    );
+                }
+                McpServer::Stdio(McpServerStdio {
+                    name,
+                    command,
+                    args,
+                    env,
+                    ..
+                }) => {
+                    config.mcp_servers.insert(
+                        name,
+                        McpServerConfig {
+                            transport: McpServerTransportConfig::Stdio {
+                                command: command.display().to_string(),
+                                args,
+                                env: if env.is_empty() {
+                                    None
+                                } else {
+                                    Some(env.into_iter().map(|env| (env.name, env.value)).collect())
+                                },
+                                env_vars: vec![],
+                                cwd: Some(cwd.clone()),
+                            },
+                            enabled: true,
+                            startup_timeout_sec: None,
+                            tool_timeout_sec: None,
+                            disabled_tools: None,
+                            enabled_tools: None,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        config
     }
 }
 
@@ -232,73 +304,7 @@ impl Agent for CodexAgent {
         } = request;
         info!("Creating new session with cwd: {}", cwd.display());
 
-        let mut config = self.config.clone();
-        // Make sure we are going through the `apply_patch` code path
-        config.include_apply_patch_tool = true;
-        config.cwd.clone_from(&cwd);
-
-        // Propagate any client-provided MCP servers that codex-rs supports.
-        for mcp_server in mcp_servers {
-            match mcp_server {
-                // Not supported in codex
-                McpServer::Sse(..) => {}
-                McpServer::Http(McpServerHttp {
-                    name, url, headers, ..
-                }) => {
-                    config.mcp_servers.insert(
-                        name,
-                        McpServerConfig {
-                            transport: McpServerTransportConfig::StreamableHttp {
-                                url,
-                                bearer_token_env_var: None,
-                                http_headers: if headers.is_empty() {
-                                    None
-                                } else {
-                                    Some(headers.into_iter().map(|h| (h.name, h.value)).collect())
-                                },
-                                env_http_headers: None,
-                            },
-                            enabled: true,
-                            startup_timeout_sec: None,
-                            tool_timeout_sec: None,
-                            disabled_tools: None,
-                            enabled_tools: None,
-                        },
-                    );
-                }
-                McpServer::Stdio(McpServerStdio {
-                    name,
-                    command,
-                    args,
-                    env,
-                    ..
-                }) => {
-                    config.mcp_servers.insert(
-                        name,
-                        McpServerConfig {
-                            transport: McpServerTransportConfig::Stdio {
-                                command: command.display().to_string(),
-                                args,
-                                env: if env.is_empty() {
-                                    None
-                                } else {
-                                    Some(env.into_iter().map(|env| (env.name, env.value)).collect())
-                                },
-                                env_vars: vec![],
-                                cwd: Some(cwd.clone()),
-                            },
-                            enabled: true,
-                            startup_timeout_sec: None,
-                            tool_timeout_sec: None,
-                            disabled_tools: None,
-                            enabled_tools: None,
-                        },
-                    );
-                }
-                _ => {}
-            }
-        }
-
+        let config = self.build_session_config(&cwd, mcp_servers);
         let num_mcp_servers = config.mcp_servers.len();
 
         let NewThread {
@@ -345,15 +351,66 @@ impl Agent for CodexAgent {
         // Check before sending if authentication was successful or not
         self.check_auth().await?;
 
-        // Check if we have this session already
-        let Some(thread) = self.sessions.borrow().get(&request.session_id).cloned() else {
-            // For now, we can't actually load sessions from disk
-            // The thread manager doesn't have a direct load method
-            // We would need to use resume_thread_from_rollout with a rollout path
-            return Err(Error::resource_not_found(None));
+        let LoadSessionRequest {
+            session_id,
+            cwd,
+            mcp_servers,
+            ..
+        } = request;
+
+        let rollout_path =
+            find_thread_path_by_id_str(&self.config.codex_home, session_id.0.as_ref())
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))?
+                .ok_or_else(|| Error::resource_not_found(None))?;
+
+        let history = RolloutRecorder::get_rollout_history(&rollout_path)
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        let rollout_items = match &history {
+            InitialHistory::Resumed(resumed) => resumed.history.clone(),
+            InitialHistory::Forked(items) => items.clone(),
+            InitialHistory::New => Vec::new(),
         };
 
-        Ok(thread.load().await?)
+        let config = self.build_session_config(&cwd, mcp_servers);
+
+        let NewThread {
+            thread_id: _,
+            thread,
+            session_configured: _,
+        } = Box::pin(self.thread_manager.resume_thread_from_rollout(
+            config.clone(),
+            rollout_path,
+            self.auth_manager.clone(),
+        ))
+        .await
+        .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        let thread = Rc::new(Thread::new(
+            session_id.clone(),
+            thread,
+            self.auth_manager.clone(),
+            self.thread_manager.get_models_manager(),
+            self.client_capabilities.clone(),
+            config.clone(),
+        ));
+
+        thread.replay_history(rollout_items).await?;
+
+        let load = thread.load().await?;
+
+        self.session_roots
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), config.cwd);
+        self.sessions.borrow_mut().insert(session_id, thread);
+
+        Ok(LoadSessionResponse::new()
+            .modes(load.modes)
+            .models(load.models)
+            .config_options(load.config_options))
     }
 
     async fn list_sessions(

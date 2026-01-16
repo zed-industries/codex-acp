@@ -46,9 +46,11 @@ use codex_protocol::{
     approvals::ElicitationRequestEvent,
     config_types::TrustLevel,
     custom_prompts::CustomPrompt,
+    models::{ContentItem, ReasoningItemReasoningSummary, ResponseItem},
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
+    protocol::RolloutItem,
     user_input::UserInput,
 };
 use heck::ToTitleCase;
@@ -138,6 +140,10 @@ enum ThreadMessage {
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
     Cancel {
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
+    ReplayHistory {
+        history: Vec<RolloutItem>,
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
 }
@@ -259,6 +265,20 @@ impl Thread {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ThreadMessage::Cancel { response_tx };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
+    pub async fn replay_history(&self, history: Vec<RolloutItem>) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ThreadMessage::ReplayHistory {
+            history,
+            response_tx,
+        };
         drop(self.message_tx.send(message));
 
         response_rx
@@ -1749,6 +1769,13 @@ impl<A: Auth> ThreadActor<A> {
                 let result = self.handle_cancel().await;
                 drop(response_tx.send(result));
             }
+            ThreadMessage::ReplayHistory {
+                history,
+                response_tx,
+            } => {
+                let result = self.handle_replay_history(history).await;
+                drop(response_tx.send(result));
+            }
         }
     }
 
@@ -2318,6 +2345,171 @@ impl<A: Auth> ThreadActor<A> {
         Ok(())
     }
 
+    /// Replay conversation history to the client via session/update notifications.
+    /// This is called when loading a session to stream all prior messages.
+    async fn handle_replay_history(&mut self, history: Vec<RolloutItem>) -> Result<(), Error> {
+        for item in history {
+            if let RolloutItem::ResponseItem(response_item) = item {
+                self.replay_response_item(&response_item).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Convert and send a single ResponseItem as ACP notification(s)
+    async fn replay_response_item(&self, item: &ResponseItem) {
+        match item {
+            ResponseItem::Message { role, content, .. } => {
+                let text = content_items_to_text(content);
+                if !text.is_empty() {
+                    if role == "user" {
+                        self.client
+                            .send_notification(SessionUpdate::UserMessageChunk(ContentChunk::new(
+                                text.into(),
+                            )))
+                            .await;
+                    } else if role == "assistant" {
+                        self.client.send_agent_text(text).await;
+                    }
+                }
+            }
+            ResponseItem::Reasoning { summary, .. } => {
+                let text = reasoning_summary_to_text(summary);
+                if !text.is_empty() {
+                    self.client.send_agent_thought(text).await;
+                }
+            }
+            ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            } => {
+                self.client
+                    .send_notification(SessionUpdate::ToolCall(
+                        ToolCall::new(call_id.clone(), name.clone())
+                            .status(ToolCallStatus::Completed)
+                            .raw_input(
+                                serde_json::from_str::<serde_json::Value>(arguments)
+                                    .unwrap_or_default(),
+                            ),
+                    ))
+                    .await;
+            }
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                self.client
+                    .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                        call_id.clone(),
+                        ToolCallUpdateFields::new()
+                            .status(ToolCallStatus::Completed)
+                            .raw_output(serde_json::to_value(&output.content).unwrap_or_default()),
+                    )))
+                    .await;
+            }
+            ResponseItem::LocalShellCall {
+                call_id: Some(call_id),
+                action,
+                ..
+            } => {
+                let title = match action {
+                    codex_protocol::models::LocalShellAction::Exec(exec) => exec.command.join(" "),
+                };
+                self.client
+                    .send_notification(SessionUpdate::ToolCall(
+                        ToolCall::new(call_id.clone(), title)
+                            .kind(ToolKind::Execute)
+                            .status(ToolCallStatus::Completed),
+                    ))
+                    .await;
+            }
+            ResponseItem::CustomToolCall {
+                name,
+                input,
+                call_id,
+                ..
+            } => {
+                self.client
+                    .send_notification(SessionUpdate::ToolCall(
+                        ToolCall::new(call_id.clone(), name.clone())
+                            .status(ToolCallStatus::Completed)
+                            .raw_input(
+                                serde_json::from_str::<serde_json::Value>(input)
+                                    .unwrap_or_default(),
+                            ),
+                    ))
+                    .await;
+            }
+            ResponseItem::CustomToolCallOutput { call_id, output } => {
+                self.client
+                    .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                        call_id.clone(),
+                        ToolCallUpdateFields::new()
+                            .status(ToolCallStatus::Completed)
+                            .raw_output(serde_json::Value::String(output.clone())),
+                    )))
+                    .await;
+            }
+            ResponseItem::WebSearchCall { id, action, .. } => {
+                let (title, call_id) = match action {
+                    codex_protocol::models::WebSearchAction::Search { query } => {
+                        let title = query.clone().unwrap_or_else(|| "Web search".to_string());
+                        let call_id = id.clone().unwrap_or_else(|| {
+                            format!(
+                                "web_search_{}",
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_nanos())
+                                    .unwrap_or(0)
+                            )
+                        });
+                        (title, call_id)
+                    }
+                    codex_protocol::models::WebSearchAction::OpenPage { url } => {
+                        let title = url.clone().unwrap_or_else(|| "Open page".to_string());
+                        let call_id = id.clone().unwrap_or_else(|| {
+                            format!(
+                                "web_open_{}",
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_nanos())
+                                    .unwrap_or(0)
+                            )
+                        });
+                        (title, call_id)
+                    }
+                    codex_protocol::models::WebSearchAction::FindInPage { pattern, .. } => {
+                        let title = pattern
+                            .clone()
+                            .unwrap_or_else(|| "Find in page".to_string());
+                        let call_id = id.clone().unwrap_or_else(|| {
+                            format!(
+                                "web_find_{}",
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_nanos())
+                                    .unwrap_or(0)
+                            )
+                        });
+                        (title, call_id)
+                    }
+                    codex_protocol::models::WebSearchAction::Other => {
+                        // Skip unknown web search actions
+                        return;
+                    }
+                };
+                self.client
+                    .send_notification(SessionUpdate::ToolCall(
+                        ToolCall::new(call_id, title)
+                            .kind(ToolKind::Search)
+                            .status(ToolCallStatus::Completed),
+                    ))
+                    .await;
+            }
+            // Skip GhostSnapshot, Compaction, Other
+            _ => {}
+        }
+    }
+
     async fn handle_event(&mut self, Event { id, msg }: Event) {
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
@@ -2496,6 +2688,30 @@ fn extract_tool_call_content_from_changes(
             })
         }),
     )
+}
+
+/// Extract text content from a list of ContentItems (used for replay)
+fn content_items_to_text(content: &[ContentItem]) -> String {
+    content
+        .iter()
+        .filter_map(|item| match item {
+            ContentItem::InputText { text } => Some(text.as_str()),
+            ContentItem::OutputText { text } => Some(text.as_str()),
+            ContentItem::InputImage { .. } => None, // Skip images in text extraction
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Extract text from reasoning summary items (used for replay)
+fn reasoning_summary_to_text(summary: &[ReasoningItemReasoningSummary]) -> String {
+    summary
+        .iter()
+        .map(|entry| match entry {
+            ReasoningItemReasoningSummary::SummaryText { text } => text.as_str(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Checks if a prompt is slash command
