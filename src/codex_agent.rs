@@ -1,23 +1,25 @@
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
     CancelNotification, ClientCapabilities, Error, Implementation, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
-    McpServerHttp, McpServerStdio, NewSessionRequest, NewSessionResponse, PromptCapabilities,
-    PromptRequest, PromptResponse, ProtocolVersion, SessionId, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
-    SetSessionModelRequest, SetSessionModelResponse,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    LoadSessionResponse, McpCapabilities, McpServer, McpServerHttp, McpServerStdio,
+    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
+    ProtocolVersion, SessionCapabilities, SessionId, SessionInfo, SessionListCapabilities,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
 use codex_core::{
-    NewThread, ThreadManager,
+    NewThread, ResponseItem, RolloutRecorder, ThreadManager,
     auth::{AuthManager, read_codex_api_key_from_env, read_openai_api_key_from_env},
     config::{
         Config,
         types::{McpServerConfig, McpServerTransportConfig},
     },
+    parse_cursor, parse_turn_item,
     protocol::SessionSource,
 };
 use codex_login::{AuthMode, CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
-use codex_protocol::ThreadId;
+use codex_protocol::{ThreadId, protocol::SessionMetaLine};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -26,6 +28,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tracing::{debug, info};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     local_spawner::{AcpFs, LocalSpawner},
@@ -50,6 +53,9 @@ pub struct CodexAgent {
     /// Session working directories for filesystem sandboxing
     session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>>,
 }
+
+const SESSION_LIST_PAGE_SIZE: usize = 25;
+const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
@@ -124,9 +130,13 @@ impl Agent for CodexAgent {
 
         *self.client_capabilities.lock().unwrap() = client_capabilities;
 
-        let agent_capabilities = AgentCapabilities::new()
+        let mut agent_capabilities = AgentCapabilities::new()
             .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
-            .mcp_capabilities(McpCapabilities::new().http(true));
+            .mcp_capabilities(McpCapabilities::new().http(true))
+            .load_session(true);
+
+        agent_capabilities.session_capabilities =
+            SessionCapabilities::new().list(SessionListCapabilities::new());
 
         let mut auth_methods = vec![
             CodexAuthMethod::ChatGpt.into(),
@@ -346,6 +356,80 @@ impl Agent for CodexAgent {
         Ok(thread.load().await?)
     }
 
+    async fn list_sessions(
+        &self,
+        request: ListSessionsRequest,
+    ) -> Result<ListSessionsResponse, Error> {
+        self.check_auth().await?;
+
+        let ListSessionsRequest { cwd, cursor, .. } = request;
+        let cursor_obj = cursor.as_deref().and_then(parse_cursor);
+
+        let page = RolloutRecorder::list_threads(
+            &self.config.codex_home,
+            SESSION_LIST_PAGE_SIZE,
+            cursor_obj.as_ref(),
+            &[
+                SessionSource::Cli,
+                SessionSource::VSCode,
+                SessionSource::Unknown,
+            ],
+            None,
+            self.config.model_provider_id.as_str(),
+        )
+        .await
+        .map_err(|err| Error::internal_error().data(format!("failed to list sessions: {err}")))?;
+
+        let sessions = page
+            .items
+            .into_iter()
+            .filter_map(|item| {
+                // Codex rollout summaries put the SessionMetaLine first in the head.
+                let session_meta_line = item.head.first().and_then(|first| {
+                    serde_json::from_value::<SessionMetaLine>(first.clone()).ok()
+                })?;
+
+                if let Some(filter_cwd) = cwd.as_ref()
+                    && session_meta_line.meta.cwd != *filter_cwd
+                {
+                    return None;
+                }
+
+                let mut title = None;
+                for value in item.head {
+                    if let Ok(response_item) = serde_json::from_value::<ResponseItem>(value)
+                        && let Some(turn_item) = parse_turn_item(&response_item)
+                        && let codex_protocol::items::TurnItem::UserMessage(user) = turn_item
+                    {
+                        if let Some(formatted) = format_session_title(&user.message()) {
+                            title = Some(formatted);
+                        }
+                        break;
+                    }
+                }
+
+                let updated_at = item.updated_at.clone().or(item.created_at.clone());
+
+                Some(
+                    SessionInfo::new(
+                        SessionId::new(session_meta_line.meta.id.to_string()),
+                        session_meta_line.meta.cwd.clone(),
+                    )
+                    .title(title)
+                    .updated_at(updated_at),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let next_cursor = page
+            .next_cursor
+            .as_ref()
+            .and_then(|next_cursor| serde_json::to_value(next_cursor).ok())
+            .and_then(|value| value.as_str().map(str::to_owned));
+
+        Ok(ListSessionsResponse::new(sessions).next_cursor(next_cursor))
+    }
+
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {
         info!("Processing prompt for session: {}", request.session_id);
         // Check before sending if authentication was successful or not
@@ -454,5 +538,36 @@ impl TryFrom<AuthMethodId> for CodexAuthMethod {
             "openai-api-key" => Ok(CodexAuthMethod::OpenAiApiKey),
             _ => Err(Error::invalid_params().data("unsupported authentication method")),
         }
+    }
+}
+
+fn truncate_graphemes(text: &str, max_graphemes: usize) -> String {
+    let mut graphemes = text.grapheme_indices(true);
+
+    if let Some((byte_index, _)) = graphemes.nth(max_graphemes) {
+        if max_graphemes >= 3 {
+            let mut truncate_graphemes = text.grapheme_indices(true);
+            if let Some((truncate_byte_index, _)) = truncate_graphemes.nth(max_graphemes - 3) {
+                let truncated = &text[..truncate_byte_index];
+                format!("{truncated}...")
+            } else {
+                text.to_string()
+            }
+        } else {
+            let truncated = &text[..byte_index];
+            truncated.to_string()
+        }
+    } else {
+        text.to_string()
+    }
+}
+
+fn format_session_title(message: &str) -> Option<String> {
+    let normalized = message.replace(['\r', '\n'], " ");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(truncate_graphemes(trimmed, SESSION_TITLE_MAX_GRAPHEMES))
     }
 }
