@@ -7,6 +7,8 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
+use codex_apply_patch::parse_patch;
+
 use agent_client_protocol::{
     Annotations, AudioContent, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
     BlobResourceContents, Client, ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock,
@@ -26,14 +28,16 @@ use codex_core::{
     config::{Config, set_project_trust_level},
     error::CodexErr,
     models_manager::manager::ModelsManager,
+    parse_command::parse_command,
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
-        AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ElicitationAction,
-        ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
-        ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExitedReviewModeEvent, FileChange,
-        ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation,
-        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
-        Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent,
+        AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent,
+        ApplyPatchApprovalRequestEvent, ElicitationAction, ErrorEvent, Event, EventMsg,
+        ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent,
+        ExecCommandOutputDeltaEvent, ExitedReviewModeEvent, FileChange, ItemCompletedEvent,
+        ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent,
+        McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, Op,
+        PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
         ReviewTarget, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent, TurnAbortedEvent,
         TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
@@ -46,9 +50,11 @@ use codex_protocol::{
     approvals::ElicitationRequestEvent,
     config_types::TrustLevel,
     custom_prompts::CustomPrompt,
+    models::ResponseItem,
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
+    protocol::RolloutItem,
     user_input::UserInput,
 };
 use heck::ToTitleCase;
@@ -57,6 +63,7 @@ use mcp_types::{CallToolResult, RequestId};
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::{
     ACP_CLIENT,
@@ -138,6 +145,10 @@ enum ThreadMessage {
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
     Cancel {
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
+    ReplayHistory {
+        history: Vec<RolloutItem>,
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
 }
@@ -259,6 +270,20 @@ impl Thread {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ThreadMessage::Cancel { response_tx };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
+    pub async fn replay_history(&self, history: Vec<RolloutItem>) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ThreadMessage::ReplayHistory {
+            history,
+            response_tx,
+        };
         drop(self.message_tx.send(message));
 
         response_rx
@@ -826,14 +851,14 @@ impl PromptState {
         let (title, locations, content) = extract_tool_call_content_from_changes(changes);
 
         client
-            .send_notification(SessionUpdate::ToolCall(
+            .send_tool_call(
                 ToolCall::new(call_id, title)
                     .kind(ToolKind::Edit)
                     .status(ToolCallStatus::InProgress)
                     .locations(locations)
                     .content(content.collect())
                     .raw_input(raw_input),
-            ))
+            )
             .await;
     }
 
@@ -856,7 +881,7 @@ impl PromptState {
         };
 
         client
-            .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            .send_tool_call_update(ToolCallUpdate::new(
                 call_id,
                 ToolCallUpdateFields::new()
                     .status(if success {
@@ -868,7 +893,7 @@ impl PromptState {
                     .title(title)
                     .locations(locations)
                     .content(content),
-            )))
+            ))
             .await;
     }
 
@@ -880,11 +905,11 @@ impl PromptState {
     ) {
         let title = format!("Tool: {}/{}", invocation.server, invocation.tool);
         client
-            .send_notification(SessionUpdate::ToolCall(
+            .send_tool_call(
                 ToolCall::new(call_id, title)
                     .status(ToolCallStatus::InProgress)
                     .raw_input(serde_json::json!(&invocation)),
-            ))
+            )
             .await;
     }
 
@@ -904,7 +929,7 @@ impl PromptState {
         };
 
         client
-            .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            .send_tool_call_update(ToolCallUpdate::new(
                 call_id,
                 ToolCallUpdateFields::new()
                     .status(if is_error {
@@ -922,7 +947,7 @@ impl PromptState {
                                 .collect()
                         },
                     )),
-            )))
+            ))
             .await;
     }
 
@@ -1077,7 +1102,7 @@ impl PromptState {
         self.active_command = Some(active_command);
 
         client
-            .send_notification(SessionUpdate::ToolCall(
+            .send_tool_call(
                 ToolCall::new(tool_call_id, title)
                     .kind(kind)
                     .status(ToolCallStatus::InProgress)
@@ -1085,7 +1110,7 @@ impl PromptState {
                     .raw_input(raw_input)
                     .content(content)
                     .meta(meta),
-            ))
+            )
             .await;
     }
 
@@ -1136,9 +1161,7 @@ impl PromptState {
                 )
             };
 
-            client
-                .send_notification(SessionUpdate::ToolCallUpdate(update))
-                .await;
+            client.send_tool_call_update(update).await;
         }
     }
 
@@ -1166,7 +1189,7 @@ impl PromptState {
             let is_success = exit_code == 0;
 
             client
-                .send_notification(SessionUpdate::ToolCallUpdate(
+                .send_tool_call_update(
                     ToolCallUpdate::new(
                         active_command.tool_call_id.clone(),
                         ToolCallUpdateFields::new()
@@ -1189,7 +1212,7 @@ impl PromptState {
                             )])
                         }),
                     ),
-                ))
+                )
                 .await;
         }
     }
@@ -1241,18 +1264,14 @@ impl PromptState {
                 )
             };
 
-            client
-                .send_notification(SessionUpdate::ToolCallUpdate(update))
-                .await;
+            client.send_tool_call_update(update).await;
         }
     }
 
     async fn start_web_search(&mut self, client: &SessionClient, call_id: String) {
         self.active_web_search = Some(call_id.clone());
         client
-            .send_notification(SessionUpdate::ToolCall(
-                ToolCall::new(call_id, "Searching the Web").kind(ToolKind::Fetch),
-            ))
+            .send_tool_call(ToolCall::new(call_id, "Searching the Web").kind(ToolKind::Fetch))
             .await;
     }
 
@@ -1263,7 +1282,7 @@ impl PromptState {
         query: String,
     ) {
         client
-            .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            .send_tool_call_update(ToolCallUpdate::new(
                 call_id,
                 ToolCallUpdateFields::new()
                     .status(ToolCallStatus::InProgress)
@@ -1271,17 +1290,17 @@ impl PromptState {
                     .raw_input(serde_json::json!({
                         "query": query
                     })),
-            )))
+            ))
             .await;
     }
 
     async fn complete_web_search(&mut self, client: &SessionClient) {
         if let Some(call_id) = self.active_web_search.take() {
             client
-                .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                .send_tool_call_update(ToolCallUpdate::new(
                     call_id,
                     ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
-                )))
+                ))
                 .await;
         }
     }
@@ -1556,6 +1575,13 @@ impl SessionClient {
         }
     }
 
+    async fn send_user_message(&self, text: impl Into<String>) {
+        self.send_notification(SessionUpdate::UserMessageChunk(ContentChunk::new(
+            text.into().into(),
+        )))
+        .await;
+    }
+
     async fn send_agent_text(&self, text: impl Into<String>) {
         self.send_notification(SessionUpdate::AgentMessageChunk(ContentChunk::new(
             text.into().into(),
@@ -1568,6 +1594,47 @@ impl SessionClient {
             text.into().into(),
         )))
         .await;
+    }
+
+    async fn send_tool_call(&self, tool_call: ToolCall) {
+        self.send_notification(SessionUpdate::ToolCall(tool_call))
+            .await;
+    }
+
+    async fn send_tool_call_update(&self, update: ToolCallUpdate) {
+        self.send_notification(SessionUpdate::ToolCallUpdate(update))
+            .await;
+    }
+
+    /// Send a completed tool call (used for replay and simple cases)
+    async fn send_completed_tool_call(
+        &self,
+        call_id: impl Into<ToolCallId>,
+        title: impl Into<String>,
+        kind: ToolKind,
+        raw_input: Option<serde_json::Value>,
+    ) {
+        let mut tool_call = ToolCall::new(call_id, title)
+            .kind(kind)
+            .status(ToolCallStatus::Completed);
+        if let Some(input) = raw_input {
+            tool_call = tool_call.raw_input(input);
+        }
+        self.send_tool_call(tool_call).await;
+    }
+
+    /// Send a tool call completion update (used for replay)
+    async fn send_tool_call_completed(
+        &self,
+        call_id: impl Into<ToolCallId>,
+        raw_output: Option<serde_json::Value>,
+    ) {
+        let mut fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
+        if let Some(output) = raw_output {
+            fields = fields.raw_output(output);
+        }
+        self.send_tool_call_update(ToolCallUpdate::new(call_id, fields))
+            .await;
     }
 
     async fn update_plan(&self, plan: Vec<PlanItemArg>) {
@@ -1747,6 +1814,13 @@ impl<A: Auth> ThreadActor<A> {
             }
             ThreadMessage::Cancel { response_tx } => {
                 let result = self.handle_cancel().await;
+                drop(response_tx.send(result));
+            }
+            ThreadMessage::ReplayHistory {
+                history,
+                response_tx,
+            } => {
+                let result = self.handle_replay_history(history).await;
                 drop(response_tx.send(result));
             }
         }
@@ -2318,6 +2392,329 @@ impl<A: Auth> ThreadActor<A> {
         Ok(())
     }
 
+    /// Replay conversation history to the client via session/update notifications.
+    /// This is called when loading a session to stream all prior messages.
+    ///
+    /// We process both `EventMsg` and `ResponseItem`:
+    /// - `EventMsg` for user/agent messages and reasoning (like the TUI does)
+    /// - `ResponseItem` for tool calls only (not persisted as EventMsg)
+    async fn handle_replay_history(&mut self, history: Vec<RolloutItem>) -> Result<(), Error> {
+        for item in history {
+            match item {
+                RolloutItem::EventMsg(event_msg) => {
+                    self.replay_event_msg(&event_msg).await;
+                }
+                RolloutItem::ResponseItem(response_item) => {
+                    self.replay_response_item(&response_item).await;
+                }
+                // Skip SessionMeta, TurnContext, Compacted
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Convert and send an EventMsg as ACP notification(s) during replay.
+    /// Handles messages and reasoning - mirrors the live event handling in PromptState.
+    async fn replay_event_msg(&self, msg: &EventMsg) {
+        match msg {
+            EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
+                self.client.send_user_message(message.clone()).await;
+            }
+            EventMsg::AgentMessage(AgentMessageEvent { message }) => {
+                self.client.send_agent_text(message.clone()).await;
+            }
+            EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
+                self.client.send_agent_thought(text.clone()).await;
+            }
+            EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text }) => {
+                self.client.send_agent_thought(text.clone()).await;
+            }
+            // Skip other event types during replay - they either:
+            // - Are transient (deltas, turn lifecycle)
+            // - Don't have direct ACP equivalents
+            // - Are handled via ResponseItem instead
+            _ => {}
+        }
+    }
+
+    /// Parse apply_patch call input to extract patch content for display.
+    /// Returns (title, locations, content) if successful.
+    /// For CustomToolCall, the input is the patch string directly.
+    fn parse_apply_patch_call(
+        &self,
+        input: &str,
+    ) -> Option<(String, Vec<ToolCallLocation>, Vec<ToolCallContent>)> {
+        // Try to parse the patch using codex-apply-patch parser
+        let parsed = parse_patch(input).ok()?;
+
+        let mut locations = Vec::new();
+        let mut file_names = Vec::new();
+        let mut content = Vec::new();
+
+        for hunk in &parsed.hunks {
+            match hunk {
+                codex_apply_patch::Hunk::AddFile { path, contents } => {
+                    let full_path = self.config.cwd.join(path);
+                    file_names.push(path.display().to_string());
+                    locations.push(ToolCallLocation::new(full_path.clone()));
+                    // New file: no old_text, new_text is the contents
+                    content.push(ToolCallContent::Diff(Diff::new(
+                        full_path,
+                        contents.clone(),
+                    )));
+                }
+                codex_apply_patch::Hunk::DeleteFile { path } => {
+                    let full_path = self.config.cwd.join(path);
+                    file_names.push(path.display().to_string());
+                    locations.push(ToolCallLocation::new(full_path.clone()));
+                    // Delete file: old_text would be original content, new_text is empty
+                    content.push(ToolCallContent::Diff(
+                        Diff::new(full_path, "").old_text("[file deleted]"),
+                    ));
+                }
+                codex_apply_patch::Hunk::UpdateFile {
+                    path,
+                    move_path,
+                    chunks,
+                } => {
+                    let full_path = self.config.cwd.join(path);
+                    let dest_path = move_path
+                        .as_ref()
+                        .map(|p| self.config.cwd.join(p))
+                        .unwrap_or_else(|| full_path.clone());
+                    file_names.push(path.display().to_string());
+                    locations.push(ToolCallLocation::new(dest_path.clone()));
+
+                    // Build old and new text from chunks
+                    let old_lines: Vec<String> = chunks
+                        .iter()
+                        .flat_map(|c| c.old_lines.iter().cloned())
+                        .collect();
+                    let new_lines: Vec<String> = chunks
+                        .iter()
+                        .flat_map(|c| c.new_lines.iter().cloned())
+                        .collect();
+
+                    content.push(ToolCallContent::Diff(
+                        Diff::new(dest_path, new_lines.join("\n")).old_text(old_lines.join("\n")),
+                    ));
+                }
+            }
+        }
+
+        let title = if file_names.is_empty() {
+            "Apply patch".to_string()
+        } else {
+            format!("Edit {}", file_names.join(", "))
+        };
+
+        Some((title, locations, content))
+    }
+
+    /// Parse shell function call arguments to extract command info for rich display.
+    /// Returns (title, kind, locations) if successful.
+    ///
+    /// Handles both:
+    /// - `shell` / `container.exec`: `command` is `Vec<String>`
+    /// - `shell_command`: `command` is a `String` (shell script)
+    fn parse_shell_function_call(
+        &self,
+        name: &str,
+        arguments: &str,
+    ) -> Option<(String, ToolKind, Vec<ToolCallLocation>)> {
+        // Extract command and workdir based on tool type
+        let (command_vec, workdir): (Vec<String>, Option<String>) = if name == "shell_command" {
+            // shell_command: command is a string (shell script)
+            #[derive(serde::Deserialize)]
+            struct ShellCommandArgs {
+                command: String,
+                #[serde(default)]
+                workdir: Option<String>,
+            }
+            let args: ShellCommandArgs = serde_json::from_str(arguments).ok()?;
+            // Wrap in bash -lc for parsing
+            (
+                vec!["bash".to_string(), "-lc".to_string(), args.command],
+                args.workdir,
+            )
+        } else {
+            // shell / container.exec: command is Vec<String>
+            #[derive(serde::Deserialize)]
+            struct ShellArgs {
+                command: Vec<String>,
+                #[serde(default)]
+                workdir: Option<String>,
+            }
+            let args: ShellArgs = serde_json::from_str(arguments).ok()?;
+            (args.command, args.workdir)
+        };
+
+        let cwd = workdir
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.config.cwd.clone());
+
+        let parsed_cmd = parse_command(&command_vec);
+        let ParseCommandToolCall {
+            title,
+            file_extension: _,
+            terminal_output: _,
+            locations,
+            kind,
+        } = parse_command_tool_call(parsed_cmd, &cwd);
+
+        Some((title, kind, locations))
+    }
+
+    /// Convert and send a single ResponseItem as ACP notification(s) during replay.
+    /// Only handles tool calls - messages/reasoning are handled via EventMsg.
+    async fn replay_response_item(&self, item: &ResponseItem) {
+        match item {
+            // Skip Message and Reasoning - these are handled via EventMsg
+            ResponseItem::Message { .. } | ResponseItem::Reasoning { .. } => {}
+            ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            } => {
+                // Check if this is a shell command - parse it like we do for LocalShellCall
+                if matches!(name.as_str(), "shell" | "container.exec" | "shell_command")
+                    && let Some((title, kind, locations)) =
+                        self.parse_shell_function_call(name, arguments)
+                {
+                    self.client
+                        .send_tool_call(
+                            ToolCall::new(call_id.clone(), title)
+                                .kind(kind)
+                                .status(ToolCallStatus::Completed)
+                                .locations(locations)
+                                .raw_input(
+                                    serde_json::from_str::<serde_json::Value>(arguments).ok(),
+                                ),
+                        )
+                        .await;
+                    return;
+                }
+
+                // Fall through to generic function call handling
+                self.client
+                    .send_completed_tool_call(
+                        call_id.clone(),
+                        name.clone(),
+                        ToolKind::Other,
+                        serde_json::from_str(arguments).ok(),
+                    )
+                    .await;
+            }
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                self.client
+                    .send_tool_call_completed(
+                        call_id.clone(),
+                        serde_json::to_value(&output.content).ok(),
+                    )
+                    .await;
+            }
+            ResponseItem::LocalShellCall {
+                call_id: Some(call_id),
+                action,
+                status,
+                ..
+            } => {
+                let codex_protocol::models::LocalShellAction::Exec(exec) = action;
+                let cwd = exec
+                    .working_directory
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| self.config.cwd.clone());
+
+                // Parse the command to get rich info like the live event handler does
+                let parsed_cmd = parse_command(&exec.command);
+                let ParseCommandToolCall {
+                    title,
+                    file_extension: _,
+                    terminal_output: _,
+                    locations,
+                    kind,
+                } = parse_command_tool_call(parsed_cmd, &cwd);
+
+                let tool_status = match status {
+                    codex_protocol::models::LocalShellStatus::Completed => {
+                        ToolCallStatus::Completed
+                    }
+                    codex_protocol::models::LocalShellStatus::InProgress
+                    | codex_protocol::models::LocalShellStatus::Incomplete => {
+                        ToolCallStatus::Failed
+                    }
+                };
+                self.client
+                    .send_tool_call(
+                        ToolCall::new(call_id.clone(), title)
+                            .kind(kind)
+                            .status(tool_status)
+                            .locations(locations),
+                    )
+                    .await;
+            }
+            ResponseItem::CustomToolCall {
+                name,
+                input,
+                call_id,
+                ..
+            } => {
+                // Check if this is an apply_patch call - show the patch content
+                if name == "apply_patch"
+                    && let Some((title, locations, content)) = self.parse_apply_patch_call(input)
+                {
+                    self.client
+                        .send_tool_call(
+                            ToolCall::new(call_id.clone(), title)
+                                .kind(ToolKind::Edit)
+                                .status(ToolCallStatus::Completed)
+                                .locations(locations)
+                                .content(content)
+                                .raw_input(serde_json::from_str::<serde_json::Value>(input).ok()),
+                        )
+                        .await;
+                    return;
+                }
+
+                // Fall through to generic custom tool call handling
+                self.client
+                    .send_completed_tool_call(
+                        call_id.clone(),
+                        name.clone(),
+                        ToolKind::Other,
+                        serde_json::from_str(input).ok(),
+                    )
+                    .await;
+            }
+            ResponseItem::CustomToolCallOutput { call_id, output } => {
+                self.client
+                    .send_tool_call_completed(
+                        call_id.clone(),
+                        Some(serde_json::Value::String(output.clone())),
+                    )
+                    .await;
+            }
+            ResponseItem::WebSearchCall { id, action, .. } => {
+                let (title, call_id) = web_search_action_to_title_and_id(id, action);
+                let Some(call_id) = call_id else {
+                    return; // Skip unknown web search actions
+                };
+                self.client
+                    .send_tool_call(
+                        ToolCall::new(call_id, title)
+                            .kind(ToolKind::Search)
+                            .status(ToolCallStatus::Completed),
+                    )
+                    .await;
+            }
+            // Skip GhostSnapshot, Compaction, Other, LocalShellCall without call_id
+            _ => {}
+        }
+    }
+
     async fn handle_event(&mut self, Event { id, msg }: Event) {
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
@@ -2496,6 +2893,44 @@ fn extract_tool_call_content_from_changes(
             })
         }),
     )
+}
+
+/// Extract title and call_id from a WebSearchAction (used for replay)
+fn web_search_action_to_title_and_id(
+    id: &Option<String>,
+    action: &codex_protocol::models::WebSearchAction,
+) -> (String, Option<String>) {
+    match action {
+        codex_protocol::models::WebSearchAction::Search { query } => {
+            let title = query.clone().unwrap_or_else(|| "Web search".to_string());
+            let call_id = id
+                .clone()
+                .or_else(|| Some(generate_fallback_id("web_search")));
+            (title, call_id)
+        }
+        codex_protocol::models::WebSearchAction::OpenPage { url } => {
+            let title = url.clone().unwrap_or_else(|| "Open page".to_string());
+            let call_id = id
+                .clone()
+                .or_else(|| Some(generate_fallback_id("web_open")));
+            (title, call_id)
+        }
+        codex_protocol::models::WebSearchAction::FindInPage { pattern, .. } => {
+            let title = pattern
+                .clone()
+                .unwrap_or_else(|| "Find in page".to_string());
+            let call_id = id
+                .clone()
+                .or_else(|| Some(generate_fallback_id("web_find")));
+            (title, call_id)
+        }
+        codex_protocol::models::WebSearchAction::Other => ("Unknown".to_string(), None),
+    }
+}
+
+/// Generate a fallback ID using UUID (used when id is missing)
+fn generate_fallback_id(prefix: &str) -> String {
+    format!("{}_{}", prefix, Uuid::new_v4())
 }
 
 /// Checks if a prompt is slash command
