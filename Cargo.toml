@@ -49,3 +49,6 @@ codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp", 
 let-underscore = "warn"
 rust-2018-idioms = "warn"
 unused = "warn"
+
+[patch.crates-io]
+tokio-tungstenite = { git = "https://github.com/JakkuSakura/tokio-tungstenite", rev = "2ae536b0de793f3ddf31fc2f22d445bf1ef2023d" }

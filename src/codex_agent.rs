@@ -9,7 +9,7 @@ use agent_client_protocol::{
     SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
 use codex_core::{
-    NewThread, ResponseItem, RolloutRecorder, ThreadManager,
+    NewThread, ResponseItem, RolloutRecorder, ThreadManager, ThreadSortKey,
     auth::{AuthManager, read_codex_api_key_from_env, read_openai_api_key_from_env},
     config::{
         Config,
@@ -117,12 +117,17 @@ impl CodexAgent {
 
     /// Build a session config from base config, working directory, and MCP servers.
     /// This is shared between `new_session` and `load_session`.
-    fn build_session_config(&self, cwd: &PathBuf, mcp_servers: Vec<McpServer>) -> Config {
+    fn build_session_config(
+        &self,
+        cwd: &PathBuf,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<Config, Error> {
         let mut config = self.config.clone();
         config.include_apply_patch_tool = true;
         config.cwd.clone_from(cwd);
 
         // Propagate any client-provided MCP servers that codex-rs supports.
+        let mut new_mcp_servers = config.mcp_servers.get().clone();
         for mcp_server in mcp_servers {
             match mcp_server {
                 // Not supported in codex
@@ -130,7 +135,7 @@ impl CodexAgent {
                 McpServer::Http(McpServerHttp {
                     name, url, headers, ..
                 }) => {
-                    config.mcp_servers.insert(
+                    new_mcp_servers.insert(
                         name,
                         McpServerConfig {
                             transport: McpServerTransportConfig::StreamableHttp {
@@ -148,6 +153,7 @@ impl CodexAgent {
                             tool_timeout_sec: None,
                             disabled_tools: None,
                             enabled_tools: None,
+                            disabled_reason: None,
                         },
                     );
                 }
@@ -158,7 +164,7 @@ impl CodexAgent {
                     env,
                     ..
                 }) => {
-                    config.mcp_servers.insert(
+                    new_mcp_servers.insert(
                         name,
                         McpServerConfig {
                             transport: McpServerTransportConfig::Stdio {
@@ -177,6 +183,7 @@ impl CodexAgent {
                             tool_timeout_sec: None,
                             disabled_tools: None,
                             enabled_tools: None,
+                            disabled_reason: None,
                         },
                     );
                 }
@@ -185,6 +192,11 @@ impl CodexAgent {
         }
 
         config
+            .mcp_servers
+            .set(new_mcp_servers)
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        Ok(config)
     }
 }
 
@@ -304,7 +316,7 @@ impl Agent for CodexAgent {
         } = request;
         info!("Creating new session with cwd: {}", cwd.display());
 
-        let config = self.build_session_config(&cwd, mcp_servers);
+        let config = self.build_session_config(&cwd, mcp_servers)?;
         let num_mcp_servers = config.mcp_servers.len();
 
         let NewThread {
@@ -374,7 +386,7 @@ impl Agent for CodexAgent {
             InitialHistory::New => Vec::new(),
         };
 
-        let config = self.build_session_config(&cwd, mcp_servers);
+        let config = self.build_session_config(&cwd, mcp_servers)?;
 
         let NewThread {
             thread_id: _,
@@ -426,6 +438,7 @@ impl Agent for CodexAgent {
             &self.config.codex_home,
             SESSION_LIST_PAGE_SIZE,
             cursor_obj.as_ref(),
+            ThreadSortKey::UpdatedAt,
             &[
                 SessionSource::Cli,
                 SessionSource::VSCode,
