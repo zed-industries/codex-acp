@@ -5733,7 +5733,7 @@ dependencies = [
 [[package]]
 name = "tungstenite"
 version = "0.28.0"
-source = "git+ssh://git@github.com/JakkuSakura/tungstenite-rs.git?branch=proxy-support#f514de8644821113e5d18a027d6d28a5c8cc0a6e"
+source = "git+https://github.com/JakkuSakura/tungstenite-rs?branch=proxy-support#f514de8644821113e5d18a027d6d28a5c8cc0a6e"
 dependencies = [
  "bytes",
  "data-encoding",
