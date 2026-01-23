@@ -5403,7 +5403,7 @@ dependencies = [
 [[package]]
 name = "tokio-tungstenite"
 version = "0.28.0"
-source = "git+https://github.com/JakkuSakura/tokio-tungstenite?rev=2ae536b0de793f3ddf31fc2f22d445bf1ef2023d#2ae536b0de793f3ddf31fc2f22d445bf1ef2023d"
+source = "git+https://github.com/JakkuSakura/tokio-tungstenite?branch=proxy-support#2ae536b0de793f3ddf31fc2f22d445bf1ef2023d"
 dependencies = [
  "futures-util",
  "log",
