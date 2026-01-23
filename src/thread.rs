@@ -27,7 +27,7 @@ use codex_core::{
     AuthManager, CodexThread,
     config::{Config, set_project_trust_level},
     error::CodexErr,
-    models_manager::manager::ModelsManager,
+    models_manager::manager::{ModelsManager, RefreshStrategy},
     parse_command::parse_command,
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
@@ -100,11 +100,13 @@ pub trait ModelsManagerImpl {
 #[async_trait::async_trait]
 impl ModelsManagerImpl for ModelsManager {
     async fn get_model(&self, model_id: &Option<String>, config: &Config) -> String {
-        self.get_model(model_id, config).await
+        self.get_default_model(model_id, config, RefreshStrategy::OnlineIfUncached)
+            .await
     }
 
     async fn list_models(&self, config: &Config) -> Vec<ModelPreset> {
-        self.list_models(config).await
+        self.list_models(config, RefreshStrategy::OnlineIfUncached)
+            .await
     }
 }
 
@@ -442,6 +444,8 @@ impl PromptState {
             EventMsg::UserMessage(UserMessageEvent {
                 message,
                 images: _,
+                text_elements: _,
+                local_images: _,
             }) => {
                 info!("User message: {message:?}");
             }
@@ -654,9 +658,16 @@ impl PromptState {
             // Old events
             | EventMsg::AgentMessageDelta(..) | EventMsg::AgentReasoningDelta(..) | EventMsg::AgentReasoningRawContentDelta(..)
             | EventMsg::RawResponseItem(..)
-            | EventMsg::SessionConfigured(..) => {}
-
-            // Unexpected events for this submission
+            | EventMsg::SessionConfigured(..)
+            // TODO: Subagent UI?
+            | EventMsg::CollabAgentSpawnBegin(..)
+            | EventMsg::CollabAgentSpawnEnd(..)
+            | EventMsg::CollabAgentInteractionBegin(..)
+            | EventMsg::CollabAgentInteractionEnd(..)
+            | EventMsg::CollabWaitingBegin(..)
+            | EventMsg::CollabWaitingEnd(..)
+            | EventMsg::CollabCloseBegin(..)
+            | EventMsg::CollabCloseEnd(..) => {},
             e @ (EventMsg::McpListToolsResponse(..)
             // returned from Op::ListCustomPrompts, ignore
             | EventMsg::ListCustomPromptsResponse(..)
@@ -664,6 +675,7 @@ impl PromptState {
             // Used for returning a single history entry
             | EventMsg::GetHistoryEntryResponse(..)
             | EventMsg::DeprecationNotice(..)
+            |  EventMsg::RequestUserInput(..)
             ) => {
                 warn!("Unexpected event: {:?}", e);
             }
@@ -1489,7 +1501,16 @@ impl TaskState {
             | EventMsg::RawResponseItem(..)
             | EventMsg::BackgroundEvent(..)
             | EventMsg::SkillsUpdateAvailable
-            | EventMsg::ContextCompacted(..) => {}
+            | EventMsg::ContextCompacted(..)
+            // TODO: Subagent UI?
+            | EventMsg::CollabAgentSpawnBegin(..)
+            | EventMsg::CollabAgentSpawnEnd(..)
+            | EventMsg::CollabAgentInteractionBegin(..)
+            | EventMsg::CollabAgentInteractionEnd(..)
+            | EventMsg::CollabWaitingBegin(..)
+            | EventMsg::CollabWaitingEnd(..)
+            | EventMsg::CollabCloseBegin(..)
+            | EventMsg::CollabCloseEnd(..) => {}
             // Unexpected events for this submission
             e @ (EventMsg::UserMessage(..)
             | EventMsg::SessionConfigured(..)
@@ -1515,7 +1536,8 @@ impl TaskState {
             | EventMsg::EnteredReviewMode(..)
             | EventMsg::ExitedReviewMode(..)
             | EventMsg::DeprecationNotice(..)
-            | EventMsg::ElicitationRequest(..)) => {
+            | EventMsg::ElicitationRequest(..)
+            | EventMsg::RequestUserInput(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
@@ -2096,6 +2118,7 @@ impl<A: Auth> ThreadActor<A> {
                 model: Some(model_to_use.clone()),
                 effort: Some(effort_to_use),
                 summary: None,
+                collaboration_mode: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2138,6 +2161,7 @@ impl<A: Auth> ThreadActor<A> {
                 model: None,
                 effort: Some(Some(effort)),
                 summary: None,
+                collaboration_mode: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2203,6 +2227,7 @@ impl<A: Auth> ThreadActor<A> {
                     op = Op::UserInput {
                         items: vec![UserInput::Text {
                             text: INIT_COMMAND_PROMPT.into(),
+                            text_elements: vec![],
                         }],
                         final_output_json_schema: None,
                     }
@@ -2257,7 +2282,10 @@ impl<A: Auth> ThreadActor<A> {
                             .map_err(|e| Error::invalid_params().data(e.user_message()))?
                     {
                         op = Op::UserInput {
-                            items: vec![UserInput::Text { text: prompt }],
+                            items: vec![UserInput::Text {
+                                text: prompt,
+                                text_elements: vec![],
+                            }],
                             final_output_json_schema: None,
                         }
                     } else {
@@ -2312,6 +2340,7 @@ impl<A: Auth> ThreadActor<A> {
                 model: None,
                 effort: None,
                 summary: None,
+                collaboration_mode: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2374,6 +2403,7 @@ impl<A: Auth> ThreadActor<A> {
                 model: Some(model_to_use.clone()),
                 effort: Some(effort_to_use),
                 summary: None,
+                collaboration_mode: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2730,12 +2760,14 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<UserInput> {
         .filter_map(|block| match block {
             ContentBlock::Text(text_block) => Some(UserInput::Text {
                 text: text_block.text,
+                text_elements: vec![],
             }),
             ContentBlock::Image(image_block) => Some(UserInput::Image {
                 image_url: format!("data:{};base64,{}", image_block.mime_type, image_block.data),
             }),
             ContentBlock::ResourceLink(ResourceLink { name, uri, .. }) => Some(UserInput::Text {
                 text: format_uri_as_link(Some(name), uri),
+                text_elements: vec![],
             }),
             ContentBlock::Resource(EmbeddedResource {
                 resource:
@@ -2750,6 +2782,7 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<UserInput> {
                     "{}\n<context ref=\"{uri}\">\n{text}\n</context>",
                     format_uri_as_link(None, uri.clone())
                 ),
+                text_elements: vec![],
             }),
             // Skip other content types for now
             ContentBlock::Audio(..) | ContentBlock::Resource(..) | _ => None,
@@ -3121,7 +3154,8 @@ mod tests {
             ops.as_slice(),
             &[Op::UserInput {
                 items: vec![UserInput::Text {
-                    text: INIT_COMMAND_PROMPT.to_string()
+                    text: INIT_COMMAND_PROMPT.to_string(),
+                    text_elements: vec![]
                 }],
                 final_output_json_schema: None,
             }],
@@ -3401,7 +3435,8 @@ mod tests {
             ops.as_slice(),
             &[Op::UserInput {
                 items: vec![UserInput::Text {
-                    text: "Custom prompt with foo arg.".into()
+                    text: "Custom prompt with foo arg.".into(),
+                    text_elements: vec![]
                 }],
                 final_output_json_schema: None,
             }],
@@ -3543,7 +3578,7 @@ mod tests {
                     let prompt = items
                         .into_iter()
                         .map(|i| match i {
-                            UserInput::Text { text } => text,
+                            UserInput::Text { text, .. } => text,
                             _ => unimplemented!(),
                         })
                         .join("\n");
