@@ -23,11 +23,13 @@ async-trait = "0.1"
 clap = "4"
 codex-apply-patch = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-arg0 = { git = "https://github.com/zed-industries/codex", branch = "acp" }
-codex-common = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["cli"] }
+codex-common = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["cli", "sandbox_summary"] }
 codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp" }
+codex-backend-client = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-mcp-server = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-protocol = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-login = { git = "https://github.com/zed-industries/codex", branch = "acp" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 itertools = "0.14.0"
 mcp-types = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 regex-lite = "0.1"

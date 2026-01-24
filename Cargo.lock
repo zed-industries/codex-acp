@@ -709,9 +709,11 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "async-trait",
+ "chrono",
  "clap",
  "codex-apply-patch",
  "codex-arg0",
+ "codex-backend-client",
  "codex-common",
  "codex-core",
  "codex-login",
@@ -808,6 +810,30 @@ dependencies = [
  "async-trait",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "codex-backend-client"
+version = "0.0.0"
+source = "git+https://github.com/zed-industries/codex?branch=acp#0ac8e6eb5e19c044331c0a051df32dc0587485c9"
+dependencies = [
+ "anyhow",
+ "codex-backend-openapi-models",
+ "codex-core",
+ "codex-protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "codex-backend-openapi-models"
+version = "0.0.0"
+source = "git+https://github.com/zed-industries/codex?branch=acp#0ac8e6eb5e19c044331c0a051df32dc0587485c9"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serde_with",
 ]
 
 [[package]]

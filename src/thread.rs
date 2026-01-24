@@ -22,7 +22,12 @@ use agent_client_protocol::{
     TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
     ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
-use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
+use chrono::{DateTime, Local, TimeZone};
+use codex_backend_client::Client as BackendClient;
+use codex_common::{
+    approval_presets::{ApprovalPreset, builtin_approval_presets},
+    summarize_sandbox_policy,
+};
 use codex_core::{
     AuthManager, CodexThread,
     config::{Config, set_project_trust_level},
@@ -45,7 +50,9 @@ use codex_core::{
     },
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
+    CodexAuth,
 };
+use codex_login::AuthMode;
 use codex_protocol::{
     approvals::ElicitationRequestEvent,
     config_types::TrustLevel,
@@ -54,7 +61,7 @@ use codex_protocol::{
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
-    protocol::RolloutItem,
+    protocol::{RateLimitSnapshot, RateLimitWindow, RolloutItem, TokenUsage, TokenUsageInfo},
     user_input::UserInput,
 };
 use heck::ToTitleCase;
@@ -112,6 +119,9 @@ impl ModelsManagerImpl for ModelsManager {
 
 pub trait Auth {
     fn logout(&self) -> Result<bool, Error>;
+    fn auth_cached(&self) -> Option<CodexAuth> {
+        None
+    }
 }
 
 impl Auth for Arc<AuthManager> {
@@ -119,6 +129,10 @@ impl Auth for Arc<AuthManager> {
         self.as_ref()
             .logout()
             .map_err(|e| Error::internal_error().data(e.to_string()))
+    }
+
+    fn auth_cached(&self) -> Option<CodexAuth> {
+        self.as_ref().auth_cached()
     }
 }
 
@@ -1560,6 +1574,10 @@ impl SessionClient {
         }
     }
 
+    fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
     #[cfg(test)]
     fn with_client(
         session_id: SessionId,
@@ -1708,6 +1726,8 @@ struct ThreadActor<A> {
     models_manager: Arc<dyn ModelsManagerImpl>,
     /// A sender for each interested `Op` submission that needs events routed.
     submissions: HashMap<String, SubmissionState>,
+    /// Latest token usage info from the session, if available.
+    last_token_info: Option<TokenUsageInfo>,
     /// A receiver for incoming thread messages.
     message_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     /// Last config options state we emitted to the client, used for deduping updates.
@@ -1731,6 +1751,7 @@ impl<A: Auth> ThreadActor<A> {
             custom_prompts: Rc::default(),
             models_manager,
             submissions: HashMap::new(),
+            last_token_info: None,
             message_rx,
             last_sent_config_options: None,
         }
@@ -1877,6 +1898,8 @@ impl<A: Auth> ThreadActor<A> {
                 "compact",
                 "summarize conversation to prevent hitting the context limit",
             ),
+            AvailableCommand::new("status", "show current session status"),
+            AvailableCommand::new("context", "show remaining context for this session"),
             AvailableCommand::new("undo", "undo Codex’s most recent turn"),
             AvailableCommand::new("logout", "logout of Codex"),
         ]
@@ -2220,6 +2243,18 @@ impl<A: Auth> ThreadActor<A> {
         let items = build_prompt_items(request.prompt);
         let op;
         if let Some((name, rest)) = extract_slash_command(&items) {
+            if name == "status" && rest.trim().is_empty() {
+                let status_text = self.status_output().await;
+                self.client.send_agent_text(status_text).await;
+                drop(response_tx.send(Ok(StopReason::EndTurn)));
+                return Ok(response_rx);
+            }
+            if name == "context" && rest.trim().is_empty() {
+                let context_text = self.context_output();
+                self.client.send_agent_text(context_text).await;
+                drop(response_tx.send(Ok(StopReason::EndTurn)));
+                return Ok(response_rx);
+            }
             match name {
                 "compact" => op = Op::Compact,
                 "undo" => op = Op::Undo,
@@ -2324,6 +2359,70 @@ impl<A: Auth> ThreadActor<A> {
         self.submissions.insert(submission_id, state);
 
         Ok(response_rx)
+    }
+
+    async fn status_output(&self) -> String {
+        let model = self.get_current_model().await;
+        let approval = self.config.approval_policy.value().to_string();
+        let sandbox = summarize_sandbox_policy(self.config.sandbox_policy.get());
+        let cwd = self.config.cwd.display().to_string();
+        let codex_home = self.config.codex_home.display().to_string();
+        let agents_path = self.config.cwd.join("AGENTS.md");
+        let agents_display = if agents_path.is_file() {
+            "AGENTS.md".to_string()
+        } else {
+            "<missing>".to_string()
+        };
+        let session_id = self.client.session_id().to_string();
+        let version = env!("CARGO_PKG_VERSION");
+
+        let mut output = format!(
+            "OpenAI Codex ACP (v{version})\n\nModel: {model}\nDirectory: {cwd}\nCodex home: {codex_home}\nApproval: {approval}\nSandbox: {sandbox}\nAgents.md: {agents_display}\nSession: {session_id}"
+        );
+
+        let rate_limit_lines = self.rate_limit_lines().await;
+        if !rate_limit_lines.is_empty() {
+            output.push_str("\n\n");
+            output.push_str(&rate_limit_lines.join("\n"));
+        }
+
+        output
+    }
+
+    fn context_output(&self) -> String {
+        let token_info = self.last_token_info.as_ref();
+        let context_window = token_info
+            .and_then(|info| info.model_context_window)
+            .or(self.config.model_context_window);
+        let default_usage = TokenUsage::default();
+
+        let percent_left = context_window
+            .map(|window| {
+                let usage = token_info
+                    .map(|info| &info.last_token_usage)
+                    .unwrap_or(&default_usage);
+                usage.percent_of_context_window_remaining(window)
+            })
+            .unwrap_or(100);
+
+        format!("{percent_left}% context left")
+    }
+
+    async fn rate_limit_lines(&self) -> Vec<String> {
+        let now = Local::now();
+        self.fetch_rate_limits()
+            .await
+            .map(|snapshot| format_rate_limit_lines(&snapshot, now))
+            .unwrap_or_default()
+    }
+
+    async fn fetch_rate_limits(&self) -> Option<RateLimitSnapshot> {
+        let auth = self.auth.auth_cached()?;
+        if auth.mode != AuthMode::ChatGPT {
+            return None;
+        }
+        let client = BackendClient::from_auth(self.config.chatgpt_base_url.clone(), &auth).ok()?;
+        client.get_rate_limits().await.ok()
     }
 
     async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
@@ -2746,6 +2845,12 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_event(&mut self, Event { id, msg }: Event) {
+        if let EventMsg::TokenCount(event) = &msg {
+            if let Some(info) = event.info.clone() {
+                self.last_token_info = Some(info);
+            }
+        }
+
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
         } else {
@@ -2966,6 +3071,73 @@ fn generate_fallback_id(prefix: &str) -> String {
     format!("{}_{}", prefix, Uuid::new_v4())
 }
 
+fn format_rate_limit_lines(snapshot: &RateLimitSnapshot, now: DateTime<Local>) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(window) = snapshot.primary.as_ref() {
+        lines.push(format_rate_limit_line(
+            label_for_limit_window(window.window_minutes),
+            window,
+            now,
+        ));
+    }
+    if let Some(window) = snapshot.secondary.as_ref() {
+        lines.push(format_rate_limit_line(
+            label_for_limit_window(window.window_minutes),
+            window,
+            now,
+        ));
+    }
+    lines
+}
+
+fn label_for_limit_window(window_minutes: Option<i64>) -> &'static str {
+    match window_minutes {
+        Some(300) => "5h limit",
+        Some(10_080) => "Weekly limit",
+        Some(43_200) => "Monthly limit",
+        _ => "Limit",
+    }
+}
+
+fn format_rate_limit_line(
+    label: &str,
+    window: &RateLimitWindow,
+    now: DateTime<Local>,
+) -> String {
+    let percent_left = (100.0 - window.used_percent).round().clamp(0.0, 100.0) as i64;
+    let bar = render_limit_bar(percent_left, 20);
+    let reset_text = format_reset_time(window.resets_at, now);
+
+    format!("{label}: {bar} {percent_left}% left ({reset_text})")
+}
+
+fn render_limit_bar(percent_left: i64, width: usize) -> String {
+    let filled = ((percent_left as f64 / 100.0) * width as f64)
+        .round()
+        .clamp(0.0, width as f64) as usize;
+    let empty = width.saturating_sub(filled);
+    format!("[{}{}]", "=".repeat(filled), "-".repeat(empty))
+}
+
+fn format_reset_time(resets_at: Option<i64>, now: DateTime<Local>) -> String {
+    let Some(resets_at) = resets_at else {
+        return "resets unknown".to_string();
+    };
+    let Some(reset_dt) = Local.timestamp_opt(resets_at, 0).single() else {
+        return "resets unknown".to_string();
+    };
+
+    if reset_dt.date_naive() == now.date_naive() {
+        format!("resets {}", reset_dt.format("%H:%M"))
+    } else {
+        format!(
+            "resets {} on {}",
+            reset_dt.format("%H:%M"),
+            reset_dt.format("%-d %b")
+        )
+    }
+}
+
 /// Checks if a prompt is slash command
 fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
     let line = content.first().and_then(|block| match block {
@@ -3163,6 +3335,117 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_status() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/status".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        let status_text = match &notifications[0].update {
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) => text,
+            _ => panic!("unexpected notification: {:?}", notifications[0]),
+        };
+        assert!(status_text.contains("OpenAI Codex ACP"));
+        assert!(status_text.contains("Model: "));
+        assert!(status_text.contains("Directory: "));
+        assert!(status_text.contains("Approval: "));
+        assert!(status_text.contains("Sandbox: "));
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(ops.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_context_command() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/context".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        let context_text = match &notifications[0].update {
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) => text,
+            _ => panic!("unexpected notification: {:?}", notifications[0]),
+        };
+        assert!(context_text.contains("context left"));
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(ops.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_rate_limit_lines() {
+        let now = Local.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let snapshot = RateLimitSnapshot {
+            primary: Some(RateLimitWindow {
+                used_percent: 10.0,
+                window_minutes: Some(300),
+                resets_at: Some(1_700_000_000 + 3_600),
+            }),
+            secondary: Some(RateLimitWindow {
+                used_percent: 50.0,
+                window_minutes: Some(10_080),
+                resets_at: Some(1_700_000_000 + 7_200),
+            }),
+            credits: None,
+            plan_type: None,
+        };
+
+        let lines = format_rate_limit_lines(&snapshot, now);
+
+        assert!(lines.iter().any(|line| line.contains("5h limit")));
+        assert!(lines.iter().any(|line| line.contains("Weekly limit")));
+        assert!(lines.iter().any(|line| line.contains("90% left")));
+        assert!(lines.iter().any(|line| line.contains("50% left")));
+        assert!(lines.iter().all(|line| line.contains("resets")));
     }
 
     #[tokio::test]
