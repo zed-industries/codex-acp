@@ -676,6 +676,7 @@ impl PromptState {
             | EventMsg::GetHistoryEntryResponse(..)
             | EventMsg::DeprecationNotice(..)
             |  EventMsg::RequestUserInput(..)
+            | EventMsg::DynamicToolCallRequest(..)
             ) => {
                 warn!("Unexpected event: {:?}", e);
             }
@@ -1537,7 +1538,8 @@ impl TaskState {
             | EventMsg::ExitedReviewMode(..)
             | EventMsg::DeprecationNotice(..)
             | EventMsg::ElicitationRequest(..)
-            | EventMsg::RequestUserInput(..)) => {
+            | EventMsg::RequestUserInput(..)
+            | EventMsg::DynamicToolCallRequest(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
@@ -2119,6 +2121,7 @@ impl<A: Auth> ThreadActor<A> {
                 effort: Some(effort_to_use),
                 summary: None,
                 collaboration_mode: None,
+                personality: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2162,6 +2165,7 @@ impl<A: Auth> ThreadActor<A> {
                 effort: Some(Some(effort)),
                 summary: None,
                 collaboration_mode: None,
+                personality: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2341,6 +2345,7 @@ impl<A: Auth> ThreadActor<A> {
                 effort: None,
                 summary: None,
                 collaboration_mode: None,
+                personality: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2404,6 +2409,7 @@ impl<A: Auth> ThreadActor<A> {
                 effort: Some(effort_to_use),
                 summary: None,
                 collaboration_mode: None,
+                personality: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
