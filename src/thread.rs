@@ -17,10 +17,10 @@ use agent_client_protocol::{
     PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome,
     SessionConfigId, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
-    SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
-    TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
+    SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal,
+    TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
@@ -50,7 +50,7 @@ use codex_protocol::{
     approvals::ElicitationRequestEvent,
     config_types::TrustLevel,
     custom_prompts::CustomPrompt,
-    models::ResponseItem,
+    models::{ResponseItem, WebSearchAction},
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
@@ -434,8 +434,9 @@ impl PromptState {
         match event {
             EventMsg::TurnStarted(TurnStartedEvent {
                 model_context_window,
+                collaboration_mode_kind,
             }) => {
-                info!("Task started with context window of {model_context_window:?}");
+                info!("Task started with context window of {model_context_window:?} {collaboration_mode_kind:?}");
             }
             EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
 
@@ -480,6 +481,16 @@ impl PromptState {
                     client.send_agent_thought(text).await;
                 }
             }
+            EventMsg::ThreadNameUpdated(event) => {
+                info!("Thread name updated: {:?}", event.thread_name);
+                if let Some(title) = event.thread_name {
+                    client
+                        .send_notification(SessionUpdate::SessionInfoUpdate(
+                            SessionInfoUpdate::new().title(title),
+                        ))
+                        .await;
+                }
+            }
             EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
                 // Send this to the client via session/update notification
                 info!("Agent plan updated. Explanation: {:?}", explanation);
@@ -490,11 +501,11 @@ impl PromptState {
                 // Create a ToolCall notification for the search beginning
                 self.start_web_search(client, call_id).await;
             }
-            EventMsg::WebSearchEnd(WebSearchEndEvent { call_id, query }) => {
+            EventMsg::WebSearchEnd(WebSearchEndEvent { call_id, query, action }) => {
                 info!("Web search query received: call_id={call_id}, query={query}");
                 // Send update that the search is in progress with the query
                 // (WebSearchEnd just means we have the query, not that results are ready)
-                self.update_web_search_query(client, call_id, query).await;
+                self.update_web_search_query(client, call_id, query, action).await;
                 // The actual search results will come through AgentMessage events
                 // We mark as completed when a new tool call begins
             }
@@ -667,7 +678,8 @@ impl PromptState {
             | EventMsg::CollabWaitingBegin(..)
             | EventMsg::CollabWaitingEnd(..)
             | EventMsg::CollabCloseBegin(..)
-            | EventMsg::CollabCloseEnd(..) => {},
+            | EventMsg::CollabCloseEnd(..)
+            | EventMsg::PlanDelta(..)=> {},
             e @ (EventMsg::McpListToolsResponse(..)
             // returned from Op::ListCustomPrompts, ignore
             | EventMsg::ListCustomPromptsResponse(..)
@@ -1293,15 +1305,36 @@ impl PromptState {
         client: &SessionClient,
         call_id: String,
         query: String,
+        action: WebSearchAction,
     ) {
+        let title = match &action {
+            WebSearchAction::Search { query, queries } => queries
+                .as_ref()
+                .map(|q| format!("Searching for: {}", q.join(", ")))
+                .or_else(|| query.as_ref().map(|q| format!("Searching for: {q}")))
+                .unwrap_or_else(|| "Web search".to_string()),
+            WebSearchAction::OpenPage { url } => url
+                .as_ref()
+                .map(|u| format!("Opening: {u}"))
+                .unwrap_or_else(|| "Open page".to_string()),
+            WebSearchAction::FindInPage { pattern, url } => match (pattern, url) {
+                (Some(p), Some(u)) => format!("Finding: {p} in {u}"),
+                (Some(p), None) => format!("Finding: {p}"),
+                (None, Some(u)) => format!("Find in page: {u}"),
+                (None, None) => "Find in page".to_string(),
+            },
+            WebSearchAction::Other => "Web search".to_string(),
+        };
+
         client
             .send_tool_call_update(ToolCallUpdate::new(
                 call_id,
                 ToolCallUpdateFields::new()
                     .status(ToolCallStatus::InProgress)
-                    .title(format!("Searching for: {query}"))
+                    .title(title)
                     .raw_input(serde_json::json!({
-                        "query": query
+                        "query": query,
+                        "action": action
                     })),
             ))
             .await;
@@ -1503,6 +1536,7 @@ impl TaskState {
             | EventMsg::BackgroundEvent(..)
             | EventMsg::SkillsUpdateAvailable
             | EventMsg::ContextCompacted(..)
+            | EventMsg::ThreadNameUpdated(..)
             // TODO: Subagent UI?
             | EventMsg::CollabAgentSpawnBegin(..)
             | EventMsg::CollabAgentSpawnEnd(..)
@@ -1511,7 +1545,8 @@ impl TaskState {
             | EventMsg::CollabWaitingBegin(..)
             | EventMsg::CollabWaitingEnd(..)
             | EventMsg::CollabCloseBegin(..)
-            | EventMsg::CollabCloseEnd(..) => {}
+            | EventMsg::CollabCloseEnd(..)
+            | EventMsg::PlanDelta(..) => {}
             // Unexpected events for this submission
             e @ (EventMsg::UserMessage(..)
             | EventMsg::SessionConfigured(..)
@@ -2122,6 +2157,7 @@ impl<A: Auth> ThreadActor<A> {
                 summary: None,
                 collaboration_mode: None,
                 personality: None,
+                windows_sandbox_level: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2166,6 +2202,7 @@ impl<A: Auth> ThreadActor<A> {
                 summary: None,
                 collaboration_mode: None,
                 personality: None,
+                windows_sandbox_level: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2346,6 +2383,7 @@ impl<A: Auth> ThreadActor<A> {
                 summary: None,
                 collaboration_mode: None,
                 personality: None,
+                windows_sandbox_level: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2410,6 +2448,7 @@ impl<A: Auth> ThreadActor<A> {
                 summary: None,
                 collaboration_mode: None,
                 personality: None,
+                windows_sandbox_level: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2734,9 +2773,10 @@ impl<A: Auth> ThreadActor<A> {
                     .await;
             }
             ResponseItem::WebSearchCall { id, action, .. } => {
-                let (title, call_id) = web_search_action_to_title_and_id(id, action);
-                let Some(call_id) = call_id else {
-                    return; // Skip unknown web search actions
+                let (title, call_id) = if let Some(action) = action {
+                    web_search_action_to_title_and_id(id, action)
+                } else {
+                    ("Web Search".into(), generate_fallback_id("web_search"))
                 };
                 self.client
                     .send_tool_call(
@@ -2938,20 +2978,24 @@ fn extract_tool_call_content_from_changes(
 fn web_search_action_to_title_and_id(
     id: &Option<String>,
     action: &codex_protocol::models::WebSearchAction,
-) -> (String, Option<String>) {
+) -> (String, String) {
     match action {
-        codex_protocol::models::WebSearchAction::Search { query } => {
-            let title = query.clone().unwrap_or_else(|| "Web search".to_string());
+        codex_protocol::models::WebSearchAction::Search { query, queries } => {
+            let title = queries
+                .as_ref()
+                .map(|q| q.join(", "))
+                .or_else(|| query.clone())
+                .unwrap_or_else(|| "Web search".to_string());
             let call_id = id
                 .clone()
-                .or_else(|| Some(generate_fallback_id("web_search")));
+                .unwrap_or_else(|| generate_fallback_id("web_search"));
             (title, call_id)
         }
         codex_protocol::models::WebSearchAction::OpenPage { url } => {
             let title = url.clone().unwrap_or_else(|| "Open page".to_string());
             let call_id = id
                 .clone()
-                .or_else(|| Some(generate_fallback_id("web_open")));
+                .unwrap_or_else(|| generate_fallback_id("web_open"));
             (title, call_id)
         }
         codex_protocol::models::WebSearchAction::FindInPage { pattern, .. } => {
@@ -2960,10 +3004,12 @@ fn web_search_action_to_title_and_id(
                 .unwrap_or_else(|| "Find in page".to_string());
             let call_id = id
                 .clone()
-                .or_else(|| Some(generate_fallback_id("web_find")));
+                .unwrap_or_else(|| generate_fallback_id("web_find"));
             (title, call_id)
         }
-        codex_protocol::models::WebSearchAction::Other => ("Unknown".to_string(), None),
+        codex_protocol::models::WebSearchAction::Other => {
+            ("Unknown".to_string(), generate_fallback_id("web_search"))
+        }
     }
 }
 
@@ -2990,6 +3036,7 @@ mod tests {
         config::ConfigOverrides, models_manager::model_presets::all_model_presets,
         protocol::AgentMessageEvent,
     };
+    use codex_protocol::config_types::ModeKind;
     use tokio::{
         sync::{Mutex, mpsc::UnboundedSender},
         task::LocalSet,
@@ -3624,6 +3671,7 @@ mod tests {
                             id: id.to_string(),
                             msg: EventMsg::TurnStarted(TurnStartedEvent {
                                 model_context_window: None,
+                                collaboration_mode_kind: ModeKind::Code,
                             }),
                         })
                         .unwrap();
