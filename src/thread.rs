@@ -10,17 +10,7 @@ use std::{
 use codex_apply_patch::parse_patch;
 
 use agent_client_protocol::{
-    Annotations, AudioContent, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
-    BlobResourceContents, Client, ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock,
-    ContentChunk, Diff, EmbeddedResource, EmbeddedResourceResource, Error, ImageContent,
-    LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan,
-    PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
-    SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal,
-    TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    Annotations, AudioContent, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, BlobResourceContents, Client, ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource, EmbeddedResourceResource, Error, ExtRequest, ExtResponse, ImageContent, LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, RawValue, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput
 };
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
@@ -30,20 +20,8 @@ use codex_core::{
     models_manager::manager::{ModelsManager, RefreshStrategy},
     parse_command::parse_command,
     protocol::{
-        AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
-        AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent,
-        ApplyPatchApprovalRequestEvent, ElicitationAction, ErrorEvent, Event, EventMsg,
-        ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent,
-        ExecCommandOutputDeltaEvent, ExitedReviewModeEvent, FileChange, ItemCompletedEvent,
-        ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent,
-        McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, Op,
-        PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent,
-        ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
-        ReviewTarget, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent, TurnAbortedEvent,
-        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
-        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
-        AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent, AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ElicitationAction, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExitedReviewModeEvent, FileChange, ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent, RateLimitSnapshot, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent, TokenUsageInfo, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent
-    },
+        AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent, AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ElicitationAction, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExitedReviewModeEvent, FileChange, ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent, TokenUsageInfo, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent
+        },
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
@@ -687,13 +665,13 @@ impl PromptState {
 
             // In the future we can use this to update usage stats
             EventMsg::TokenCount(TokenCountEvent{info, rate_limits}) =>{
-                if let Some(TokenUsageInfo{total_token_usage, last_token_usage:_, model_context_window}) = info{
+                if let Some(TokenUsageInfo{total_token_usage: _, last_token_usage: usage, model_context_window}) = info{
                     let raw_value = match to_raw_value(&SessionUsageUpdate{
                         usage: SessionUsage { 
-                            input_tokens: total_token_usage.input_tokens, 
-                            output_tokens: total_token_usage.output_tokens, 
-                            cache_read_input_tokens: total_token_usage.cached_input_tokens, 
-                            reasoning_output_tokens: total_token_usage.reasoning_output_tokens,
+                            input_tokens: usage.input_tokens, 
+                            output_tokens: usage.output_tokens, 
+                            cache_read_input_tokens: usage.cached_input_tokens, 
+                            reasoning_output_tokens: usage.reasoning_output_tokens,
                             context_window: model_context_window
                          }
                     }){
@@ -719,9 +697,9 @@ impl PromptState {
                     let secondary = rate_limits.secondary.as_ref();
                     let raw_value = match serde_json::to_string(&RaceLimitUpdate{
                         five_hour: primary.map(|r|r.used_percent),
-                        five_hour_reset_at: primary.map(|r|r.resets_at).flatten(),
+                        five_hour_reset_at: primary.and_then(|r|r.resets_at),
                         seven_day: secondary.map(|r|r.used_percent),
-                        seven_day_reset_at: secondary.map(|r|r.resets_at).flatten(),
+                        seven_day_reset_at: secondary.and_then(|r|r.resets_at),
                         plan_name: rate_limits.plan_type.map(|p|serde_json::to_string(&p).unwrap())
                     }).and_then(|json|{
                         RawValue::from_string(json)
