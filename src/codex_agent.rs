@@ -9,17 +9,17 @@ use agent_client_protocol::{
     SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
 use codex_core::{
-    CodexAuth, NewThread, ResponseItem, RolloutRecorder, ThreadManager, ThreadSortKey,
+    CodexAuth, NewThread, RolloutRecorder, ThreadManager, ThreadSortKey,
     auth::{AuthManager, read_codex_api_key_from_env, read_openai_api_key_from_env},
     config::{
         Config,
         types::{McpServerConfig, McpServerTransportConfig},
     },
-    find_thread_path_by_id_str, parse_cursor, parse_turn_item,
+    find_thread_path_by_id_str, parse_cursor,
     protocol::{InitialHistory, SessionSource},
 };
 use codex_login::{CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
-use codex_protocol::{ThreadId, protocol::SessionMetaLine};
+use codex_protocol::ThreadId;
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -456,39 +456,25 @@ impl Agent for CodexAgent {
             .items
             .into_iter()
             .filter_map(|item| {
-                // Codex rollout summaries put the SessionMetaLine first in the head.
-                let session_meta_line = item.head.first().and_then(|first| {
-                    serde_json::from_value::<SessionMetaLine>(first.clone()).ok()
-                })?;
+                let thread_id = item.thread_id?;
+                let item_cwd = item.cwd?;
 
                 if let Some(filter_cwd) = cwd.as_ref()
-                    && session_meta_line.meta.cwd != *filter_cwd
+                    && item_cwd != *filter_cwd
                 {
                     return None;
                 }
 
-                let mut title = None;
-                for value in item.head {
-                    if let Ok(response_item) = serde_json::from_value::<ResponseItem>(value)
-                        && let Some(turn_item) = parse_turn_item(&response_item)
-                        && let codex_protocol::items::TurnItem::UserMessage(user) = turn_item
-                    {
-                        if let Some(formatted) = format_session_title(&user.message()) {
-                            title = Some(formatted);
-                        }
-                        break;
-                    }
-                }
-
-                let updated_at = item.updated_at.clone().or(item.created_at.clone());
+                let title = item
+                    .first_user_message
+                    .as_deref()
+                    .and_then(format_session_title);
+                let updated_at = item.updated_at.or(item.created_at);
 
                 Some(
-                    SessionInfo::new(
-                        SessionId::new(session_meta_line.meta.id.to_string()),
-                        session_meta_line.meta.cwd.clone(),
-                    )
-                    .title(title)
-                    .updated_at(updated_at),
+                    SessionInfo::new(SessionId::new(thread_id.to_string()), item_cwd)
+                        .title(title)
+                        .updated_at(updated_at),
                 )
             })
             .collect::<Vec<_>>();
