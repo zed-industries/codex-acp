@@ -7,21 +7,20 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
-use codex_apply_patch::parse_patch;
-
 use agent_client_protocol::{
-    Annotations, AudioContent, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
-    BlobResourceContents, Client, ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock,
-    ContentChunk, Diff, EmbeddedResource, EmbeddedResourceResource, Error, ImageContent,
-    LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan,
-    PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
-    SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal,
-    TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, Client, ClientCapabilities,
+    ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
+    EmbeddedResourceResource, Error, LoadSessionResponse, Meta, ModelId, ModelInfo,
+    PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId,
+    SessionInfoUpdate, SessionMode, SessionModeId, SessionModeState, SessionModelState,
+    SessionNotification, SessionUpdate, StopReason, Terminal, TextResourceContents, ToolCall,
+    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
+use codex_apply_patch::parse_patch;
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
     AuthManager, CodexThread,
@@ -50,6 +49,7 @@ use codex_protocol::{
     approvals::ElicitationRequestEvent,
     config_types::TrustLevel,
     custom_prompts::CustomPrompt,
+    mcp::CallToolResult,
     models::{ResponseItem, WebSearchAction},
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
@@ -59,7 +59,6 @@ use codex_protocol::{
 };
 use heck::ToTitleCase;
 use itertools::Itertools;
-use mcp_types::{CallToolResult, RequestId};
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
@@ -687,8 +686,10 @@ impl PromptState {
             // Used for returning a single history entry
             | EventMsg::GetHistoryEntryResponse(..)
             | EventMsg::DeprecationNotice(..)
-            |  EventMsg::RequestUserInput(..)
+            | EventMsg::RequestUserInput(..)
             | EventMsg::DynamicToolCallRequest(..)
+            | EventMsg::ListRemoteSkillsResponse(..)
+            | EventMsg::RemoteSkillDownloaded(..)
             ) => {
                 warn!("Unexpected event: {:?}", e);
             }
@@ -707,8 +708,8 @@ impl PromptState {
             message,
         } = event;
         let tool_call_id = ToolCallId::new(match &id {
-            RequestId::String(s) => s.clone(),
-            RequestId::Integer(i) => i.to_string(),
+            codex_protocol::mcp::RequestId::String(s) => s.clone(),
+            codex_protocol::mcp::RequestId::Integer(i) => i.to_string(),
         });
         let response = client
             .request_permission(
@@ -968,7 +969,10 @@ impl PromptState {
                             result
                                 .content
                                 .into_iter()
-                                .map(codex_content_to_acp_content)
+                                .filter_map(|content| {
+                                    serde_json::from_value::<ContentBlock>(content).ok()
+                                })
+                                .map(|content| ToolCallContent::Content(Content::new(content)))
                                 .collect()
                         },
                     )),
@@ -1574,7 +1578,9 @@ impl TaskState {
             | EventMsg::DeprecationNotice(..)
             | EventMsg::ElicitationRequest(..)
             | EventMsg::RequestUserInput(..)
-            | EventMsg::DynamicToolCallRequest(..)) => {
+            | EventMsg::DynamicToolCallRequest(..)
+            | EventMsg::ListRemoteSkillsResponse(..)
+            | EventMsg::RemoteSkillDownloaded(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
@@ -2684,10 +2690,7 @@ impl<A: Auth> ThreadActor<A> {
             }
             ResponseItem::FunctionCallOutput { call_id, output } => {
                 self.client
-                    .send_tool_call_completed(
-                        call_id.clone(),
-                        serde_json::to_value(&output.content).ok(),
-                    )
+                    .send_tool_call_completed(call_id.clone(), serde_json::to_value(output).ok())
                     .await;
             }
             ResponseItem::LocalShellCall {
@@ -2852,98 +2855,6 @@ fn format_uri_as_link(name: Option<String>, uri: String) -> String {
     }
 }
 
-fn codex_content_to_acp_content(content: mcp_types::ContentBlock) -> ToolCallContent {
-    ToolCallContent::Content(Content::new(match content {
-        mcp_types::ContentBlock::TextContent(mcp_types::TextContent {
-            annotations, text, ..
-        }) => ContentBlock::Text(
-            TextContent::new(text).annotations(annotations.map(convert_annotations)),
-        ),
-        mcp_types::ContentBlock::ImageContent(mcp_types::ImageContent {
-            annotations,
-            data,
-            mime_type,
-            ..
-        }) => ContentBlock::Image(
-            ImageContent::new(data, mime_type).annotations(annotations.map(convert_annotations)),
-        ),
-        mcp_types::ContentBlock::AudioContent(mcp_types::AudioContent {
-            annotations,
-            data,
-            mime_type,
-            ..
-        }) => ContentBlock::Audio(
-            AudioContent::new(data, mime_type).annotations(annotations.map(convert_annotations)),
-        ),
-        mcp_types::ContentBlock::ResourceLink(mcp_types::ResourceLink {
-            annotations,
-            description,
-            mime_type,
-            name,
-            size,
-            title,
-            uri,
-            ..
-        }) => ContentBlock::ResourceLink(
-            ResourceLink::new(name, uri)
-                .annotations(annotations.map(convert_annotations))
-                .description(description)
-                .mime_type(mime_type)
-                .size(size)
-                .title(title),
-        ),
-        mcp_types::ContentBlock::EmbeddedResource(mcp_types::EmbeddedResource {
-            annotations,
-            resource,
-            ..
-        }) => {
-            let resource = match resource {
-                mcp_types::EmbeddedResourceResource::TextResourceContents(
-                    mcp_types::TextResourceContents {
-                        mime_type,
-                        text,
-                        uri,
-                    },
-                ) => EmbeddedResourceResource::TextResourceContents(
-                    TextResourceContents::new(text, uri).mime_type(mime_type),
-                ),
-                mcp_types::EmbeddedResourceResource::BlobResourceContents(
-                    mcp_types::BlobResourceContents {
-                        blob,
-                        mime_type,
-                        uri,
-                    },
-                ) => EmbeddedResourceResource::BlobResourceContents(
-                    BlobResourceContents::new(blob, uri).mime_type(mime_type),
-                ),
-            };
-            ContentBlock::Resource(
-                EmbeddedResource::new(resource).annotations(annotations.map(convert_annotations)),
-            )
-        }
-    }))
-}
-
-fn convert_annotations(
-    mcp_types::Annotations {
-        audience,
-        last_modified,
-        priority,
-    }: mcp_types::Annotations,
-) -> Annotations {
-    Annotations::new()
-        .audience(audience.map(|a| {
-            a.into_iter()
-                .map(|audience| match audience {
-                    mcp_types::Role::Assistant => agent_client_protocol::Role::Assistant,
-                    mcp_types::Role::User => agent_client_protocol::Role::User,
-                })
-                .collect::<Vec<_>>()
-        }))
-        .last_modified(last_modified)
-        .priority(priority)
-}
-
 fn extract_tool_call_content_from_changes(
     changes: HashMap<PathBuf, FileChange>,
 ) -> (
@@ -3032,6 +2943,7 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
+    use agent_client_protocol::TextContent;
     use codex_core::{
         config::ConfigOverrides, models_manager::model_presets::all_model_presets,
         protocol::AgentMessageEvent,
@@ -3671,7 +3583,7 @@ mod tests {
                             id: id.to_string(),
                             msg: EventMsg::TurnStarted(TurnStartedEvent {
                                 model_context_window: None,
-                                collaboration_mode_kind: ModeKind::Code,
+                                collaboration_mode_kind: ModeKind::default(),
                             }),
                         })
                         .unwrap();

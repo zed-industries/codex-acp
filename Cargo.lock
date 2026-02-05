@@ -31,9 +31,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol"
-version = "0.9.3"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ea4b85f3bcd56ebe65f830321d34bc939af1b5a33b9dcb683195a3b72de0cdb"
+checksum = "2659b1089101b15db31137710159421cb44785ecdb5ba784be3b4a6f8cb8a475"
 dependencies = [
  "agent-client-protocol-schema",
  "anyhow",
@@ -48,9 +48,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-schema"
-version = "0.10.6"
+version = "0.10.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70829a300bd178abe42836ac779cd3eb3b0dd3881250c752b2621b5324735df1"
+checksum = "44bc1fef9c32f03bce2ab44af35b6f483bfd169bf55cc59beeb2e3b1a00ae4d1"
 dependencies = [
  "anyhow",
  "derive_more 2.1.1",
@@ -181,15 +181,24 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.100"
+version = "1.0.101"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
+checksum = "5f0e0fee31ef5ed1ba1316088939cea399010ed7731dba877ed44aeb407a75ea"
+
+[[package]]
+name = "arbitrary"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
+dependencies = [
+ "derive_arbitrary",
+]
 
 [[package]]
 name = "arc-swap"
-version = "1.8.0"
+version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51d03449bb8ca2cc2ef70869af31463d1ae5ccc8fa3e334b307203fbf815207e"
+checksum = "9ded5f9a03ac8f24d1b8a25101ee812cd32cdc8c50a4c50237de2c4915850e73"
 dependencies = [
  "rustversion",
 ]
@@ -579,6 +588,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "bzip2"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49ecfb22d906f800d4fe833b6282cf4dc1c298f5057ca0b5445e5c209735ca47"
+dependencies = [
+ "bzip2-sys",
+]
+
+[[package]]
+name = "bzip2-sys"
+version = "0.1.13+1.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "225bff33b2141874fe80d71e07d6eec4f85c5c216453dd96388240f96e1acc14"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
+
+[[package]]
 name = "cbc"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -666,9 +694,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.5.56"
+version = "4.5.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a75ca66430e33a14957acc24c5077b503e7d374151b2b4b3a10c83b4ceb4be0e"
+checksum = "6899ea499e3fb9305a65d5ebf6e3d2248c5fab291f300ad0a704fbe142eae31a"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -676,9 +704,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.5.56"
+version = "4.5.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "793207c7fa6300a0608d1080b858e5fdbe713cdc1c8db9fb17777d8a13e63df0"
+checksum = "7b12c8b680195a62a8364d16b8447b01b6c2c8f9aaf68bee653be34d4245e238"
 dependencies = [
  "anstream",
  "anstyle",
@@ -737,7 +765,6 @@ dependencies = [
  "codex-protocol",
  "heck",
  "itertools 0.14.0",
- "mcp-types",
  "regex-lite",
  "serde",
  "serde_json",
@@ -753,7 +780,7 @@ dependencies = [
 [[package]]
 name = "codex-api"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "async-trait",
  "bytes",
@@ -776,7 +803,7 @@ dependencies = [
 [[package]]
 name = "codex-app-server-protocol"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "anyhow",
  "clap",
@@ -784,7 +811,6 @@ dependencies = [
  "codex-protocol",
  "codex-utils-absolute-path",
  "inventory",
- "mcp-types",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -797,7 +823,7 @@ dependencies = [
 [[package]]
 name = "codex-apply-patch"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "anyhow",
  "similar",
@@ -809,7 +835,7 @@ dependencies = [
 [[package]]
 name = "codex-arg0"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "anyhow",
  "codex-apply-patch",
@@ -823,7 +849,7 @@ dependencies = [
 [[package]]
 name = "codex-async-utils"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "async-trait",
  "tokio",
@@ -833,7 +859,7 @@ dependencies = [
 [[package]]
 name = "codex-client"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "async-trait",
  "bytes",
@@ -855,7 +881,7 @@ dependencies = [
 [[package]]
 name = "codex-common"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "clap",
  "codex-core",
@@ -869,7 +895,7 @@ dependencies = [
 [[package]]
 name = "codex-core"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -899,6 +925,7 @@ dependencies = [
  "codex-utils-string",
  "codex-windows-sandbox",
  "core-foundation 0.9.4",
+ "dirs",
  "dunce",
  "encoding_rs",
  "env-flags",
@@ -911,8 +938,8 @@ dependencies = [
  "keyring",
  "landlock",
  "libc",
- "mcp-types",
  "multimap",
+ "notify",
  "once_cell",
  "openssl-sys",
  "os_info",
@@ -920,6 +947,7 @@ dependencies = [
  "regex",
  "regex-lite",
  "reqwest",
+ "rmcp",
  "schemars 0.8.22",
  "seccompiler",
  "serde",
@@ -947,12 +975,13 @@ dependencies = [
  "uuid",
  "which",
  "wildmatch",
+ "zip",
 ]
 
 [[package]]
 name = "codex-execpolicy"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "anyhow",
  "clap",
@@ -967,7 +996,7 @@ dependencies = [
 [[package]]
 name = "codex-experimental-api-macros"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -977,7 +1006,7 @@ dependencies = [
 [[package]]
 name = "codex-file-search"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "anyhow",
  "clap",
@@ -992,7 +1021,7 @@ dependencies = [
 [[package]]
 name = "codex-git"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "once_cell",
  "regex",
@@ -1007,7 +1036,7 @@ dependencies = [
 [[package]]
 name = "codex-keyring-store"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "keyring",
  "tracing",
@@ -1016,20 +1045,23 @@ dependencies = [
 [[package]]
 name = "codex-linux-sandbox"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
+ "cc",
  "clap",
  "codex-core",
  "codex-utils-absolute-path",
  "landlock",
  "libc",
+ "pkg-config",
  "seccompiler",
+ "serde_json",
 ]
 
 [[package]]
 name = "codex-lmstudio"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "codex-core",
  "reqwest",
@@ -1042,7 +1074,7 @@ dependencies = [
 [[package]]
 name = "codex-login"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "base64",
  "chrono",
@@ -1064,7 +1096,7 @@ dependencies = [
 [[package]]
 name = "codex-mcp-server"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "anyhow",
  "codex-arg0",
@@ -1072,7 +1104,7 @@ dependencies = [
  "codex-core",
  "codex-protocol",
  "codex-utils-json-to-toml",
- "mcp-types",
+ "rmcp",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -1085,7 +1117,7 @@ dependencies = [
 [[package]]
 name = "codex-ollama"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "async-stream",
  "bytes",
@@ -1102,13 +1134,13 @@ dependencies = [
 [[package]]
 name = "codex-otel"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "chrono",
  "codex-api",
- "codex-app-server-protocol",
  "codex-protocol",
  "codex-utils-absolute-path",
+ "codex-utils-string",
  "eventsource-stream",
  "http",
  "opentelemetry",
@@ -1116,6 +1148,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
+ "os_info",
  "reqwest",
  "serde",
  "serde_json",
@@ -1131,7 +1164,7 @@ dependencies = [
 [[package]]
 name = "codex-protocol"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "codex-execpolicy",
  "codex-git",
@@ -1140,7 +1173,6 @@ dependencies = [
  "icu_decimal",
  "icu_locale_core",
  "icu_provider",
- "mcp-types",
  "mime_guess",
  "schemars 0.8.22",
  "serde",
@@ -1157,7 +1189,7 @@ dependencies = [
 [[package]]
 name = "codex-rmcp-client"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "anyhow",
  "axum",
@@ -1166,7 +1198,6 @@ dependencies = [
  "codex-utils-home-dir",
  "futures",
  "keyring",
- "mcp-types",
  "oauth2",
  "reqwest",
  "rmcp",
@@ -1185,7 +1216,7 @@ dependencies = [
 [[package]]
 name = "codex-state"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1193,6 +1224,7 @@ dependencies = [
  "codex-otel",
  "codex-protocol",
  "dirs",
+ "log",
  "owo-colors",
  "serde",
  "serde_json",
@@ -1206,7 +1238,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-absolute-path"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "dirs",
  "path-absolutize",
@@ -1218,7 +1250,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-cache"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "lru",
  "sha1",
@@ -1228,7 +1260,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-home-dir"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "dirs",
 ]
@@ -1236,7 +1268,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-image"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "base64",
  "codex-utils-cache",
@@ -1248,7 +1280,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-json-to-toml"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "serde_json",
  "toml 0.9.11+spec-1.1.0",
@@ -1257,7 +1289,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-pty"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "anyhow",
  "filedescriptor",
@@ -1273,7 +1305,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-readiness"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "async-trait",
  "thiserror 2.0.18",
@@ -1284,12 +1316,12 @@ dependencies = [
 [[package]]
 name = "codex-utils-string"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 
 [[package]]
 name = "codex-windows-sandbox"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
+source = "git+https://github.com/zed-industries/codex?branch=acp#785c0c43df941e6997ff3a9e8a9dd48da2661f20"
 dependencies = [
  "anyhow",
  "base64",
@@ -1349,6 +1381,12 @@ name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
 name = "convert_case"
@@ -1630,6 +1668,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "deflate64"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26bf8fc351c5ed29b5c2f0cbbac1b209b74f60ecd62e675a998df72c49af5204"
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1659,6 +1703,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "derive_arbitrary"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
 ]
 
 [[package]]
@@ -2070,9 +2125,9 @@ checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
 
 [[package]]
 name = "flate2"
-version = "1.1.8"
+version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b375d6465b98090a5f25b1c7703f3859783755aa9a80433b36e0379a3ec2f369"
+checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
@@ -2129,6 +2184,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fsevent-sys"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -2300,7 +2364,7 @@ dependencies = [
  "bstr",
  "log",
  "regex-automata",
- "regex-syntax 0.8.8",
+ "regex-syntax 0.8.9",
 ]
 
 [[package]]
@@ -2497,7 +2561,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.5",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]
@@ -2820,6 +2884,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "inotify"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f37dccff2791ab604f9babef0ba14fbe0be30bd368dc541e2b08d07c8aa908f3"
+dependencies = [
+ "bitflags 2.10.0",
+ "inotify-sys",
+ "libc",
+]
+
+[[package]]
+name = "inotify-sys"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e05c02b5e89bff3b946cedeca278abc628fe811e604f027c45a8aa3cf793d0eb"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2962,6 +3046,26 @@ dependencies = [
  "windows-sys 0.60.2",
  "zbus",
  "zeroize",
+]
+
+[[package]]
+name = "kqueue"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eac30106d7dce88daf4a3fcb4879ea939476d5074a9b7ddd0fb97fa4bed5596a"
+dependencies = [
+ "kqueue-sys",
+ "libc",
+]
+
+[[package]]
+name = "kqueue-sys"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed9625ffda8729b85e45cf04090035ac368927b8cebc34898e7c120f52e4838b"
+dependencies = [
+ "bitflags 1.3.2",
+ "libc",
 ]
 
 [[package]]
@@ -3147,6 +3251,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "lzma-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "297e814c836ae64db86b36cf2a557ba54368d03f6afcd7d947c266692f71115e"
+dependencies = [
+ "byteorder",
+ "crc",
+]
+
+[[package]]
+name = "lzma-sys"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fda04ab3764e6cde78b9974eec4f779acaba7c4e84b36eca3cf77c581b85d27"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "maplit"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3166,17 +3291,6 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
-
-[[package]]
-name = "mcp-types"
-version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#6a06fefad7b3529e8cacb465a6ffa61d52ad4b31"
-dependencies = [
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "ts-rs",
-]
 
 [[package]]
 name = "md-5"
@@ -3251,6 +3365,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a69bcab0ad47271a0234d9422b131806bf3968021e5dc9328caf2d4cd58557fc"
 dependencies = [
  "libc",
+ "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -3357,6 +3472,33 @@ checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
 dependencies = [
  "memchr",
  "minimal-lexical",
+]
+
+[[package]]
+name = "notify"
+version = "8.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d3d07927151ff8575b7087f245456e549fea62edf0ec4e565a5ee50c8402bc3"
+dependencies = [
+ "bitflags 2.10.0",
+ "fsevent-sys",
+ "inotify",
+ "kqueue",
+ "libc",
+ "log",
+ "mio",
+ "notify-types",
+ "walkdir",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "notify-types"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42b8cfee0e339a0337359f3c88165702ac6e600dc01c0cc9579a92d62b08477a"
+dependencies = [
+ "bitflags 2.10.0",
 ]
 
 [[package]]
@@ -3950,6 +4092,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest",
+ "hmac",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4167,16 +4319,16 @@ dependencies = [
 
 [[package]]
 name = "proptest"
-version = "1.9.0"
+version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bee689443a2bd0a16ab0348b52ee43e3b2d1b1f931c8aa5c9f8de4c86fbe8c40"
+checksum = "37566cb3fdacef14c0737f9546df7cfeadbfbc9fef10991038bf5015d0c80532"
 dependencies = [
  "bitflags 2.10.0",
  "num-traits",
  "rand 0.9.2",
  "rand_chacha 0.9.0",
  "rand_xorshift",
- "regex-syntax 0.8.8",
+ "regex-syntax 0.8.9",
  "unarray",
 ]
 
@@ -4442,32 +4594,32 @@ dependencies = [
 
 [[package]]
 name = "regex"
-version = "1.12.2"
+version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "843bc0191f75f3e22651ae5f1e72939ab2f72a4bc30fa80a066bd66edefc24d4"
+checksum = "e10754a14b9137dd7b1e3e5b0493cc9171fdd105e0ab477f51b72e7f3ac0e276"
 dependencies = [
  "aho-corasick",
  "memchr",
  "regex-automata",
- "regex-syntax 0.8.8",
+ "regex-syntax 0.8.9",
 ]
 
 [[package]]
 name = "regex-automata"
-version = "0.4.13"
+version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5276caf25ac86c8d810222b3dbb938e512c55c6831a10f3e6ed1c93b84041f1c"
+checksum = "6e1dd4122fc1595e8162618945476892eefca7b88c52820e74af6262213cae8f"
 dependencies = [
  "aho-corasick",
  "memchr",
- "regex-syntax 0.8.8",
+ "regex-syntax 0.8.9",
 ]
 
 [[package]]
 name = "regex-lite"
-version = "0.1.8"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d942b98df5e658f56f20d592c7f868833fe38115e65c33003d8cd224b0155da"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "regex-syntax"
@@ -4477,9 +4629,9 @@ checksum = "f162c6dd7b008981e4d40210aca20b4bd0f9b60ca9271061b07f78537722f2e1"
 
 [[package]]
 name = "regex-syntax"
-version = "0.8.8"
+version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
+checksum = "a96887878f22d7bad8a3b6dc5b7440e0ada9a245242924394987b21cf2210a4c"
 
 [[package]]
 name = "reqwest"
@@ -4527,7 +4679,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
- "webpki-roots 1.0.5",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]
@@ -5829,9 +5981,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.46"
+version = "0.3.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9da98b7d9b7dad93488a84b8248efc35352b0b2657397d4167e7ad67e5d535e5"
+checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
 dependencies = [
  "deranged",
  "itoa",
@@ -5852,9 +6004,9 @@ checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
 
 [[package]]
 name = "time-macros"
-version = "0.2.26"
+version = "0.2.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78cc610bac2dcee56805c99642447d4c5dbde4d01f752ffea0199aee1f601dc4"
+checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
 dependencies = [
  "num-conv",
  "time-core",
@@ -6243,7 +6395,7 @@ checksum = "78f873475d258561b06f1c595d93308a7ed124d9977cb26b148c2084a4a3cc87"
 dependencies = [
  "cc",
  "regex",
- "regex-syntax 0.8.8",
+ "regex-syntax 0.8.9",
  "serde_json",
  "streaming-iterator",
  "tree-sitter-language",
@@ -6621,14 +6773,14 @@ version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
 dependencies = [
- "webpki-roots 1.0.5",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.5"
+version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12bed680863276c63889429bfd6cab3b99943659923822de1c8a39c49e4d722c"
+checksum = "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -7252,6 +7404,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "xz2"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "388c44dc09d76f1536602ead6d325eb532f5c122f17782bd57fb47baeeb767e2"
+dependencies = [
+ "lzma-sys",
+]
+
+[[package]]
 name = "yoke"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7338,18 +7499,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.37"
+version = "0.8.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7456cf00f0685ad319c5b1693f291a650eaf345e941d082fc4e03df8a03996ac"
+checksum = "57cf3aa6855b23711ee9852dfc97dfaa51c45feaba5b645d0c777414d494a961"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.37"
+version = "0.8.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1328722bbf2115db7e19d69ebcc15e795719e2d66b60827c6a69a117365e37a0"
+checksum = "8a616990af1a287837c4fe6596ad77ef57948f787e46ce28e166facc0cc1cb75"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7432,10 +7593,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "zip"
+version = "2.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
+dependencies = [
+ "aes",
+ "arbitrary",
+ "bzip2",
+ "constant_time_eq",
+ "crc32fast",
+ "crossbeam-utils",
+ "deflate64",
+ "displaydoc",
+ "flate2",
+ "getrandom 0.3.4",
+ "hmac",
+ "indexmap 2.13.0",
+ "lzma-rs",
+ "memchr",
+ "pbkdf2",
+ "sha1",
+ "thiserror 2.0.18",
+ "time",
+ "xz2",
+ "zeroize",
+ "zopfli",
+ "zstd",
+]
+
+[[package]]
 name = "zmij"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ff05f8caa9038894637571ae6b9e29466c1f4f829d26c9b28f869a29cbe3445"
+
+[[package]]
+name = "zopfli"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f05cd8797d63865425ff89b5c4a48804f35ba0ce8d125800027ad6017d2b5249"
+dependencies = [
+ "bumpalo",
+ "crc32fast",
+ "log",
+ "simd-adler32",
+]
 
 [[package]]
 name = "zstd"
