@@ -8,17 +8,7 @@ use std::{
 };
 
 use agent_client_protocol::{
-    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, Client, ClientCapabilities,
-    ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
-    EmbeddedResourceResource, Error, LoadSessionResponse, Meta, ModelId, ModelInfo,
-    PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId,
-    SessionInfoUpdate, SessionMode, SessionModeId, SessionModeState, SessionModelState,
-    SessionNotification, SessionUpdate, StopReason, Terminal, TextResourceContents, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, Client, ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource, EmbeddedResourceResource, Error, ExtRequest, ExtResponse, LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, RawValue, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal, TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput
 };
 use codex_apply_patch::parse_patch;
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
