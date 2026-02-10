@@ -296,10 +296,8 @@ impl Thread {
 enum SubmissionState {
     /// Loading custom prompts from the project
     CustomPrompts(CustomPromptsState),
-    /// User prompts + some slash commands like /init or /review
+    /// User prompts, including slash commands like /init, /review, /compact, /undo.
     Prompt(PromptState),
-    /// Subtask, like /compact
-    Task(TaskState),
 }
 
 impl SubmissionState {
@@ -307,7 +305,6 @@ impl SubmissionState {
         match self {
             Self::CustomPrompts(state) => state.is_active(),
             Self::Prompt(state) => state.is_active(),
-            Self::Task(state) => state.is_active(),
         }
     }
 
@@ -315,7 +312,6 @@ impl SubmissionState {
         match self {
             Self::CustomPrompts(state) => state.handle_event(event),
             Self::Prompt(state) => state.handle_event(client, event).await,
-            Self::Task(state) => state.handle_event(client, event).await,
         }
     }
 }
@@ -438,7 +434,6 @@ impl PromptState {
                 info!("Task started with context window of {model_context_window:?} {collaboration_mode_kind:?}");
             }
             EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
-
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
             }
             EventMsg::UserMessage(UserMessageEvent {
@@ -449,18 +444,38 @@ impl PromptState {
             }) => {
                 info!("User message: {message:?}");
             }
-            EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent { thread_id, turn_id, item_id, delta }) => {
+            EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
+                thread_id,
+                turn_id,
+                item_id,
+                delta,
+            }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
                 self.seen_message_deltas = true;
                 client.send_agent_text(delta).await;
             }
-            EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent { thread_id, turn_id, item_id, delta, summary_index: index })
-            | EventMsg::ReasoningRawContentDelta(ReasoningRawContentDeltaEvent { thread_id, turn_id, item_id, delta, content_index: index }) => {
+            EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
+                thread_id,
+                turn_id,
+                item_id,
+                delta,
+                summary_index: index,
+            })
+            | EventMsg::ReasoningRawContentDelta(ReasoningRawContentDeltaEvent {
+                thread_id,
+                turn_id,
+                item_id,
+                delta,
+                content_index: index,
+            }) => {
                 info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought(delta).await;
             }
-            EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent { item_id, summary_index}) => {
+            EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
+                item_id,
+                summary_index,
+            }) => {
                 info!("Agent reasoning section break received:  item_id: {item_id}, index: {summary_index}");
                 // Make sure the section heading actually get spacing
                 self.seen_reasoning_deltas = true;
@@ -500,17 +515,27 @@ impl PromptState {
                 // Create a ToolCall notification for the search beginning
                 self.start_web_search(client, call_id).await;
             }
-            EventMsg::WebSearchEnd(WebSearchEndEvent { call_id, query, action }) => {
+            EventMsg::WebSearchEnd(WebSearchEndEvent {
+                call_id,
+                query,
+                action,
+            }) => {
                 info!("Web search query received: call_id={call_id}, query={query}");
                 // Send update that the search is in progress with the query
                 // (WebSearchEnd just means we have the query, not that results are ready)
-                self.update_web_search_query(client, call_id, query, action).await;
+                self.update_web_search_query(client, call_id, query, action)
+                    .await;
                 // The actual search results will come through AgentMessage events
                 // We mark as completed when a new tool call begins
             }
             EventMsg::ExecApprovalRequest(event) => {
-                info!("Command execution started: call_id={}, command={:?}", event.call_id, event.command);
-                if let Err(err) = self.exec_approval(client, event).await && let Some(response_tx) = self.response_tx.take() {
+                info!(
+                    "Command execution started: call_id={}, command={:?}",
+                    event.call_id, event.command
+                );
+                if let Err(err) = self.exec_approval(client, event).await
+                    && let Some(response_tx) = self.response_tx.take()
+                {
                     drop(response_tx.send(Err(err)));
                 }
             }
@@ -538,34 +563,64 @@ impl PromptState {
                 );
                 self.terminal_interaction(client, event).await;
             }
-            EventMsg::McpToolCallBegin(McpToolCallBeginEvent { call_id, invocation }) => {
-                info!("MCP tool call begin: call_id={call_id}, invocation={} {}", invocation.server, invocation.tool);
+            EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
+                call_id,
+                invocation,
+            }) => {
+                info!(
+                    "MCP tool call begin: call_id={call_id}, invocation={} {}",
+                    invocation.server, invocation.tool
+                );
                 self.start_mcp_tool_call(client, call_id, invocation).await;
             }
-            EventMsg::McpToolCallEnd(McpToolCallEndEvent { call_id, invocation, duration, result }) => {
-                info!("MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}", invocation.server, invocation.tool);
+            EventMsg::McpToolCallEnd(McpToolCallEndEvent {
+                call_id,
+                invocation,
+                duration,
+                result,
+            }) => {
+                info!(
+                    "MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}",
+                    invocation.server, invocation.tool
+                );
                 self.end_mcp_tool_call(client, call_id, result).await;
             }
             EventMsg::ApplyPatchApprovalRequest(event) => {
-                info!("Apply patch approval request: call_id={}, reason={:?}", event.call_id, event.reason);
-                if let Err(err) = self.patch_approval(client, event).await && let Some(response_tx) = self.response_tx.take() {
+                info!(
+                    "Apply patch approval request: call_id={}, reason={:?}",
+                    event.call_id, event.reason
+                );
+                if let Err(err) = self.patch_approval(client, event).await
+                    && let Some(response_tx) = self.response_tx.take()
+                {
                     drop(response_tx.send(Err(err)));
                 }
             }
             EventMsg::PatchApplyBegin(event) => {
-                info!("Patch apply begin: call_id={}, auto_approved={}", event.call_id,event.auto_approved);
+                info!(
+                    "Patch apply begin: call_id={}, auto_approved={}",
+                    event.call_id, event.auto_approved
+                );
                 self.start_patch_apply(client, event).await;
             }
             EventMsg::PatchApplyEnd(event) => {
-                info!("Patch apply end: call_id={}, success={}", event.call_id, event.success);
+                info!(
+                    "Patch apply end: call_id={}, success={}",
+                    event.call_id, event.success
+                );
                 self.end_patch_apply(client, event).await;
             }
-            EventMsg::ItemCompleted(ItemCompletedEvent { thread_id, turn_id, item }) => {
+            EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id,
+                turn_id,
+                item,
+            }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
             }
-            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message}) => {
+            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message }) => {
                 info!(
-                    "Task completed successfully after {} events. Last agent message: {last_agent_message:?}", self.event_count
+                    "Task completed successfully after {} events. Last agent message: {last_agent_message:?}",
+                    self.event_count
                 );
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
@@ -588,13 +643,26 @@ impl PromptState {
                 };
                 client.send_agent_text(event.message.unwrap_or(fallback)).await;
             }
-            EventMsg::StreamError(StreamErrorEvent { message , codex_error_info, additional_details }) => {
-                error!("Handled error during turn: {message} {codex_error_info:?} {additional_details:?}");
+            EventMsg::StreamError(StreamErrorEvent {
+                message,
+                codex_error_info,
+                additional_details,
+            }) => {
+                error!(
+                    "Handled error during turn: {message} {codex_error_info:?} {additional_details:?}"
+                );
             }
-            EventMsg::Error(ErrorEvent { message, codex_error_info }) => {
+            EventMsg::Error(ErrorEvent {
+                message,
+                codex_error_info,
+            }) => {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
                 if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Err(Error::internal_error().data(json!({ "message": message, "codex_error_info": codex_error_info })))).ok();
+                    response_tx
+                        .send(Err(Error::internal_error().data(
+                            json!({ "message": message, "codex_error_info": codex_error_info }),
+                        )))
+                        .ok();
                 }
             }
             EventMsg::TurnAborted(TurnAbortedEvent { reason }) => {
@@ -628,7 +696,9 @@ impl PromptState {
             }
             EventMsg::ExitedReviewMode(event) => {
                 info!("Review end: output={event:?}");
-                if let Err(err) = self.review_mode_exit(client, event).await && let Some(response_tx) = self.response_tx.take() {
+                if let Err(err) = self.review_mode_exit(client, event).await
+                    && let Some(response_tx) = self.response_tx.take()
+                {
                     drop(response_tx.send(Err(err)));
                 }
             }
@@ -649,7 +719,9 @@ impl PromptState {
             }
             EventMsg::ElicitationRequest(event) => {
                 info!("Elicitation request: server={}, id={:?}, message={}", event.server_name, event.id, event.message);
-                if let Err(err) = self.mcp_elicitation(client, event).await && let Some(response_tx) = self.response_tx.take() {
+                if let Err(err) = self.mcp_elicitation(client, event).await
+                    && let Some(response_tx) = self.response_tx.take()
+                {
                     drop(response_tx.send(Err(err)));
                 }
             }
@@ -666,7 +738,9 @@ impl PromptState {
             | EventMsg::ContextCompacted(..)
             | EventMsg::SkillsUpdateAvailable
             // Old events
-            | EventMsg::AgentMessageDelta(..) | EventMsg::AgentReasoningDelta(..) | EventMsg::AgentReasoningRawContentDelta(..)
+            | EventMsg::AgentMessageDelta(..)
+            | EventMsg::AgentReasoningDelta(..)
+            | EventMsg::AgentReasoningRawContentDelta(..)
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..)
             // TODO: Subagent UI?
@@ -678,7 +752,7 @@ impl PromptState {
             | EventMsg::CollabWaitingEnd(..)
             | EventMsg::CollabCloseBegin(..)
             | EventMsg::CollabCloseEnd(..)
-            | EventMsg::PlanDelta(..)=> {},
+            | EventMsg::PlanDelta(..) => {}
             e @ (EventMsg::McpListToolsResponse(..)
             // returned from Op::ListCustomPrompts, ignore
             | EventMsg::ListCustomPromptsResponse(..)
@@ -689,8 +763,7 @@ impl PromptState {
             | EventMsg::RequestUserInput(..)
             | EventMsg::DynamicToolCallRequest(..)
             | EventMsg::ListRemoteSkillsResponse(..)
-            | EventMsg::RemoteSkillDownloaded(..)
-            ) => {
+            | EventMsg::RemoteSkillDownloaded(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
@@ -1421,169 +1494,6 @@ fn parse_command_tool_call(parsed_cmd: Vec<ParsedCommand>, cwd: &Path) -> ParseC
         terminal_output,
         locations,
         kind,
-    }
-}
-
-struct TaskState {
-    response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
-}
-
-impl TaskState {
-    fn new(response_tx: oneshot::Sender<Result<StopReason, Error>>) -> Self {
-        Self {
-            response_tx: Some(response_tx),
-        }
-    }
-
-    fn is_active(&self) -> bool {
-        self.response_tx.is_some()
-    }
-
-    async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
-        match event {
-            EventMsg::TurnComplete(..) => {
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::EndTurn)).ok();
-                }
-            }
-            // Safer to grab the non-streaming version of the events so we don't duplicate
-            // and it is likely these are synthetic events, not from the model
-            EventMsg::AgentMessage(AgentMessageEvent { message }) => {
-                client.send_agent_text(message).await;
-            }
-            EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
-                client.send_agent_thought(text).await;
-            }
-            EventMsg::UndoStarted(event) => {
-                client
-                    .send_agent_text(
-                        event
-                            .message
-                            .unwrap_or_else(|| "Undo in progress...".to_string()),
-                    )
-                    .await;
-            }
-            EventMsg::UndoCompleted(event) => {
-                let fallback = if event.success {
-                    "Undo completed.".to_string()
-                } else {
-                    "Undo failed.".to_string()
-                };
-                client
-                    .send_agent_text(event.message.unwrap_or(fallback))
-                    .await;
-            }
-            EventMsg::StreamError(StreamErrorEvent {
-                message,
-                codex_error_info,
-                additional_details,
-            }) => {
-                error!(
-                    "Handled error during turn: {message} {codex_error_info:?} {additional_details:?}"
-                );
-            }
-            EventMsg::Error(ErrorEvent {
-                message,
-                codex_error_info,
-            }) => {
-                error!("Unhandled error during turn: {message} {codex_error_info:?}");
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx
-                        .send(Err(Error::internal_error().data(
-                            json!({ "message": message, "codex_error_info": codex_error_info }),
-                        )))
-                        .ok();
-                }
-            }
-            EventMsg::TurnAborted(TurnAbortedEvent { reason }) => {
-                info!("Turn aborted: {reason:?}");
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::Cancelled)).ok();
-                }
-            }
-            EventMsg::ShutdownComplete => {
-                info!("Agent shutting down");
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::Cancelled)).ok();
-                }
-            }
-            EventMsg::Warning(WarningEvent { message }) => {
-                warn!("Warning: {message}");
-            }
-            EventMsg::McpStartupUpdate(McpStartupUpdateEvent { server, status }) => {
-                info!("MCP startup update: server={server}, status={status:?}");
-            }
-            EventMsg::McpStartupComplete(McpStartupCompleteEvent {
-                ready,
-                failed,
-                cancelled,
-            }) => {
-                info!(
-                    "MCP startup complete: ready={ready:?}, failed={failed:?}, cancelled={cancelled:?}"
-                );
-            }
-            // Expected but ignore
-            EventMsg::TurnStarted(..)
-            | EventMsg::ThreadRolledBack(..)
-            | EventMsg::ItemStarted(..)
-            | EventMsg::ItemCompleted(..)
-            | EventMsg::TokenCount(..)
-            | EventMsg::AgentMessageDelta(..)
-            | EventMsg::AgentReasoningDelta(..)
-            | EventMsg::AgentMessageContentDelta(..)
-            | EventMsg::AgentReasoningRawContent(..)
-            | EventMsg::AgentReasoningRawContentDelta(..)
-            | EventMsg::ReasoningContentDelta(..)
-            | EventMsg::ReasoningRawContentDelta(..)
-            | EventMsg::AgentReasoningSectionBreak(..)
-            | EventMsg::RawResponseItem(..)
-            | EventMsg::BackgroundEvent(..)
-            | EventMsg::SkillsUpdateAvailable
-            | EventMsg::ContextCompacted(..)
-            | EventMsg::ThreadNameUpdated(..)
-            // TODO: Subagent UI?
-            | EventMsg::CollabAgentSpawnBegin(..)
-            | EventMsg::CollabAgentSpawnEnd(..)
-            | EventMsg::CollabAgentInteractionBegin(..)
-            | EventMsg::CollabAgentInteractionEnd(..)
-            | EventMsg::CollabWaitingBegin(..)
-            | EventMsg::CollabWaitingEnd(..)
-            | EventMsg::CollabCloseBegin(..)
-            | EventMsg::CollabCloseEnd(..)
-            | EventMsg::PlanDelta(..) => {}
-            // Unexpected events for this submission
-            e @ (EventMsg::UserMessage(..)
-            | EventMsg::SessionConfigured(..)
-            | EventMsg::McpToolCallBegin(..)
-            | EventMsg::McpToolCallEnd(..)
-            | EventMsg::WebSearchBegin(..)
-            | EventMsg::WebSearchEnd(..)
-            | EventMsg::ExecCommandBegin(..)
-            | EventMsg::ExecCommandOutputDelta(..)
-            | EventMsg::ExecCommandEnd(..)
-            | EventMsg::TerminalInteraction(..)
-            | EventMsg::ViewImageToolCall(..)
-            | EventMsg::ExecApprovalRequest(..)
-            | EventMsg::ApplyPatchApprovalRequest(..)
-            | EventMsg::PatchApplyBegin(..)
-            | EventMsg::PatchApplyEnd(..)
-            | EventMsg::TurnDiff(..)
-            | EventMsg::GetHistoryEntryResponse(..)
-            | EventMsg::McpListToolsResponse(..)
-            | EventMsg::ListCustomPromptsResponse(..)
-            | EventMsg::ListSkillsResponse(..)
-            | EventMsg::PlanUpdate(..)
-            | EventMsg::EnteredReviewMode(..)
-            | EventMsg::ExitedReviewMode(..)
-            | EventMsg::DeprecationNotice(..)
-            | EventMsg::ElicitationRequest(..)
-            | EventMsg::RequestUserInput(..)
-            | EventMsg::DynamicToolCallRequest(..)
-            | EventMsg::ListRemoteSkillsResponse(..)
-            | EventMsg::RemoteSkillDownloaded(..)) => {
-                warn!("Unexpected event: {:?}", e);
-            }
-        }
     }
 }
 
@@ -2374,14 +2284,11 @@ impl<A: Auth> ThreadActor<A> {
         info!("Submitted prompt with submission_id: {submission_id}");
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
 
-        let state = match op {
-            Op::Compact | Op::Undo => SubmissionState::Task(TaskState::new(response_tx)),
-            _ => SubmissionState::Prompt(PromptState::new(
-                self.thread.clone(),
-                response_tx,
-                submission_id.clone(),
-            )),
-        };
+        let state = SubmissionState::Prompt(PromptState::new(
+            self.thread.clone(),
+            response_tx,
+            submission_id.clone(),
+        ));
 
         self.submissions.insert(submission_id, state);
 
