@@ -1950,6 +1950,21 @@ impl<A: Auth> ThreadActor<A> {
                 &preset.approval == self.config.approval_policy.get()
                     && &preset.sandbox == self.config.sandbox_policy.get()
             })
+            .or_else(|| {
+                // When the project is untrusted, the above code won't match
+                // since AskForApproval::UnlessTrusted is not part of the
+                // default presets. However, in this case we still want to show
+                // the mode selector, which allows the user to choose a
+                // different mode (which will set the project to be trusted)
+                // See https://github.com/zed-industries/zed/issues/48132
+                if self.config.active_project.is_untrusted() {
+                    APPROVAL_PRESETS
+                        .iter()
+                        .find(|preset| preset.id == "read-only")
+                } else {
+                    None
+                }
+            })
             .map(|preset| SessionModeId::new(preset.id))?;
 
         Some(SessionModeState::new(
