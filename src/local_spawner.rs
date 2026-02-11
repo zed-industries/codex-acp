@@ -123,7 +123,7 @@ impl AcpFs {
                 )
             })
     }
-    
+
     fn ensure_within_root(&self, path: &std::path::Path) -> std::io::Result<PathBuf> {
         let root = std::path::absolute(self.session_root()?)?;
         // Fix: Resolve relative paths against session root, not CWD
