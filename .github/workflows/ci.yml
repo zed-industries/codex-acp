@@ -68,11 +68,13 @@ jobs:
           restore-keys: |
             ${{ matrix.os }}-${{ matrix.target }}-cargo-target-
 
-      - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
-        name: Install musl build tools
+      - name: Install Linux build dependencies
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools pkg-config
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y pkg-config libcap-dev musl-tools
 
       - name: Run tests
         run: cargo test --release --target ${{ matrix.target }}
