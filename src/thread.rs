@@ -21,7 +21,6 @@ use agent_client_protocol::{
     ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use codex_apply_patch::parse_patch;
-use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
     AuthManager, CodexThread,
     config::{Config, set_project_trust_level},
@@ -57,6 +56,7 @@ use codex_protocol::{
     protocol::RolloutItem,
     user_input::UserInput,
 };
+use codex_utils_approval_presets::{ApprovalPreset, builtin_approval_presets};
 use heck::ToTitleCase;
 use itertools::Itertools;
 use serde_json::json;
@@ -430,8 +430,9 @@ impl PromptState {
             EventMsg::TurnStarted(TurnStartedEvent {
                 model_context_window,
                 collaboration_mode_kind,
+                turn_id,
             }) => {
-                info!("Task started with context window of {model_context_window:?} {collaboration_mode_kind:?}");
+                info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
             }
             EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
@@ -617,9 +618,9 @@ impl PromptState {
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
             }
-            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message }) => {
+            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id }) => {
                 info!(
-                    "Task completed successfully after {} events. Last agent message: {last_agent_message:?}",
+                    "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
                 );
                 if let Some(response_tx) = self.response_tx.take() {
@@ -665,8 +666,8 @@ impl PromptState {
                         .ok();
                 }
             }
-            EventMsg::TurnAborted(TurnAbortedEvent { reason }) => {
-                info!("Turn aborted: {reason:?}");
+            EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id }) => {
+                info!("Turn {turn_id:?} aborted: {reason:?}");
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
                 }
@@ -750,6 +751,8 @@ impl PromptState {
             | EventMsg::CollabAgentInteractionEnd(..)
             | EventMsg::CollabWaitingBegin(..)
             | EventMsg::CollabWaitingEnd(..)
+            | EventMsg::CollabResumeBegin(..)
+            | EventMsg::CollabResumeEnd(..)
             | EventMsg::CollabCloseBegin(..)
             | EventMsg::CollabCloseEnd(..)
             | EventMsg::PlanDelta(..) => {}
@@ -1062,7 +1065,7 @@ impl PromptState {
         let ExecApprovalRequestEvent {
             call_id,
             command: _,
-            turn_id: _,
+            turn_id,
             cwd,
             reason,
             parsed_cmd,
@@ -1150,6 +1153,7 @@ impl PromptState {
         self.thread
             .submit(Op::ExecApproval {
                 id: self.submission_id.clone(),
+                turn_id: Some(turn_id),
                 decision,
             })
             .await
@@ -2336,7 +2340,7 @@ impl<A: Auth> ThreadActor<A> {
                     TrustLevel::Trusted,
                 )?;
             }
-            SandboxPolicy::ReadOnly => {}
+            SandboxPolicy::ReadOnly { .. } => {}
         }
 
         Ok(())
@@ -2867,8 +2871,7 @@ mod tests {
 
     use agent_client_protocol::TextContent;
     use codex_core::{
-        config::ConfigOverrides, models_manager::model_presets::all_model_presets,
-        protocol::AgentMessageEvent,
+        config::ConfigOverrides, protocol::AgentMessageEvent, test_support::all_model_presets,
     };
     use codex_protocol::config_types::ModeKind;
     use tokio::{
@@ -3495,6 +3498,7 @@ mod tests {
                             id: id.to_string(),
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
+                                turn_id: id.to_string(),
                             }),
                         })
                         .unwrap();
@@ -3506,6 +3510,7 @@ mod tests {
                             msg: EventMsg::TurnStarted(TurnStartedEvent {
                                 model_context_window: None,
                                 collaboration_mode_kind: ModeKind::default(),
+                                turn_id: id.to_string(),
                             }),
                         })
                         .unwrap();
@@ -3522,6 +3527,7 @@ mod tests {
                             id: id.to_string(),
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
+                                turn_id: id.to_string(),
                             }),
                         })
                         .unwrap();
@@ -3551,6 +3557,7 @@ mod tests {
                             id: id.to_string(),
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
+                                turn_id: id.to_string(),
                             }),
                         })
                         .unwrap();
@@ -3583,6 +3590,7 @@ mod tests {
                             id: id.to_string(),
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
+                                turn_id: id.to_string(),
                             }),
                         })
                         .unwrap();
