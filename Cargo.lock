@@ -781,9 +781,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.55"
+version = "1.2.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47b26a0954ae34af09b50f0de26458fa95369a0d478d8236d3f93082b219bd29"
+checksum = "aebf35691d1bfb0ac386a69bac2fde4dd276fb618cf8bf4f5318fe285e821bb2"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -954,7 +954,7 @@ dependencies = [
 [[package]]
 name = "codex-api"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "async-trait",
  "bytes",
@@ -979,7 +979,7 @@ dependencies = [
 [[package]]
 name = "codex-app-server-protocol"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "anyhow",
  "clap",
@@ -990,6 +990,7 @@ dependencies = [
  "schemars 0.8.22",
  "serde",
  "serde_json",
+ "shlex",
  "strum_macros",
  "thiserror 2.0.18",
  "ts-rs",
@@ -999,7 +1000,7 @@ dependencies = [
 [[package]]
 name = "codex-apply-patch"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "anyhow",
  "similar",
@@ -1011,7 +1012,7 @@ dependencies = [
 [[package]]
 name = "codex-arg0"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "anyhow",
  "codex-apply-patch",
@@ -1025,7 +1026,7 @@ dependencies = [
 [[package]]
 name = "codex-async-utils"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "async-trait",
  "tokio",
@@ -1035,7 +1036,7 @@ dependencies = [
 [[package]]
 name = "codex-client"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1057,7 +1058,7 @@ dependencies = [
 [[package]]
 name = "codex-config"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "codex-app-server-protocol",
  "codex-execpolicy",
@@ -1075,7 +1076,7 @@ dependencies = [
 [[package]]
 name = "codex-core"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1108,6 +1109,7 @@ dependencies = [
  "codex-utils-home-dir",
  "codex-utils-pty",
  "codex-utils-readiness",
+ "codex-utils-sanitizer",
  "codex-utils-string",
  "codex-windows-sandbox",
  "core-foundation 0.9.4",
@@ -1129,7 +1131,6 @@ dependencies = [
  "openssl-sys",
  "os_info",
  "rand 0.9.2",
- "regex",
  "regex-lite",
  "reqwest",
  "rmcp",
@@ -1165,7 +1166,7 @@ dependencies = [
 [[package]]
 name = "codex-execpolicy"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "anyhow",
  "clap",
@@ -1180,7 +1181,7 @@ dependencies = [
 [[package]]
 name = "codex-experimental-api-macros"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1190,7 +1191,7 @@ dependencies = [
 [[package]]
 name = "codex-file-search"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "anyhow",
  "clap",
@@ -1205,7 +1206,7 @@ dependencies = [
 [[package]]
 name = "codex-git"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "once_cell",
  "regex",
@@ -1220,7 +1221,7 @@ dependencies = [
 [[package]]
 name = "codex-hooks"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "chrono",
  "codex-protocol",
@@ -1233,7 +1234,7 @@ dependencies = [
 [[package]]
 name = "codex-keyring-store"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "keyring",
  "tracing",
@@ -1242,7 +1243,7 @@ dependencies = [
 [[package]]
 name = "codex-linux-sandbox"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "cc",
  "clap",
@@ -1258,7 +1259,7 @@ dependencies = [
 [[package]]
 name = "codex-login"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "base64",
  "chrono",
@@ -1280,7 +1281,7 @@ dependencies = [
 [[package]]
 name = "codex-mcp-server"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "anyhow",
  "codex-arg0",
@@ -1301,10 +1302,11 @@ dependencies = [
 [[package]]
 name = "codex-network-proxy"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "clap",
  "codex-utils-absolute-path",
  "codex-utils-rustls-provider",
@@ -1329,7 +1331,7 @@ dependencies = [
 [[package]]
 name = "codex-otel"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "chrono",
  "codex-api",
@@ -1359,7 +1361,7 @@ dependencies = [
 [[package]]
 name = "codex-protocol"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "codex-execpolicy",
  "codex-git",
@@ -1384,7 +1386,7 @@ dependencies = [
 [[package]]
 name = "codex-rmcp-client"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "anyhow",
  "axum",
@@ -1412,7 +1414,7 @@ dependencies = [
 [[package]]
 name = "codex-shell-command"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "base64",
  "codex-protocol",
@@ -1431,7 +1433,7 @@ dependencies = [
 [[package]]
 name = "codex-state"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1453,7 +1455,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-absolute-path"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "dirs",
  "path-absolutize",
@@ -1465,7 +1467,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-approval-presets"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "codex-core",
 ]
@@ -1473,7 +1475,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-cache"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "lru",
  "sha1",
@@ -1483,7 +1485,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-cli"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "clap",
  "codex-core",
@@ -1495,7 +1497,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-home-dir"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "dirs",
 ]
@@ -1503,7 +1505,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-image"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "base64",
  "codex-utils-cache",
@@ -1515,7 +1517,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-json-to-toml"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "serde_json",
  "toml 0.9.12+spec-1.1.0",
@@ -1524,7 +1526,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-pty"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "anyhow",
  "filedescriptor",
@@ -1540,7 +1542,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-readiness"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "async-trait",
  "thiserror 2.0.18",
@@ -1551,20 +1553,28 @@ dependencies = [
 [[package]]
 name = "codex-utils-rustls-provider"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "rustls",
 ]
 
 [[package]]
+name = "codex-utils-sanitizer"
+version = "0.0.0"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
+dependencies = [
+ "regex",
+]
+
+[[package]]
 name = "codex-utils-string"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 
 [[package]]
 name = "codex-windows-sandbox"
 version = "0.0.0"
-source = "git+https://github.com/zed-industries/codex?branch=acp#05cae864f9ab0049eeae180a125eaa4db4a22178"
+source = "git+https://github.com/zed-industries/codex?branch=acp#1591f20ca07bbde58358364020eff9f2cf24f192"
 dependencies = [
  "anyhow",
  "base64",
@@ -3645,9 +3655,9 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "libc"
-version = "0.2.181"
+version = "0.2.180"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "459427e2af2b9c839b132acb702a1c654d95e10f8c326bfc2ad11310e458b1c5"
+checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
 
 [[package]]
 name = "libdbus-sys"
@@ -3971,9 +3981,9 @@ dependencies = [
 
 [[package]]
 name = "native-tls"
-version = "0.2.14"
+version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87de3442987e9dbec73158d5c715e7ad9072fda936bb03d19d7fa10e00520f0e"
+checksum = "6cdede44f9a69cab2899a2049e2c3bd49bf911a157f6a3353d4a91c61abbce44"
 dependencies = [
  "libc",
  "log",
@@ -4037,6 +4047,18 @@ name = "nix"
 version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags 2.10.0",
+ "cfg-if",
+ "cfg_aliases 0.2.1",
+ "libc",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "225e7cfe711e0ba79a68baeddb2982723e4235247aefce1482f2f16c27865b66"
 dependencies = [
  "bitflags 2.10.0",
  "cfg-if",
@@ -4923,13 +4945,13 @@ dependencies = [
 
 [[package]]
 name = "process-wrap"
-version = "9.0.2"
+version = "9.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5811c133381ea59d7dd6ca37419b434bb2e3089a2a59c1e4b26a86fa79426e23"
+checksum = "ccd9713fe2c91c3c85ac388b31b89de339365d2c995146e630b5e0da9d06526a"
 dependencies = [
  "futures",
  "indexmap 2.13.0",
- "nix 0.30.1",
+ "nix 0.31.1",
  "tokio",
  "tracing",
  "windows 0.62.2",
@@ -4975,9 +4997,9 @@ dependencies = [
 
 [[package]]
 name = "psl"
-version = "2.1.189"
+version = "2.1.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b687d25588173c6432b3f40da08066984344a0a02d2895b1b65231cb8b81df"
+checksum = "66fed3dc7578357ff12137c75eac73413b6aba9a7204916c19f2a0e9e1e920e0"
 dependencies = [
  "psl-types",
 ]
@@ -7287,9 +7309,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.0.7+spec-1.1.0"
+version = "1.0.8+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "247eaa3197818b831697600aadf81514e577e0cba5eab10f7e064e78ae154df1"
+checksum = "0742ff5ff03ea7e67c8ae6c93cac239e0d9784833362da3f9a9c1da8dfefcbdc"
 dependencies = [
  "winnow",
 ]
