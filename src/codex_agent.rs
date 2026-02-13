@@ -148,6 +148,7 @@ impl CodexAgent {
                                 },
                                 env_http_headers: None,
                             },
+                            required: false,
                             enabled: true,
                             startup_timeout_sec: None,
                             tool_timeout_sec: None,
@@ -179,6 +180,7 @@ impl CodexAgent {
                                 env_vars: vec![],
                                 cwd: Some(cwd.clone()),
                             },
+                            required: false,
                             enabled: true,
                             startup_timeout_sec: None,
                             tool_timeout_sec: None,
@@ -437,7 +439,7 @@ impl Agent for CodexAgent {
         let cursor_obj = cursor.as_deref().and_then(parse_cursor);
 
         let page = RolloutRecorder::list_threads(
-            &self.config.codex_home,
+            &self.config,
             SESSION_LIST_PAGE_SIZE,
             cursor_obj.as_ref(),
             ThreadSortKey::UpdatedAt,
