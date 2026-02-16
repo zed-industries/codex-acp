@@ -1,6 +1,6 @@
 [package]
 name = "codex-acp"
-version = "0.9.2"
+version = "0.9.3"
 edition = "2024"
 authors = ["Zed <hi@zed.dev>"]
 license = "Apache-2.0"
@@ -13,6 +13,7 @@ name = "codex-acp"
 path = "src/main.rs"
 
 [lib]
+doctest = false
 name = "codex_acp"
 path = "src/lib.rs"
 
@@ -23,11 +24,12 @@ async-trait = "0.1"
 clap = "4"
 codex-apply-patch = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-arg0 = { git = "https://github.com/zed-industries/codex", branch = "acp" }
-codex-common = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["cli"] }
 codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-mcp-server = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-protocol = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-login = { git = "https://github.com/zed-industries/codex", branch = "acp" }
+codex-utils-approval-presets = { git = "https://github.com/zed-industries/codex", branch = "acp" }
+codex-utils-cli = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 itertools = "0.14.0"
 regex-lite = "0.1"
 serde = { version = "1", features = ["derive"] }
@@ -43,16 +45,11 @@ heck = "0.5.0"
 unicode-segmentation = "1.11.0"
 uuid = { version = "1", features = ["v4"] }
 
-[dev-dependencies]
-codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["test-support"] }
-
 [lints.rust]
 let-underscore = "warn"
 rust-2018-idioms = "warn"
 unused = "warn"
 
 [patch.crates-io]
-tokio-tungstenite = { git = "https://github.com/JakkuSakura/tokio-tungstenite", branch = "proxy-support" }
-
-[patch.'ssh://git@github.com/JakkuSakura/tungstenite-rs.git']
-tungstenite = { git = "https://github.com/JakkuSakura/tungstenite-rs", branch = "proxy-support" }
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "132f5b39c862e3a970f731d709608b3e6276d5f6" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "9200079d3b54a1ff51072e24d81fd354f085156f" }
