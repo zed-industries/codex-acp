@@ -13,6 +13,7 @@ name = "codex-acp"
 path = "src/main.rs"
 
 [lib]
+doctest = false
 name = "codex_acp"
 path = "src/lib.rs"
 
