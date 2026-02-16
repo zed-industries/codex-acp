@@ -75,13 +75,23 @@ jobs:
         uses: actions/cache@v4
         with:
           path: target
-          # v2: busts stale caches that contained cmake/build-script artifacts
-          # compiled with wrong flags (UBSan leaks, glibc library paths).
-          # The hash of the musl install script is included so that tooling
-          # changes also invalidate the cache.
-          key: v2-${{ matrix.os }}-${{ matrix.target }}-cargo-target-${{ hashFiles('**/Cargo.lock', '.github/scripts/install-musl-build-tools.sh') }}
-          restore-keys: |
-            v2-${{ matrix.os }}-${{ matrix.target }}-cargo-target-
+          # v3: busts v2 caches that still contained cmake artifacts compiled
+          # with UBSan flags.  restore-keys intentionally omitted so that a
+          # Cargo.lock or tooling change forces a fully clean build instead of
+          # restoring a stale target/ with baked-in cmake caches.
+          key: v3-${{ matrix.os }}-${{ matrix.target }}-cargo-target-${{ hashFiles('**/Cargo.lock', '.github/scripts/install-musl-build-tools.sh') }}
+
+      - name: Purge stale cmake caches (musl)
+        if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # cmake bakes CFLAGS into CMakeCache.txt on first configure and
+          # ignores the environment on subsequent runs.  If a cached target/
+          # directory contains a CMakeCache.txt with UBSan flags, the C
+          # objects will have __ubsan_handle_* references that cannot be
+          # resolved when linking a static musl binary.
+          find target -name CMakeCache.txt -exec rm -f {} + 2>/dev/null || true
 
       - name: Install Linux build dependencies
         if: ${{ runner.os == 'Linux' }}
