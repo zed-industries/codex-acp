@@ -896,6 +896,7 @@ impl PromptState {
             grant_root: _,
             turn_id: _,
         } = event;
+        let approval_id = call_id.clone();
         let (title, locations, content) = extract_tool_call_content_from_changes(changes);
         let response = client
             .request_permission(
@@ -932,7 +933,7 @@ impl PromptState {
 
         self.thread
             .submit(Op::PatchApproval {
-                id: self.submission_id.clone(),
+                id: approval_id,
                 decision,
             })
             .await
@@ -1156,7 +1157,7 @@ impl PromptState {
 
         self.thread
             .submit(Op::ExecApproval {
-                id: self.submission_id.clone(),
+                id: call_id,
                 turn_id: Some(turn_id),
                 decision,
             })
