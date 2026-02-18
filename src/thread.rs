@@ -35,11 +35,12 @@ use codex_core::{
         ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent, FileChange,
         ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation,
         McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
-        Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
-        ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
-        ReviewTarget, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent, TurnAbortedEvent,
-        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
-        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        ModelRerouteEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
+        ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
+        ReviewOutputEvent, ReviewRequest, ReviewTarget, SandboxPolicy, StreamErrorEvent,
+        TerminalInteractionEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent,
+        UserMessageEvent, ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent,
+        WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
@@ -92,20 +93,19 @@ impl CodexThreadImpl for CodexThread {
 
 #[async_trait::async_trait]
 pub trait ModelsManagerImpl {
-    async fn get_model(&self, model_id: &Option<String>, config: &Config) -> String;
-    async fn list_models(&self, config: &Config) -> Vec<ModelPreset>;
+    async fn get_model(&self, model_id: &Option<String>) -> String;
+    async fn list_models(&self) -> Vec<ModelPreset>;
 }
 
 #[async_trait::async_trait]
 impl ModelsManagerImpl for ModelsManager {
-    async fn get_model(&self, model_id: &Option<String>, config: &Config) -> String {
-        self.get_default_model(model_id, config, RefreshStrategy::OnlineIfUncached)
+    async fn get_model(&self, model_id: &Option<String>) -> String {
+        self.get_default_model(model_id, RefreshStrategy::OnlineIfUncached)
             .await
     }
 
-    async fn list_models(&self, config: &Config) -> Vec<ModelPreset> {
-        self.list_models(config, RefreshStrategy::OnlineIfUncached)
-            .await
+    async fn list_models(&self) -> Vec<ModelPreset> {
+        self.list_models(RefreshStrategy::OnlineIfUncached).await
     }
 }
 
@@ -363,7 +363,6 @@ struct PromptState {
     thread: Arc<dyn CodexThreadImpl>,
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
-    submission_id: String,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
 }
@@ -372,7 +371,6 @@ impl PromptState {
     fn new(
         thread: Arc<dyn CodexThreadImpl>,
         response_tx: oneshot::Sender<Result<StopReason, Error>>,
-        submission_id: String,
     ) -> Self {
         Self {
             active_commands: HashMap::new(),
@@ -380,7 +378,6 @@ impl PromptState {
             thread,
             event_count: 0,
             response_tx: Some(response_tx),
-            submission_id,
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
         }
@@ -725,6 +722,9 @@ impl PromptState {
                     drop(response_tx.send(Err(err)));
                 }
             }
+            EventMsg::ModelReroute(ModelRerouteEvent { from_model, to_model, reason }) => {
+                info!("Model reroute: from={from_model}, to={to_model}, reason={reason:?}");
+            }
 
             // Ignore these events
             EventMsg::AgentReasoningRawContent(..)
@@ -900,7 +900,7 @@ impl PromptState {
         let response = client
             .request_permission(
                 ToolCallUpdate::new(
-                    call_id,
+                    call_id.clone(),
                     ToolCallUpdateFields::new()
                         .kind(ToolKind::Edit)
                         .status(ToolCallStatus::Pending)
@@ -932,7 +932,7 @@ impl PromptState {
 
         self.thread
             .submit(Op::PatchApproval {
-                id: self.submission_id.clone(),
+                id: call_id,
                 decision,
             })
             .await
@@ -1072,6 +1072,8 @@ impl PromptState {
             reason,
             parsed_cmd,
             proposed_execpolicy_amendment,
+            approval_id,
+            network_approval_context: _,
         } = event;
 
         // Create a new tool call for the command execution
@@ -1156,7 +1158,7 @@ impl PromptState {
 
         self.thread
             .submit(Op::ExecApproval {
-                id: self.submission_id.clone(),
+                id: approval_id.unwrap_or(call_id),
                 turn_id: Some(turn_id),
                 decision,
             })
@@ -1893,7 +1895,7 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn find_current_model(&self) -> Option<ModelId> {
-        let model_presets = self.models_manager.list_models(&self.config).await;
+        let model_presets = self.models_manager.list_models().await;
         let config_model = self.get_current_model().await;
         let preset = model_presets
             .iter()
@@ -1945,7 +1947,7 @@ impl<A: Auth> ThreadActor<A> {
             );
         }
 
-        let presets = self.models_manager.list_models(&self.config).await;
+        let presets = self.models_manager.list_models().await;
 
         let current_model = self.get_current_model().await;
         let current_preset = presets.iter().find(|p| p.model == current_model).cloned();
@@ -2054,7 +2056,7 @@ impl<A: Auth> ThreadActor<A> {
     async fn handle_set_config_model(&mut self, value: SessionConfigValueId) -> Result<(), Error> {
         let model_id = value.0;
 
-        let presets = self.models_manager.list_models(&self.config).await;
+        let presets = self.models_manager.list_models().await;
         let preset = presets.iter().find(|p| p.id.as_str() == &*model_id);
 
         let model_to_use = preset
@@ -2111,7 +2113,7 @@ impl<A: Auth> ThreadActor<A> {
             serde_json::from_value(value.0.as_ref().into()).map_err(|_| Error::invalid_params())?;
 
         let current_model = self.get_current_model().await;
-        let presets = self.models_manager.list_models(&self.config).await;
+        let presets = self.models_manager.list_models().await;
         let Some(preset) = presets.iter().find(|p| p.model == current_model) else {
             return Err(Error::invalid_params()
                 .data("Reasoning effort can only be set for known model presets"));
@@ -2162,7 +2164,7 @@ impl<A: Auth> ThreadActor<A> {
 
         available_models.extend(
             self.models_manager
-                .list_models(&self.config)
+                .list_models()
                 .await
                 .iter()
                 .filter(|model| model.show_in_picker || model.model == config_model)
@@ -2288,11 +2290,7 @@ impl<A: Auth> ThreadActor<A> {
         info!("Submitted prompt with submission_id: {submission_id}");
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
 
-        let state = SubmissionState::Prompt(PromptState::new(
-            self.thread.clone(),
-            response_tx,
-            submission_id.clone(),
-        ));
+        let state = SubmissionState::Prompt(PromptState::new(self.thread.clone(), response_tx));
 
         self.submissions.insert(submission_id, state);
 
@@ -2349,9 +2347,7 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn get_current_model(&self) -> String {
-        self.models_manager
-            .get_model(&self.config.model, &self.config)
-            .await
+        self.models_manager.get_model(&self.config.model).await
     }
 
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
@@ -3428,11 +3424,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ModelsManagerImpl for StubModelsManager {
-        async fn get_model(&self, _model_id: &Option<String>, _config: &Config) -> String {
+        async fn get_model(&self, _model_id: &Option<String>) -> String {
             all_model_presets()[0].to_owned().id
         }
 
-        async fn list_models(&self, _config: &Config) -> Vec<ModelPreset> {
+        async fn list_models(&self) -> Vec<ModelPreset> {
             all_model_presets().to_owned()
         }
     }
