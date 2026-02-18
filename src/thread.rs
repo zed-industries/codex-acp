@@ -363,7 +363,6 @@ struct PromptState {
     thread: Arc<dyn CodexThreadImpl>,
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
-    submission_id: String,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
 }
@@ -372,7 +371,6 @@ impl PromptState {
     fn new(
         thread: Arc<dyn CodexThreadImpl>,
         response_tx: oneshot::Sender<Result<StopReason, Error>>,
-        submission_id: String,
     ) -> Self {
         Self {
             active_commands: HashMap::new(),
@@ -380,7 +378,6 @@ impl PromptState {
             thread,
             event_count: 0,
             response_tx: Some(response_tx),
-            submission_id,
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
         }
@@ -903,7 +900,7 @@ impl PromptState {
         let response = client
             .request_permission(
                 ToolCallUpdate::new(
-                    call_id,
+                    call_id.clone(),
                     ToolCallUpdateFields::new()
                         .kind(ToolKind::Edit)
                         .status(ToolCallStatus::Pending)
@@ -935,7 +932,7 @@ impl PromptState {
 
         self.thread
             .submit(Op::PatchApproval {
-                id: self.submission_id.clone(),
+                id: call_id,
                 decision,
             })
             .await
@@ -1161,7 +1158,7 @@ impl PromptState {
 
         self.thread
             .submit(Op::ExecApproval {
-                id: approval_id.unwrap_or_else(|| self.submission_id.clone()),
+                id: approval_id.unwrap_or(call_id),
                 turn_id: Some(turn_id),
                 decision,
             })
@@ -2293,11 +2290,7 @@ impl<A: Auth> ThreadActor<A> {
         info!("Submitted prompt with submission_id: {submission_id}");
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
 
-        let state = SubmissionState::Prompt(PromptState::new(
-            self.thread.clone(),
-            response_tx,
-            submission_id.clone(),
-        ));
+        let state = SubmissionState::Prompt(PromptState::new(self.thread.clone(), response_tx));
 
         self.submissions.insert(submission_id, state);
 
