@@ -126,7 +126,14 @@ impl AcpFs {
 
     fn ensure_within_root(&self, path: &std::path::Path) -> std::io::Result<PathBuf> {
         let root = std::path::absolute(self.session_root()?)?;
-        let abs_path = std::path::absolute(path)?;
+        // Fix: Resolve relative paths against session root, not CWD
+        // This ensures that relative paths from apply_patch are correctly resolved
+        let abs_path = if path.is_absolute() {
+            std::path::absolute(path)?
+        } else {
+            let resolved = root.join(path);
+            std::path::absolute(&resolved)?
+        };
         if abs_path.starts_with(&root) {
             Ok(abs_path)
         } else {

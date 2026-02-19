@@ -2,8 +2,8 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use agent_client_protocol::AgentSideConnection;
-use codex_common::CliConfigOverrides;
 use codex_core::config::{Config, ConfigOverrides};
+use codex_utils_cli::CliConfigOverrides;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::{io::Result as IoResult, rc::Rc};

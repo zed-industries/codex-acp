@@ -11,7 +11,6 @@ use agent_client_protocol::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, Client, ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource, EmbeddedResourceResource, Error, ExtRequest, ExtResponse, LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, RawValue, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal, TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput
 };
 use codex_apply_patch::parse_patch;
-use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
     AuthManager, CodexThread,
     config::{Config, set_project_trust_level},
@@ -19,8 +18,20 @@ use codex_core::{
     models_manager::manager::{ModelsManager, RefreshStrategy},
     parse_command::parse_command,
     protocol::{
-        AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent, AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ElicitationAction, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExitedReviewModeEvent, FileChange, ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent, TokenUsageInfo, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent
-        },
+        AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
+        AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent,
+        ApplyPatchApprovalRequestEvent, ElicitationAction, ErrorEvent, Event, EventMsg,
+        ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent,
+        ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent, FileChange,
+        ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation,
+        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
+        ModelRerouteEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
+        ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
+        ReviewOutputEvent, ReviewRequest, ReviewTarget, SandboxPolicy, StreamErrorEvent,
+        TerminalInteractionEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent,
+        UserMessageEvent, ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent,
+        WebSearchEndEvent,
+    },
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
@@ -36,6 +47,7 @@ use codex_protocol::{
     protocol::RolloutItem,
     user_input::UserInput,
 };
+use codex_utils_approval_presets::{ApprovalPreset, builtin_approval_presets};
 use heck::ToTitleCase;
 use itertools::Itertools;
 use serde_json::{json, value::to_raw_value};
@@ -100,20 +112,19 @@ impl CodexThreadImpl for CodexThread {
 
 #[async_trait::async_trait]
 pub trait ModelsManagerImpl {
-    async fn get_model(&self, model_id: &Option<String>, config: &Config) -> String;
-    async fn list_models(&self, config: &Config) -> Vec<ModelPreset>;
+    async fn get_model(&self, model_id: &Option<String>) -> String;
+    async fn list_models(&self) -> Vec<ModelPreset>;
 }
 
 #[async_trait::async_trait]
 impl ModelsManagerImpl for ModelsManager {
-    async fn get_model(&self, model_id: &Option<String>, config: &Config) -> String {
-        self.get_default_model(model_id, config, RefreshStrategy::OnlineIfUncached)
+    async fn get_model(&self, model_id: &Option<String>) -> String {
+        self.get_default_model(model_id, RefreshStrategy::OnlineIfUncached)
             .await
     }
 
-    async fn list_models(&self, config: &Config) -> Vec<ModelPreset> {
-        self.list_models(config, RefreshStrategy::OnlineIfUncached)
-            .await
+    async fn list_models(&self) -> Vec<ModelPreset> {
+        self.list_models(RefreshStrategy::OnlineIfUncached).await
     }
 }
 
@@ -304,10 +315,8 @@ impl Thread {
 enum SubmissionState {
     /// Loading custom prompts from the project
     CustomPrompts(CustomPromptsState),
-    /// User prompts + some slash commands like /init or /review
+    /// User prompts, including slash commands like /init, /review, /compact, /undo.
     Prompt(PromptState),
-    /// Subtask, like /compact
-    Task(TaskState),
 }
 
 impl SubmissionState {
@@ -315,7 +324,6 @@ impl SubmissionState {
         match self {
             Self::CustomPrompts(state) => state.is_active(),
             Self::Prompt(state) => state.is_active(),
-            Self::Task(state) => state.is_active(),
         }
     }
 
@@ -323,7 +331,6 @@ impl SubmissionState {
         match self {
             Self::CustomPrompts(state) => state.handle_event(event),
             Self::Prompt(state) => state.handle_event(client, event).await,
-            Self::Task(state) => state.handle_event(client, event).await,
         }
     }
 }
@@ -363,7 +370,6 @@ impl CustomPromptsState {
 }
 
 struct ActiveCommand {
-    call_id: String,
     tool_call_id: ToolCallId,
     terminal_output: bool,
     output: String,
@@ -371,12 +377,11 @@ struct ActiveCommand {
 }
 
 struct PromptState {
-    active_command: Option<ActiveCommand>,
+    active_commands: HashMap<String, ActiveCommand>,
     active_web_search: Option<String>,
     thread: Arc<dyn CodexThreadImpl>,
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
-    submission_id: String,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
 }
@@ -385,15 +390,13 @@ impl PromptState {
     fn new(
         thread: Arc<dyn CodexThreadImpl>,
         response_tx: oneshot::Sender<Result<StopReason, Error>>,
-        submission_id: String,
     ) -> Self {
         Self {
-            active_command: None,
+            active_commands: HashMap::new(),
             active_web_search: None,
             thread,
             event_count: 0,
             response_tx: Some(response_tx),
-            submission_id,
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
         }
@@ -442,11 +445,11 @@ impl PromptState {
             EventMsg::TurnStarted(TurnStartedEvent {
                 model_context_window,
                 collaboration_mode_kind,
+                turn_id,
             }) => {
-                info!("Task started with context window of {model_context_window:?} {collaboration_mode_kind:?}");
+                info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
             }
             EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
-
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
             }
             EventMsg::UserMessage(UserMessageEvent {
@@ -457,18 +460,38 @@ impl PromptState {
             }) => {
                 info!("User message: {message:?}");
             }
-            EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent { thread_id, turn_id, item_id, delta }) => {
+            EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
+                thread_id,
+                turn_id,
+                item_id,
+                delta,
+            }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
                 self.seen_message_deltas = true;
                 client.send_agent_text(delta).await;
             }
-            EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent { thread_id, turn_id, item_id, delta, summary_index: index })
-            | EventMsg::ReasoningRawContentDelta(ReasoningRawContentDeltaEvent { thread_id, turn_id, item_id, delta, content_index: index }) => {
+            EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
+                thread_id,
+                turn_id,
+                item_id,
+                delta,
+                summary_index: index,
+            })
+            | EventMsg::ReasoningRawContentDelta(ReasoningRawContentDeltaEvent {
+                thread_id,
+                turn_id,
+                item_id,
+                delta,
+                content_index: index,
+            }) => {
                 info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought(delta).await;
             }
-            EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent { item_id, summary_index}) => {
+            EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
+                item_id,
+                summary_index,
+            }) => {
                 info!("Agent reasoning section break received:  item_id: {item_id}, index: {summary_index}");
                 // Make sure the section heading actually get spacing
                 self.seen_reasoning_deltas = true;
@@ -508,17 +531,27 @@ impl PromptState {
                 // Create a ToolCall notification for the search beginning
                 self.start_web_search(client, call_id).await;
             }
-            EventMsg::WebSearchEnd(WebSearchEndEvent { call_id, query, action }) => {
+            EventMsg::WebSearchEnd(WebSearchEndEvent {
+                call_id,
+                query,
+                action,
+            }) => {
                 info!("Web search query received: call_id={call_id}, query={query}");
                 // Send update that the search is in progress with the query
                 // (WebSearchEnd just means we have the query, not that results are ready)
-                self.update_web_search_query(client, call_id, query, action).await;
+                self.update_web_search_query(client, call_id, query, action)
+                    .await;
                 // The actual search results will come through AgentMessage events
                 // We mark as completed when a new tool call begins
             }
             EventMsg::ExecApprovalRequest(event) => {
-                info!("Command execution started: call_id={}, command={:?}", event.call_id, event.command);
-                if let Err(err) = self.exec_approval(client, event).await && let Some(response_tx) = self.response_tx.take() {
+                info!(
+                    "Command execution started: call_id={}, command={:?}",
+                    event.call_id, event.command
+                );
+                if let Err(err) = self.exec_approval(client, event).await
+                    && let Some(response_tx) = self.response_tx.take()
+                {
                     drop(response_tx.send(Err(err)));
                 }
             }
@@ -546,34 +579,64 @@ impl PromptState {
                 );
                 self.terminal_interaction(client, event).await;
             }
-            EventMsg::McpToolCallBegin(McpToolCallBeginEvent { call_id, invocation }) => {
-                info!("MCP tool call begin: call_id={call_id}, invocation={} {}", invocation.server, invocation.tool);
+            EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
+                call_id,
+                invocation,
+            }) => {
+                info!(
+                    "MCP tool call begin: call_id={call_id}, invocation={} {}",
+                    invocation.server, invocation.tool
+                );
                 self.start_mcp_tool_call(client, call_id, invocation).await;
             }
-            EventMsg::McpToolCallEnd(McpToolCallEndEvent { call_id, invocation, duration, result }) => {
-                info!("MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}", invocation.server, invocation.tool);
+            EventMsg::McpToolCallEnd(McpToolCallEndEvent {
+                call_id,
+                invocation,
+                duration,
+                result,
+            }) => {
+                info!(
+                    "MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}",
+                    invocation.server, invocation.tool
+                );
                 self.end_mcp_tool_call(client, call_id, result).await;
             }
             EventMsg::ApplyPatchApprovalRequest(event) => {
-                info!("Apply patch approval request: call_id={}, reason={:?}", event.call_id, event.reason);
-                if let Err(err) = self.patch_approval(client, event).await && let Some(response_tx) = self.response_tx.take() {
+                info!(
+                    "Apply patch approval request: call_id={}, reason={:?}",
+                    event.call_id, event.reason
+                );
+                if let Err(err) = self.patch_approval(client, event).await
+                    && let Some(response_tx) = self.response_tx.take()
+                {
                     drop(response_tx.send(Err(err)));
                 }
             }
             EventMsg::PatchApplyBegin(event) => {
-                info!("Patch apply begin: call_id={}, auto_approved={}", event.call_id,event.auto_approved);
+                info!(
+                    "Patch apply begin: call_id={}, auto_approved={}",
+                    event.call_id, event.auto_approved
+                );
                 self.start_patch_apply(client, event).await;
             }
             EventMsg::PatchApplyEnd(event) => {
-                info!("Patch apply end: call_id={}, success={}", event.call_id, event.success);
+                info!(
+                    "Patch apply end: call_id={}, success={}",
+                    event.call_id, event.success
+                );
                 self.end_patch_apply(client, event).await;
             }
-            EventMsg::ItemCompleted(ItemCompletedEvent { thread_id, turn_id, item }) => {
+            EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id,
+                turn_id,
+                item,
+            }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
             }
-            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message}) => {
+            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id }) => {
                 info!(
-                    "Task completed successfully after {} events. Last agent message: {last_agent_message:?}", self.event_count
+                    "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
+                    self.event_count
                 );
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
@@ -596,17 +659,30 @@ impl PromptState {
                 };
                 client.send_agent_text(event.message.unwrap_or(fallback)).await;
             }
-            EventMsg::StreamError(StreamErrorEvent { message , codex_error_info, additional_details }) => {
-                error!("Handled error during turn: {message} {codex_error_info:?} {additional_details:?}");
+            EventMsg::StreamError(StreamErrorEvent {
+                message,
+                codex_error_info,
+                additional_details,
+            }) => {
+                error!(
+                    "Handled error during turn: {message} {codex_error_info:?} {additional_details:?}"
+                );
             }
-            EventMsg::Error(ErrorEvent { message, codex_error_info }) => {
+            EventMsg::Error(ErrorEvent {
+                message,
+                codex_error_info,
+            }) => {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
                 if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Err(Error::internal_error().data(json!({ "message": message, "codex_error_info": codex_error_info })))).ok();
+                    response_tx
+                        .send(Err(Error::internal_error().data(
+                            json!({ "message": message, "codex_error_info": codex_error_info }),
+                        )))
+                        .ok();
                 }
             }
-            EventMsg::TurnAborted(TurnAbortedEvent { reason }) => {
-                info!("Turn aborted: {reason:?}");
+            EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id }) => {
+                info!("Turn {turn_id:?} aborted: {reason:?}");
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
                 }
@@ -636,7 +712,9 @@ impl PromptState {
             }
             EventMsg::ExitedReviewMode(event) => {
                 info!("Review end: output={event:?}");
-                if let Err(err) = self.review_mode_exit(client, event).await && let Some(response_tx) = self.response_tx.take() {
+                if let Err(err) = self.review_mode_exit(client, event).await
+                    && let Some(response_tx) = self.response_tx.take()
+                {
                     drop(response_tx.send(Err(err)));
                 }
             }
@@ -657,7 +735,9 @@ impl PromptState {
             }
             EventMsg::ElicitationRequest(event) => {
                 info!("Elicitation request: server={}, id={:?}, message={}", event.server_name, event.id, event.message);
-                if let Err(err) = self.mcp_elicitation(client, event).await && let Some(response_tx) = self.response_tx.take() {
+                if let Err(err) = self.mcp_elicitation(client, event).await
+                    && let Some(response_tx) = self.response_tx.take()
+                {
                     drop(response_tx.send(Err(err)));
                 }
             }
@@ -717,6 +797,9 @@ impl PromptState {
                     }
                 }
             }
+            EventMsg::ModelReroute(ModelRerouteEvent { from_model, to_model, reason }) => {
+                info!("Model reroute: from={from_model}, to={to_model}, reason={reason:?}");
+            }
 
             // Ignore these events
             EventMsg::AgentReasoningRawContent(..)
@@ -728,7 +811,9 @@ impl PromptState {
             | EventMsg::ContextCompacted(..)
             | EventMsg::SkillsUpdateAvailable
             // Old events
-            | EventMsg::AgentMessageDelta(..) | EventMsg::AgentReasoningDelta(..) | EventMsg::AgentReasoningRawContentDelta(..)
+            | EventMsg::AgentMessageDelta(..)
+            | EventMsg::AgentReasoningDelta(..)
+            | EventMsg::AgentReasoningRawContentDelta(..)
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..)
             // TODO: Subagent UI?
@@ -738,9 +823,11 @@ impl PromptState {
             | EventMsg::CollabAgentInteractionEnd(..)
             | EventMsg::CollabWaitingBegin(..)
             | EventMsg::CollabWaitingEnd(..)
+            | EventMsg::CollabResumeBegin(..)
+            | EventMsg::CollabResumeEnd(..)
             | EventMsg::CollabCloseBegin(..)
             | EventMsg::CollabCloseEnd(..)
-            | EventMsg::PlanDelta(..)=> {},
+            | EventMsg::PlanDelta(..) => {}
             e @ (EventMsg::McpListToolsResponse(..)
             // returned from Op::ListCustomPrompts, ignore
             | EventMsg::ListCustomPromptsResponse(..)
@@ -751,8 +838,7 @@ impl PromptState {
             | EventMsg::RequestUserInput(..)
             | EventMsg::DynamicToolCallRequest(..)
             | EventMsg::ListRemoteSkillsResponse(..)
-            | EventMsg::RemoteSkillDownloaded(..)
-            ) => {
+            | EventMsg::RemoteSkillDownloaded(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
@@ -887,7 +973,7 @@ impl PromptState {
         let response = client
             .request_permission(
                 ToolCallUpdate::new(
-                    call_id,
+                    call_id.clone(),
                     ToolCallUpdateFields::new()
                         .kind(ToolKind::Edit)
                         .status(ToolCallStatus::Pending)
@@ -919,7 +1005,7 @@ impl PromptState {
 
         self.thread
             .submit(Op::PatchApproval {
-                id: self.submission_id.clone(),
+                id: call_id,
                 decision,
             })
             .await
@@ -959,6 +1045,7 @@ impl PromptState {
             success,
             changes,
             turn_id: _,
+            status,
         } = event;
 
         let (title, locations, content) = if !changes.is_empty() {
@@ -968,15 +1055,17 @@ impl PromptState {
             (None, None, None)
         };
 
+        let status = match status {
+            PatchApplyStatus::Completed => ToolCallStatus::Completed,
+            _ if success => ToolCallStatus::Completed,
+            PatchApplyStatus::Failed | PatchApplyStatus::Declined => ToolCallStatus::Failed,
+        };
+
         client
             .send_tool_call_update(ToolCallUpdate::new(
                 call_id,
                 ToolCallUpdateFields::new()
-                    .status(if success {
-                        ToolCallStatus::Completed
-                    } else {
-                        ToolCallStatus::Failed
-                    })
+                    .status(status)
                     .raw_output(raw_output)
                     .title(title)
                     .locations(locations)
@@ -1051,11 +1140,13 @@ impl PromptState {
         let ExecApprovalRequestEvent {
             call_id,
             command: _,
-            turn_id: _,
+            turn_id,
             cwd,
             reason,
             parsed_cmd,
             proposed_execpolicy_amendment,
+            approval_id,
+            network_approval_context: _,
         } = event;
 
         // Create a new tool call for the command execution
@@ -1067,13 +1158,15 @@ impl PromptState {
             locations,
             kind,
         } = parse_command_tool_call(parsed_cmd, &cwd);
-        self.active_command = Some(ActiveCommand {
-            call_id,
-            terminal_output,
-            tool_call_id: tool_call_id.clone(),
-            output: String::new(),
-            file_extension,
-        });
+        self.active_commands.insert(
+            call_id.clone(),
+            ActiveCommand {
+                terminal_output,
+                tool_call_id: tool_call_id.clone(),
+                output: String::new(),
+                file_extension,
+            },
+        );
 
         let mut content = vec![];
 
@@ -1138,7 +1231,8 @@ impl PromptState {
 
         self.thread
             .submit(Op::ExecApproval {
-                id: self.submission_id.clone(),
+                id: approval_id.unwrap_or(call_id),
+                turn_id: Some(turn_id),
                 decision,
             })
             .await
@@ -1170,7 +1264,6 @@ impl PromptState {
         } = parse_command_tool_call(parsed_cmd, &cwd);
 
         let active_command = ActiveCommand {
-            call_id: call_id.clone(),
             tool_call_id: tool_call_id.clone(),
             output: String::new(),
             file_extension,
@@ -1190,7 +1283,7 @@ impl PromptState {
             (vec![], None)
         };
 
-        self.active_command = Some(active_command);
+        self.active_commands.insert(call_id.clone(), active_command);
 
         client
             .send_tool_call(
@@ -1216,9 +1309,7 @@ impl PromptState {
             stream: _,
         } = event;
         // Stream output bytes to the display-only terminal via ToolCallUpdate meta.
-        if let Some(active_command) = &mut self.active_command
-            && *active_command.call_id == call_id
-        {
+        if let Some(active_command) = self.active_commands.get_mut(&call_id) {
             let data_str = String::from_utf8_lossy(&chunk).to_string();
 
             let update = if client.supports_terminal_output(active_command) {
@@ -1273,22 +1364,23 @@ impl PromptState {
             duration: _,
             formatted_output: _,
             process_id: _,
+            status,
         } = event;
-        if let Some(active_command) = self.active_command.take()
-            && active_command.call_id == call_id
-        {
+        if let Some(active_command) = self.active_commands.remove(&call_id) {
             let is_success = exit_code == 0;
+
+            let status = match status {
+                ExecCommandStatus::Completed => ToolCallStatus::Completed,
+                _ if is_success => ToolCallStatus::Completed,
+                ExecCommandStatus::Failed | ExecCommandStatus::Declined => ToolCallStatus::Failed,
+            };
 
             client
                 .send_tool_call_update(
                     ToolCallUpdate::new(
                         active_command.tool_call_id.clone(),
                         ToolCallUpdateFields::new()
-                            .status(if is_success {
-                                ToolCallStatus::Completed
-                            } else {
-                                ToolCallStatus::Failed
-                            })
+                            .status(status)
                             .raw_output(raw_output),
                     )
                     .meta(
@@ -1321,9 +1413,7 @@ impl PromptState {
 
         let stdin = format!("\n{stdin}\n");
         // Stream output bytes to the display-only terminal via ToolCallUpdate meta.
-        if let Some(active_command) = &mut self.active_command
-            && *active_command.call_id == call_id
-        {
+        if let Some(active_command) = self.active_commands.get_mut(&call_id) {
             let update = if client.supports_terminal_output(active_command) {
                 ToolCallUpdate::new(
                     active_command.tool_call_id.clone(),
@@ -1483,169 +1573,6 @@ fn parse_command_tool_call(parsed_cmd: Vec<ParsedCommand>, cwd: &Path) -> ParseC
         terminal_output,
         locations,
         kind,
-    }
-}
-
-struct TaskState {
-    response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
-}
-
-impl TaskState {
-    fn new(response_tx: oneshot::Sender<Result<StopReason, Error>>) -> Self {
-        Self {
-            response_tx: Some(response_tx),
-        }
-    }
-
-    fn is_active(&self) -> bool {
-        self.response_tx.is_some()
-    }
-
-    async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
-        match event {
-            EventMsg::TurnComplete(..) => {
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::EndTurn)).ok();
-                }
-            }
-            // Safer to grab the non-streaming version of the events so we don't duplicate
-            // and it is likely these are synthetic events, not from the model
-            EventMsg::AgentMessage(AgentMessageEvent { message }) => {
-                client.send_agent_text(message).await;
-            }
-            EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
-                client.send_agent_thought(text).await;
-            }
-            EventMsg::UndoStarted(event) => {
-                client
-                    .send_agent_text(
-                        event
-                            .message
-                            .unwrap_or_else(|| "Undo in progress...".to_string()),
-                    )
-                    .await;
-            }
-            EventMsg::UndoCompleted(event) => {
-                let fallback = if event.success {
-                    "Undo completed.".to_string()
-                } else {
-                    "Undo failed.".to_string()
-                };
-                client
-                    .send_agent_text(event.message.unwrap_or(fallback))
-                    .await;
-            }
-            EventMsg::StreamError(StreamErrorEvent {
-                message,
-                codex_error_info,
-                additional_details,
-            }) => {
-                error!(
-                    "Handled error during turn: {message} {codex_error_info:?} {additional_details:?}"
-                );
-            }
-            EventMsg::Error(ErrorEvent {
-                message,
-                codex_error_info,
-            }) => {
-                error!("Unhandled error during turn: {message} {codex_error_info:?}");
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx
-                        .send(Err(Error::internal_error().data(
-                            json!({ "message": message, "codex_error_info": codex_error_info }),
-                        )))
-                        .ok();
-                }
-            }
-            EventMsg::TurnAborted(TurnAbortedEvent { reason }) => {
-                info!("Turn aborted: {reason:?}");
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::Cancelled)).ok();
-                }
-            }
-            EventMsg::ShutdownComplete => {
-                info!("Agent shutting down");
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::Cancelled)).ok();
-                }
-            }
-            EventMsg::Warning(WarningEvent { message }) => {
-                warn!("Warning: {message}");
-            }
-            EventMsg::McpStartupUpdate(McpStartupUpdateEvent { server, status }) => {
-                info!("MCP startup update: server={server}, status={status:?}");
-            }
-            EventMsg::McpStartupComplete(McpStartupCompleteEvent {
-                ready,
-                failed,
-                cancelled,
-            }) => {
-                info!(
-                    "MCP startup complete: ready={ready:?}, failed={failed:?}, cancelled={cancelled:?}"
-                );
-            }
-            // Expected but ignore
-            EventMsg::TurnStarted(..)
-            | EventMsg::ThreadRolledBack(..)
-            | EventMsg::ItemStarted(..)
-            | EventMsg::ItemCompleted(..)
-            | EventMsg::TokenCount(..)
-            | EventMsg::AgentMessageDelta(..)
-            | EventMsg::AgentReasoningDelta(..)
-            | EventMsg::AgentMessageContentDelta(..)
-            | EventMsg::AgentReasoningRawContent(..)
-            | EventMsg::AgentReasoningRawContentDelta(..)
-            | EventMsg::ReasoningContentDelta(..)
-            | EventMsg::ReasoningRawContentDelta(..)
-            | EventMsg::AgentReasoningSectionBreak(..)
-            | EventMsg::RawResponseItem(..)
-            | EventMsg::BackgroundEvent(..)
-            | EventMsg::SkillsUpdateAvailable
-            | EventMsg::ContextCompacted(..)
-            | EventMsg::ThreadNameUpdated(..)
-            // TODO: Subagent UI?
-            | EventMsg::CollabAgentSpawnBegin(..)
-            | EventMsg::CollabAgentSpawnEnd(..)
-            | EventMsg::CollabAgentInteractionBegin(..)
-            | EventMsg::CollabAgentInteractionEnd(..)
-            | EventMsg::CollabWaitingBegin(..)
-            | EventMsg::CollabWaitingEnd(..)
-            | EventMsg::CollabCloseBegin(..)
-            | EventMsg::CollabCloseEnd(..)
-            | EventMsg::PlanDelta(..) => {}
-            // Unexpected events for this submission
-            e @ (EventMsg::UserMessage(..)
-            | EventMsg::SessionConfigured(..)
-            | EventMsg::McpToolCallBegin(..)
-            | EventMsg::McpToolCallEnd(..)
-            | EventMsg::WebSearchBegin(..)
-            | EventMsg::WebSearchEnd(..)
-            | EventMsg::ExecCommandBegin(..)
-            | EventMsg::ExecCommandOutputDelta(..)
-            | EventMsg::ExecCommandEnd(..)
-            | EventMsg::TerminalInteraction(..)
-            | EventMsg::ViewImageToolCall(..)
-            | EventMsg::ExecApprovalRequest(..)
-            | EventMsg::ApplyPatchApprovalRequest(..)
-            | EventMsg::PatchApplyBegin(..)
-            | EventMsg::PatchApplyEnd(..)
-            | EventMsg::TurnDiff(..)
-            | EventMsg::GetHistoryEntryResponse(..)
-            | EventMsg::McpListToolsResponse(..)
-            | EventMsg::ListCustomPromptsResponse(..)
-            | EventMsg::ListSkillsResponse(..)
-            | EventMsg::PlanUpdate(..)
-            | EventMsg::EnteredReviewMode(..)
-            | EventMsg::ExitedReviewMode(..)
-            | EventMsg::DeprecationNotice(..)
-            | EventMsg::ElicitationRequest(..)
-            | EventMsg::RequestUserInput(..)
-            | EventMsg::DynamicToolCallRequest(..)
-            | EventMsg::ListRemoteSkillsResponse(..)
-            | EventMsg::RemoteSkillDownloaded(..)) => {
-                warn!("Unexpected event: {:?}", e);
-            }
-        }
     }
 }
 
@@ -2013,8 +1940,23 @@ impl<A: Auth> ThreadActor<A> {
         let current_mode_id = APPROVAL_PRESETS
             .iter()
             .find(|preset| {
-                &preset.approval == self.config.approval_policy.get()
-                    && &preset.sandbox == self.config.sandbox_policy.get()
+                &preset.approval == self.config.permissions.approval_policy.get()
+                    && &preset.sandbox == self.config.permissions.sandbox_policy.get()
+            })
+            .or_else(|| {
+                // When the project is untrusted, the above code won't match
+                // since AskForApproval::UnlessTrusted is not part of the
+                // default presets. However, in this case we still want to show
+                // the mode selector, which allows the user to choose a
+                // different mode (which will set the project to be trusted)
+                // See https://github.com/zed-industries/zed/issues/48132
+                if self.config.active_project.is_untrusted() {
+                    APPROVAL_PRESETS
+                        .iter()
+                        .find(|preset| preset.id == "read-only")
+                } else {
+                    None
+                }
             })
             .map(|preset| SessionModeId::new(preset.id))?;
 
@@ -2030,7 +1972,7 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn find_current_model(&self) -> Option<ModelId> {
-        let model_presets = self.models_manager.list_models(&self.config).await;
+        let model_presets = self.models_manager.list_models().await;
         let config_model = self.get_current_model().await;
         let preset = model_presets
             .iter()
@@ -2082,7 +2024,7 @@ impl<A: Auth> ThreadActor<A> {
             );
         }
 
-        let presets = self.models_manager.list_models(&self.config).await;
+        let presets = self.models_manager.list_models().await;
 
         let current_model = self.get_current_model().await;
         let current_preset = presets.iter().find(|p| p.model == current_model).cloned();
@@ -2191,7 +2133,7 @@ impl<A: Auth> ThreadActor<A> {
     async fn handle_set_config_model(&mut self, value: SessionConfigValueId) -> Result<(), Error> {
         let model_id = value.0;
 
-        let presets = self.models_manager.list_models(&self.config).await;
+        let presets = self.models_manager.list_models().await;
         let preset = presets.iter().find(|p| p.id.as_str() == &*model_id);
 
         let model_to_use = preset
@@ -2248,7 +2190,7 @@ impl<A: Auth> ThreadActor<A> {
             serde_json::from_value(value.0.as_ref().into()).map_err(|_| Error::invalid_params())?;
 
         let current_model = self.get_current_model().await;
-        let presets = self.models_manager.list_models(&self.config).await;
+        let presets = self.models_manager.list_models().await;
         let Some(preset) = presets.iter().find(|p| p.model == current_model) else {
             return Err(Error::invalid_params()
                 .data("Reasoning effort can only be set for known model presets"));
@@ -2299,7 +2241,7 @@ impl<A: Auth> ThreadActor<A> {
 
         available_models.extend(
             self.models_manager
-                .list_models(&self.config)
+                .list_models()
                 .await
                 .iter()
                 .filter(|model| model.show_in_picker || model.model == config_model)
@@ -2425,14 +2367,7 @@ impl<A: Auth> ThreadActor<A> {
         info!("Submitted prompt with submission_id: {submission_id}");
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
 
-        let state = match op {
-            Op::Compact | Op::Undo => SubmissionState::Task(TaskState::new(response_tx)),
-            _ => SubmissionState::Prompt(PromptState::new(
-                self.thread.clone(),
-                response_tx,
-                submission_id.clone(),
-            )),
-        };
+        let state = SubmissionState::Prompt(PromptState::new(self.thread.clone(), response_tx));
 
         self.submissions.insert(submission_id, state);
 
@@ -2461,10 +2396,12 @@ impl<A: Auth> ThreadActor<A> {
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
         self.config
+            .permissions
             .approval_policy
             .set(preset.approval)
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
         self.config
+            .permissions
             .sandbox_policy
             .set(preset.sandbox.clone())
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2480,16 +2417,14 @@ impl<A: Auth> ThreadActor<A> {
                     TrustLevel::Trusted,
                 )?;
             }
-            SandboxPolicy::ReadOnly => {}
+            SandboxPolicy::ReadOnly { .. } => {}
         }
 
         Ok(())
     }
 
     async fn get_current_model(&self) -> String {
-        self.models_manager
-            .get_model(&self.config.model, &self.config)
-            .await
+        self.models_manager.get_model(&self.config.model).await
     }
 
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
@@ -3011,8 +2946,7 @@ mod tests {
 
     use agent_client_protocol::TextContent;
     use codex_core::{
-        config::ConfigOverrides, models_manager::model_presets::all_model_presets,
-        protocol::AgentMessageEvent,
+        config::ConfigOverrides, protocol::AgentMessageEvent, test_support::all_model_presets,
     };
     use codex_protocol::config_types::ModeKind;
     use tokio::{
@@ -3567,11 +3501,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ModelsManagerImpl for StubModelsManager {
-        async fn get_model(&self, _model_id: &Option<String>, _config: &Config) -> String {
+        async fn get_model(&self, _model_id: &Option<String>) -> String {
             all_model_presets()[0].to_owned().id
         }
 
-        async fn list_models(&self, _config: &Config) -> Vec<ModelPreset> {
+        async fn list_models(&self) -> Vec<ModelPreset> {
             all_model_presets().to_owned()
         }
     }
@@ -3614,34 +3548,111 @@ mod tests {
                         })
                         .join("\n");
 
-                    self.op_tx
-                        .send(Event {
-                            id: id.to_string(),
-                            msg: EventMsg::AgentMessageContentDelta(
-                                AgentMessageContentDeltaEvent {
-                                    thread_id: id.to_string(),
+                    if prompt == "parallel-exec" {
+                        // Emit interleaved exec events: Begin A, Begin B, End A, End B
+                        let turn_id = id.to_string();
+                        let cwd = std::env::current_dir().unwrap();
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        send(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                            call_id: "call-a".into(),
+                            process_id: None,
+                            turn_id: turn_id.clone(),
+                            command: vec!["echo".into(), "a".into()],
+                            cwd: cwd.clone(),
+                            parsed_cmd: vec![ParsedCommand::Unknown {
+                                cmd: "echo a".into(),
+                            }],
+                            source: Default::default(),
+                            interaction_input: None,
+                        }));
+                        send(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                            call_id: "call-b".into(),
+                            process_id: None,
+                            turn_id: turn_id.clone(),
+                            command: vec!["echo".into(), "b".into()],
+                            cwd: cwd.clone(),
+                            parsed_cmd: vec![ParsedCommand::Unknown {
+                                cmd: "echo b".into(),
+                            }],
+                            source: Default::default(),
+                            interaction_input: None,
+                        }));
+                        send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                            call_id: "call-a".into(),
+                            process_id: None,
+                            turn_id: turn_id.clone(),
+                            command: vec!["echo".into(), "a".into()],
+                            cwd: cwd.clone(),
+                            parsed_cmd: vec![],
+                            source: Default::default(),
+                            interaction_input: None,
+                            stdout: "a\n".into(),
+                            stderr: String::new(),
+                            aggregated_output: "a\n".into(),
+                            exit_code: 0,
+                            duration: std::time::Duration::from_millis(10),
+                            formatted_output: "a\n".into(),
+                            status: ExecCommandStatus::Completed,
+                        }));
+                        send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                            call_id: "call-b".into(),
+                            process_id: None,
+                            turn_id: turn_id.clone(),
+                            command: vec!["echo".into(), "b".into()],
+                            cwd: cwd.clone(),
+                            parsed_cmd: vec![],
+                            source: Default::default(),
+                            interaction_input: None,
+                            stdout: "b\n".into(),
+                            stderr: String::new(),
+                            aggregated_output: "b\n".into(),
+                            exit_code: 0,
+                            duration: std::time::Duration::from_millis(10),
+                            formatted_output: "b\n".into(),
+                            status: ExecCommandStatus::Completed,
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id,
+                        }));
+                    } else {
+                        self.op_tx
+                            .send(Event {
+                                id: id.to_string(),
+                                msg: EventMsg::AgentMessageContentDelta(
+                                    AgentMessageContentDeltaEvent {
+                                        thread_id: id.to_string(),
+                                        turn_id: id.to_string(),
+                                        item_id: id.to_string(),
+                                        delta: prompt.clone(),
+                                    },
+                                ),
+                            })
+                            .unwrap();
+                        // Send non-delta event (should be deduplicated, but handled by deduplication)
+                        self.op_tx
+                            .send(Event {
+                                id: id.to_string(),
+                                msg: EventMsg::AgentMessage(AgentMessageEvent { message: prompt }),
+                            })
+                            .unwrap();
+                        self.op_tx
+                            .send(Event {
+                                id: id.to_string(),
+                                msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                                    last_agent_message: None,
                                     turn_id: id.to_string(),
-                                    item_id: id.to_string(),
-                                    delta: prompt.clone(),
-                                },
-                            ),
-                        })
-                        .unwrap();
-                    // Send non-delta event (should be deduplicated, but handled by deduplication)
-                    self.op_tx
-                        .send(Event {
-                            id: id.to_string(),
-                            msg: EventMsg::AgentMessage(AgentMessageEvent { message: prompt }),
-                        })
-                        .unwrap();
-                    self.op_tx
-                        .send(Event {
-                            id: id.to_string(),
-                            msg: EventMsg::TurnComplete(TurnCompleteEvent {
-                                last_agent_message: None,
-                            }),
-                        })
-                        .unwrap();
+                                }),
+                            })
+                            .unwrap();
+                    }
                 }
                 Op::Compact => {
                     self.op_tx
@@ -3650,6 +3661,7 @@ mod tests {
                             msg: EventMsg::TurnStarted(TurnStartedEvent {
                                 model_context_window: None,
                                 collaboration_mode_kind: ModeKind::default(),
+                                turn_id: id.to_string(),
                             }),
                         })
                         .unwrap();
@@ -3666,6 +3678,7 @@ mod tests {
                             id: id.to_string(),
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
+                                turn_id: id.to_string(),
                             }),
                         })
                         .unwrap();
@@ -3695,6 +3708,7 @@ mod tests {
                             id: id.to_string(),
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
+                                turn_id: id.to_string(),
                             }),
                         })
                         .unwrap();
@@ -3727,6 +3741,7 @@ mod tests {
                             id: id.to_string(),
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
+                                turn_id: id.to_string(),
                             }),
                         })
                         .unwrap();
@@ -3771,5 +3786,85 @@ mod tests {
             self.notifications.lock().unwrap().push(args);
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn test_parallel_exec_commands() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["parallel-exec".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+
+        // Collect all ToolCall (begin) notifications keyed by their tool_call_id prefix.
+        let tool_calls: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::ToolCall(tc) => Some(tc.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // Collect all ToolCallUpdate notifications that carry a terminal status.
+        let completed_updates: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::ToolCallUpdate(update) => {
+                    if update.fields.status == Some(ToolCallStatus::Completed) {
+                        Some(update.clone())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+
+        // Both commands A and B should have produced a ToolCall (begin).
+        assert_eq!(
+            tool_calls.len(),
+            2,
+            "expected 2 ToolCall begin notifications, got {tool_calls:?}"
+        );
+
+        // Both commands A and B should have produced a completed ToolCallUpdate.
+        assert_eq!(
+            completed_updates.len(),
+            2,
+            "expected 2 completed ToolCallUpdate notifications, got {completed_updates:?}"
+        );
+
+        // The completed updates should reference the same tool_call_ids as the begins.
+        let begin_ids: std::collections::HashSet<_> = tool_calls
+            .iter()
+            .map(|tc| tc.tool_call_id.clone())
+            .collect();
+        let end_ids: std::collections::HashSet<_> = completed_updates
+            .iter()
+            .map(|u| u.tool_call_id.clone())
+            .collect();
+        assert_eq!(
+            begin_ids, end_ids,
+            "completed update tool_call_ids should match begin tool_call_ids"
+        );
+
+        Ok(())
     }
 }
