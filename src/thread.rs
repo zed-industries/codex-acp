@@ -8,7 +8,17 @@ use std::{
 };
 
 use agent_client_protocol::{
-    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, Client, ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource, EmbeddedResourceResource, Error, ExtRequest, ExtResponse, LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, RawValue, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal, TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput
+    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, Client, ClientCapabilities,
+    ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
+    EmbeddedResourceResource, Error, ExtRequest, ExtResponse, LoadSessionResponse, Meta, ModelId,
+    ModelInfo, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, PromptRequest, RawValue, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionConfigId,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
+    SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal,
+    TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
@@ -28,9 +38,9 @@ use codex_core::{
         ModelRerouteEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
         ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
         ReviewOutputEvent, ReviewRequest, ReviewTarget, SandboxPolicy, StreamErrorEvent,
-        TerminalInteractionEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent,
-        UserMessageEvent, ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent,
-        WebSearchEndEvent,
+        TerminalInteractionEvent, TokenCountEvent, TokenUsageInfo, TurnAbortedEvent,
+        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
+        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
@@ -72,7 +82,7 @@ pub struct SessionUsage {
     output_tokens: i64,
     cache_read_input_tokens: i64,
     reasoning_output_tokens: i64,
-    context_window: Option<i64>
+    context_window: Option<i64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -746,10 +756,10 @@ impl PromptState {
             EventMsg::TokenCount(TokenCountEvent{info, rate_limits}) =>{
                 if let Some(TokenUsageInfo{total_token_usage: _, last_token_usage: usage, model_context_window}) = info{
                     let raw_value = match to_raw_value(&SessionUsageUpdate{
-                        usage: SessionUsage { 
-                            input_tokens: usage.input_tokens, 
-                            output_tokens: usage.output_tokens, 
-                            cache_read_input_tokens: usage.cached_input_tokens, 
+                        usage: SessionUsage {
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                            cache_read_input_tokens: usage.cached_input_tokens,
                             reasoning_output_tokens: usage.reasoning_output_tokens,
                             context_window: model_context_window
                          }
@@ -762,7 +772,7 @@ impl PromptState {
                             return;
                         }
                     };
-                     
+
                     let response =  client.ext_method(ExtRequest::new(
                         USAGE_METHOD, Arc::from(raw_value)
                      )).await;
