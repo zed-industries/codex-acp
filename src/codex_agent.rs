@@ -2,7 +2,7 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
     CancelNotification, ClientCapabilities, Error, Implementation, InitializeRequest,
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, McpCapabilities, McpServer, McpServerHttp, McpServerStdio,
+    LoadSessionResponse, McpCapabilities, McpServer, McpServerHttp, McpServerStdio, Meta,
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
     ProtocolVersion, SessionCapabilities, SessionId, SessionInfo, SessionListCapabilities,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
@@ -97,6 +97,20 @@ impl CodexAgent {
 
     fn session_id_from_thread_id(thread_id: ThreadId) -> SessionId {
         SessionId::new(thread_id.to_string())
+    }
+
+    fn runtime_session_meta(session_id: &SessionId) -> Meta {
+        let runtime_id = session_id.0.to_string();
+        Meta::from_iter([
+            (
+                "runtimeSessionId".to_owned(),
+                serde_json::Value::String(runtime_id.clone()),
+            ),
+            (
+                "codexSessionId".to_owned(),
+                serde_json::Value::String(runtime_id),
+            ),
+        ])
     }
 
     fn get_thread(&self, session_id: &SessionId) -> Result<Rc<Thread>, Error> {
@@ -353,7 +367,8 @@ impl Agent for CodexAgent {
 
         debug!("Created new session with {} MCP servers", num_mcp_servers);
 
-        Ok(NewSessionResponse::new(session_id)
+        Ok(NewSessionResponse::new(session_id.clone())
+            .meta(Self::runtime_session_meta(&session_id))
             .modes(load.modes)
             .models(load.models)
             .config_options(load.config_options))
@@ -421,9 +436,12 @@ impl Agent for CodexAgent {
             .lock()
             .unwrap()
             .insert(session_id.clone(), config.cwd);
-        self.sessions.borrow_mut().insert(session_id, thread);
+        self.sessions
+            .borrow_mut()
+            .insert(session_id.clone(), thread);
 
         Ok(LoadSessionResponse::new()
+            .meta(Self::runtime_session_meta(&session_id))
             .modes(load.modes)
             .models(load.models)
             .config_options(load.config_options))
