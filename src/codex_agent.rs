@@ -497,9 +497,13 @@ impl Agent for CodexAgent {
 
         // Get the session state
         let thread = self.get_thread(&request.session_id)?;
-        let stop_reason = thread.prompt(request).await?;
+        let (stop_reason, usage) = thread.prompt(request).await?;
 
-        Ok(PromptResponse::new(stop_reason))
+        let mut response = PromptResponse::new(stop_reason);
+        if let Some(usage) = usage {
+            response = response.usage(usage);
+        }
+        Ok(response)
     }
 
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
