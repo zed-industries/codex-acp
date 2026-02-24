@@ -17,6 +17,7 @@ use agent_client_protocol::{
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId,
     SessionInfoUpdate, SessionMode, SessionModeId, SessionModeState, SessionModelState,
     SessionNotification, SessionUpdate, StopReason, Terminal, TextResourceContents, ToolCall,
+    UsageUpdate,
     ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
@@ -38,7 +39,8 @@ use codex_core::{
         ModelRerouteEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
         ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
         ReviewOutputEvent, ReviewRequest, ReviewTarget, SandboxPolicy, StreamErrorEvent,
-        TerminalInteractionEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent,
+        TerminalInteractionEvent, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
+        TurnStartedEvent,
         UserMessageEvent, ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent,
         WebSearchEndEvent,
     },
@@ -411,7 +413,6 @@ impl PromptState {
             | EventMsg::PatchApplyEnd(..)
             | EventMsg::TurnStarted(..)
             | EventMsg::TurnComplete(..)
-            | EventMsg::TokenCount(..)
             | EventMsg::TurnDiff(..)
             | EventMsg::TurnAborted(..)
             | EventMsg::EnteredReviewMode(..)
@@ -429,6 +430,19 @@ impl PromptState {
                 turn_id,
             }) => {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
+            }
+            EventMsg::TokenCount(TokenCountEvent { info, .. }) => {
+                if let Some(info) = info {
+                    if let Some(size) = info.model_context_window {
+                        let used = info.last_token_usage.tokens_in_context_window().max(0) as u64;
+                        client
+                            .send_notification(SessionUpdate::UsageUpdate(UsageUpdate::new(
+                                used,
+                                size as u64,
+                            )))
+                            .await;
+                    }
+                }
             }
             EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
@@ -729,8 +743,6 @@ impl PromptState {
             // Ignore these events
             EventMsg::AgentReasoningRawContent(..)
             | EventMsg::ThreadRolledBack(..)
-            // In the future we can use this to update usage stats
-            | EventMsg::TokenCount(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
             // Revisit when we can emit status updates
