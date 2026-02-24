@@ -742,13 +742,23 @@ impl PromptState {
                     let total_tokens = total.total_tokens.max(0) as u64;
                     let context_window = info.model_context_window.unwrap_or(0).max(0) as u64;
 
+                    // PromptResponse.usage: cumulative session totals (per ACP spec)
                     let usage = Usage::new(total_tokens, input_tokens, output_tokens)
                         .cached_read_tokens(cached_input)
                         .thought_tokens(reasoning);
                     self.last_usage = Some(usage);
 
+                    // UsageUpdate.used: current context window usage from the last turn.
+                    // Use last_token_usage (per-turn) not total_token_usage (cumulative),
+                    // and only count input tokens (input + cached_input) since those
+                    // represent the actual context sent to the model. Output and reasoning
+                    // tokens are the model's response, not context window consumption.
+                    let last = &info.last_token_usage;
+                    let context_used =
+                        (last.input_tokens.max(0) as u64) + (last.cached_input_tokens.max(0) as u64);
+
                     self.send_notification(SessionUpdate::UsageUpdate(
-                        UsageUpdate::new(total_tokens, context_window),
+                        UsageUpdate::new(context_used, context_window),
                     ))
                     .await;
                 }
