@@ -100,17 +100,10 @@ impl CodexAgent {
     }
 
     fn runtime_session_meta(session_id: &SessionId) -> Meta {
-        let runtime_id = session_id.0.to_string();
-        Meta::from_iter([
-            (
-                "runtimeSessionId".to_owned(),
-                serde_json::Value::String(runtime_id.clone()),
-            ),
-            (
-                "codexSessionId".to_owned(),
-                serde_json::Value::String(runtime_id),
-            ),
-        ])
+        Meta::from_iter([(
+            "sessionId".to_owned(),
+            serde_json::Value::String(session_id.0.to_string()),
+        )])
     }
 
     fn get_thread(&self, session_id: &SessionId) -> Result<Rc<Thread>, Error> {
