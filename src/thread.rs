@@ -17,9 +17,8 @@ use agent_client_protocol::{
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId,
     SessionInfoUpdate, SessionMode, SessionModeId, SessionModeState, SessionModelState,
     SessionNotification, SessionUpdate, StopReason, Terminal, TextResourceContents, ToolCall,
-    UsageUpdate,
     ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, UsageUpdate,
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
@@ -40,9 +39,8 @@ use codex_core::{
         ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
         ReviewOutputEvent, ReviewRequest, ReviewTarget, SandboxPolicy, StreamErrorEvent,
         TerminalInteractionEvent, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
-        TurnStartedEvent,
-        UserMessageEvent, ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent,
-        WebSearchEndEvent,
+        TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
+        WebSearchBeginEvent, WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
