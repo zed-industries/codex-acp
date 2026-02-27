@@ -47,7 +47,7 @@ use codex_core::{
 };
 use codex_protocol::{
     approvals::ElicitationRequestEvent,
-    config_types::TrustLevel,
+    config_types::{CollaborationMode, CollaborationModeMask, ModeKind, Settings, TrustLevel},
     custom_prompts::CustomPrompt,
     mcp::CallToolResult,
     models::{ResponseItem, WebSearchAction},
@@ -95,6 +95,7 @@ impl CodexThreadImpl for CodexThread {
 pub trait ModelsManagerImpl {
     async fn get_model(&self, model_id: &Option<String>) -> String;
     async fn list_models(&self) -> Vec<ModelPreset>;
+    fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask>;
 }
 
 #[async_trait::async_trait]
@@ -106,6 +107,10 @@ impl ModelsManagerImpl for ModelsManager {
 
     async fn list_models(&self) -> Vec<ModelPreset> {
         self.list_models(RefreshStrategy::OnlineIfUncached).await
+    }
+
+    fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
+        self.list_collaboration_modes()
     }
 }
 
@@ -1680,6 +1685,8 @@ struct ThreadActor<A> {
     message_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     /// Last config options state we emitted to the client, used for deduping updates.
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
+    /// Tracks the last requested session mode id (approval presets and collaboration modes).
+    active_mode_id: Option<SessionModeId>,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -1701,6 +1708,7 @@ impl<A: Auth> ThreadActor<A> {
             submissions: HashMap::new(),
             message_rx,
             last_sent_config_options: None,
+            active_mode_id: None,
         }
     }
 
@@ -1868,8 +1876,8 @@ impl<A: Auth> ThreadActor<A> {
         response_rx
     }
 
-    fn modes(&self) -> Option<SessionModeState> {
-        let current_mode_id = APPROVAL_PRESETS
+    fn approval_mode_id_from_config(&self) -> Option<SessionModeId> {
+        APPROVAL_PRESETS
             .iter()
             .find(|preset| {
                 &preset.approval == self.config.permissions.approval_policy.get()
@@ -1890,17 +1898,79 @@ impl<A: Auth> ThreadActor<A> {
                     None
                 }
             })
-            .map(|preset| SessionModeId::new(preset.id))?;
+            .map(|preset| SessionModeId::new(preset.id))
+    }
 
-        Some(SessionModeState::new(
-            current_mode_id,
-            APPROVAL_PRESETS
+    fn collaboration_mode_id(kind: ModeKind) -> &'static str {
+        match kind {
+            ModeKind::Plan => "plan",
+            ModeKind::Default => "default",
+            ModeKind::PairProgramming => "pair_programming",
+            ModeKind::Execute => "execute",
+        }
+    }
+
+    fn resolve_collaboration_mode_mask(&self, mode_id: &str) -> Option<CollaborationModeMask> {
+        let normalized = mode_id.trim().to_ascii_lowercase();
+        self.models_manager
+            .list_collaboration_modes()
+            .into_iter()
+            .find(|mask| {
+                let Some(kind) = mask.mode else {
+                    return false;
+                };
+                let canonical = Self::collaboration_mode_id(kind);
+                normalized == canonical || normalized == kind.display_name().to_ascii_lowercase()
+            })
+    }
+
+    fn collaboration_session_modes(&self) -> Vec<SessionMode> {
+        self.models_manager
+            .list_collaboration_modes()
+            .into_iter()
+            .filter_map(|mask| {
+                let kind = mask.mode?;
+                if !kind.is_tui_visible() {
+                    return None;
+                }
+                let desc = match kind {
+                    ModeKind::Plan => {
+                        "Plan-first collaboration mode (planning and checkpoints before execution)"
+                    }
+                    ModeKind::Default => "Default collaboration mode",
+                    ModeKind::PairProgramming => "Pair programming collaboration mode",
+                    ModeKind::Execute => "Execute collaboration mode",
+                };
+                Some(
+                    SessionMode::new(Self::collaboration_mode_id(kind), mask.name)
+                        .description(desc),
+                )
+            })
+            .collect()
+    }
+
+    fn modes(&self) -> Option<SessionModeState> {
+        let mut available_modes: Vec<SessionMode> = APPROVAL_PRESETS
+            .iter()
+            .map(|preset| SessionMode::new(preset.id, preset.label).description(preset.description))
+            .collect();
+
+        for mode in self.collaboration_session_modes() {
+            if available_modes
                 .iter()
-                .map(|preset| {
-                    SessionMode::new(preset.id, preset.label).description(preset.description)
-                })
-                .collect(),
-        ))
+                .all(|existing| existing.id != mode.id)
+            {
+                available_modes.push(mode);
+            }
+        }
+
+        let current_mode_id = self
+            .active_mode_id
+            .clone()
+            .or_else(|| self.approval_mode_id_from_config())
+            .or_else(|| available_modes.first().map(|m| m.id.clone()))?;
+
+        Some(SessionModeState::new(current_mode_id, available_modes))
     }
 
     async fn find_current_model(&self) -> Option<ModelId> {
@@ -1947,12 +2017,12 @@ impl<A: Auth> ThreadActor<A> {
             options.push(
                 SessionConfigOption::select(
                     "mode",
-                    "Approval Preset",
+                    "Session Mode",
                     modes.current_mode_id.0,
                     select_options,
                 )
                 .category(SessionConfigOptionCategory::Mode)
-                .description("Choose an approval and sandboxing preset for your session"),
+                .description("Choose session mode (approval preset or collaboration mode)"),
             );
         }
 
@@ -2307,52 +2377,88 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
-        let preset = APPROVAL_PRESETS
+        if let Some(preset) = APPROVAL_PRESETS
             .iter()
             .find(|preset| mode.0.as_ref() == preset.id)
-            .ok_or_else(Error::invalid_params)?;
+        {
+            self.thread
+                .submit(Op::OverrideTurnContext {
+                    cwd: None,
+                    approval_policy: Some(preset.approval),
+                    sandbox_policy: Some(preset.sandbox.clone()),
+                    model: None,
+                    effort: None,
+                    summary: None,
+                    collaboration_mode: None,
+                    personality: None,
+                    windows_sandbox_level: None,
+                })
+                .await
+                .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
-        self.thread
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: Some(preset.approval),
-                sandbox_policy: Some(preset.sandbox.clone()),
-                model: None,
-                effort: None,
-                summary: None,
-                collaboration_mode: None,
-                personality: None,
-                windows_sandbox_level: None,
-            })
-            .await
-            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+            self.config
+                .permissions
+                .approval_policy
+                .set(preset.approval)
+                .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+            self.config
+                .permissions
+                .sandbox_policy
+                .set(preset.sandbox.clone())
+                .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
-        self.config
-            .permissions
-            .approval_policy
-            .set(preset.approval)
-            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-        self.config
-            .permissions
-            .sandbox_policy
-            .set(preset.sandbox.clone())
-            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-
-        match preset.sandbox {
-            // Treat this user action as a trusted dir
-            SandboxPolicy::DangerFullAccess
-            | SandboxPolicy::WorkspaceWrite { .. }
-            | SandboxPolicy::ExternalSandbox { .. } => {
-                set_project_trust_level(
-                    &self.config.codex_home,
-                    &self.config.cwd,
-                    TrustLevel::Trusted,
-                )?;
+            match preset.sandbox {
+                // Treat this user action as a trusted dir
+                SandboxPolicy::DangerFullAccess
+                | SandboxPolicy::WorkspaceWrite { .. }
+                | SandboxPolicy::ExternalSandbox { .. } => {
+                    set_project_trust_level(
+                        &self.config.codex_home,
+                        &self.config.cwd,
+                        TrustLevel::Trusted,
+                    )?;
+                }
+                SandboxPolicy::ReadOnly { .. } => {}
             }
-            SandboxPolicy::ReadOnly { .. } => {}
+
+            self.active_mode_id = Some(SessionModeId::new(preset.id));
+            return Ok(());
         }
 
-        Ok(())
+        if let Some(mask) = self.resolve_collaboration_mode_mask(mode.0.as_ref()) {
+            let mode_kind = mask.mode.ok_or_else(Error::invalid_params)?;
+            let base_mode = CollaborationMode {
+                mode: mode_kind,
+                settings: Settings {
+                    model: self.get_current_model().await,
+                    reasoning_effort: self.config.model_reasoning_effort,
+                    developer_instructions: None,
+                },
+            };
+            let collaboration_mode = base_mode.apply_mask(&mask);
+
+            self.thread
+                .submit(Op::OverrideTurnContext {
+                    cwd: None,
+                    approval_policy: None,
+                    sandbox_policy: None,
+                    model: None,
+                    effort: None,
+                    summary: None,
+                    collaboration_mode: Some(collaboration_mode.clone()),
+                    personality: None,
+                    windows_sandbox_level: None,
+                })
+                .await
+                .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+            self.config.model = Some(collaboration_mode.model().to_string());
+            self.config.model_reasoning_effort = collaboration_mode.reasoning_effort();
+            self.active_mode_id = Some(SessionModeId::new(Self::collaboration_mode_id(mode_kind)));
+            return Ok(());
+        }
+
+        Err(Error::invalid_params())
     }
 
     async fn get_current_model(&self) -> String {
@@ -3384,6 +3490,43 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_set_mode_plan_routes_to_collaboration_mode() -> anyhow::Result<()> {
+        let (_, _, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (set_mode_tx, set_mode_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::SetMode {
+            mode: SessionModeId::new("plan"),
+            response_tx: set_mode_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                set_mode_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [Op::OverrideTurnContext {
+                    collaboration_mode: Some(mode),
+                    ..
+                }] if mode.mode == ModeKind::Plan
+            ),
+            "expected single OverrideTurnContext with ModeKind::Plan, got {ops:?}"
+        );
+
+        Ok(())
+    }
+
     async fn setup(
         custom_prompts: Vec<CustomPrompt>,
     ) -> anyhow::Result<(
@@ -3439,6 +3582,25 @@ mod tests {
 
         async fn list_models(&self) -> Vec<ModelPreset> {
             all_model_presets().to_owned()
+        }
+
+        fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
+            vec![
+                CollaborationModeMask {
+                    name: "Plan".to_string(),
+                    mode: Some(ModeKind::Plan),
+                    model: None,
+                    reasoning_effort: Some(Some(ReasoningEffort::Medium)),
+                    developer_instructions: Some(Some("Plan mode stub".to_string())),
+                },
+                CollaborationModeMask {
+                    name: "Default".to_string(),
+                    mode: Some(ModeKind::Default),
+                    model: None,
+                    reasoning_effort: None,
+                    developer_instructions: Some(Some("Default mode stub".to_string())),
+                },
+            ]
         }
     }
 
@@ -3677,6 +3839,9 @@ mod tests {
                             }),
                         })
                         .unwrap();
+                }
+                Op::OverrideTurnContext { .. } => {
+                    // No-op in stub: actor should still complete set-mode/set-config flows.
                 }
                 _ => {
                     unimplemented!()
