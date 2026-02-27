@@ -15,11 +15,15 @@ use codex_core::{
         Config,
         types::{McpServerConfig, McpServerTransportConfig},
     },
-    find_thread_path_by_id_str, parse_cursor,
-    protocol::{InitialHistory, SessionSource},
+    find_thread_path_by_id_str,
+    models_manager::collaboration_mode_presets::CollaborationModesConfig,
+    parse_cursor,
 };
 use codex_login::{CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
-use codex_protocol::ThreadId;
+use codex_protocol::{
+    ThreadId,
+    protocol::{InitialHistory, SessionSource},
+};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -76,6 +80,11 @@ impl CodexAgent {
             config.codex_home.clone(),
             auth_manager.clone(),
             SessionSource::Unknown,
+            config.model_catalog.clone(),
+            CollaborationModesConfig {
+                // False for now
+                default_mode_request_user_input: false,
+            },
             Box::new(move |thread_id| {
                 Arc::new(AcpFs::new(
                     Self::session_id_from_thread_id(thread_id),
@@ -156,6 +165,7 @@ impl CodexAgent {
                             enabled_tools: None,
                             disabled_reason: None,
                             scopes: None,
+                            oauth_resource: None,
                         },
                     );
                 }
@@ -188,6 +198,7 @@ impl CodexAgent {
                             enabled_tools: None,
                             disabled_reason: None,
                             scopes: None,
+                            oauth_resource: None,
                         },
                     );
                 }
@@ -450,6 +461,7 @@ impl Agent for CodexAgent {
             ],
             None,
             self.config.model_provider_id.as_str(),
+            None,
         )
         .await
         .map_err(|err| Error::internal_error().data(format!("failed to list sessions: {err}")))?;
