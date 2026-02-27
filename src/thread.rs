@@ -430,8 +430,8 @@ impl PromptState {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
             }
             EventMsg::TokenCount(TokenCountEvent { info, .. }) => {
-                if let Some(info) = info {
-                    if let Some(size) = info.model_context_window {
+                if let Some(info) = info
+                    && let Some(size) = info.model_context_window {
                         let used = info.last_token_usage.tokens_in_context_window().max(0) as u64;
                         client
                             .send_notification(SessionUpdate::UsageUpdate(UsageUpdate::new(
@@ -440,7 +440,6 @@ impl PromptState {
                             )))
                             .await;
                     }
-                }
             }
             EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
