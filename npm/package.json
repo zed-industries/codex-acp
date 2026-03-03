@@ -1,6 +1,6 @@
 {
   "name": "acp-extension-codex",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "type": "module",
   "description": "An ACP-compatible coding agent powered by Codex",
   "license": "Apache-2.0",
@@ -28,11 +28,11 @@
     "bin"
   ],
   "optionalDependencies": {
-    "acp-extension-codex-darwin-arm64": "0.9.4",
-    "acp-extension-codex-darwin-x64": "0.9.4",
-    "acp-extension-codex-linux-arm64": "0.9.4",
-    "acp-extension-codex-linux-x64": "0.9.4",
-    "acp-extension-codex-win32-arm64": "0.9.4",
-    "acp-extension-codex-win32-x64": "0.9.4"
+    "acp-extension-codex-darwin-arm64": "0.9.5",
+    "acp-extension-codex-darwin-x64": "0.9.5",
+    "acp-extension-codex-linux-arm64": "0.9.5",
+    "acp-extension-codex-linux-x64": "0.9.5",
+    "acp-extension-codex-win32-arm64": "0.9.5",
+    "acp-extension-codex-win32-x64": "0.9.5"
   }
 }
