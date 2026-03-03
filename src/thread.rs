@@ -10,15 +10,15 @@ use std::{
 use agent_client_protocol::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, Client, ClientCapabilities,
     ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
-    EmbeddedResourceResource, Error, LoadSessionResponse, Meta, ModelId, ModelInfo,
-    PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId,
-    SessionInfoUpdate, SessionMode, SessionModeId, SessionModeState, SessionModelState,
-    SessionNotification, SessionUpdate, StopReason, Terminal, TextResourceContents, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, UsageUpdate,
+    EmbeddedResourceResource, Error, ExtRequest, ExtResponse, LoadSessionResponse, Meta, ModelId,
+    ModelInfo, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, PromptRequest, RawValue, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionConfigId,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
+    SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal,
+    TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, UsageUpdate,
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
@@ -39,26 +39,30 @@ use codex_protocol::protocol::{
     McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, Op, PatchApplyBeginEvent,
     PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
     ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget,
-    SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent, TurnAbortedEvent,
-    TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
-    WebSearchBeginEvent, WebSearchEndEvent,
+    SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent, TokenUsageInfo,
+    TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+    ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
 };
 use codex_protocol::{
     approvals::ElicitationRequestEvent,
     config_types::TrustLevel,
     custom_prompts::CustomPrompt,
+    dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     mcp::CallToolResult,
     models::{ResponseItem, WebSearchAction},
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
-    protocol::RolloutItem,
+    protocol::{
+        DynamicToolCallResponseEvent, NetworkApprovalContext, NetworkPolicyAmendment, RolloutItem,
+    },
     user_input::UserInput,
 };
+use codex_shell_command::parse_command::parse_command;
 use codex_utils_approval_presets::{ApprovalPreset, builtin_approval_presets};
 use heck::ToTitleCase;
 use itertools::Itertools;
-use serde_json::json;
+use serde_json::{json, value::to_raw_value};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -94,6 +98,8 @@ pub struct SessionUsageUpdate {
 #[serde(rename_all = "camelCase")]
 pub struct RaceLimitUpdate {
     plan_name: Option<String>,
+    limit_name: Option<String>,
+    limit_id: Option<String>,
     five_hour: Option<f64>,
     seven_day: Option<f64>,
     five_hour_reset_at: Option<i64>,
@@ -438,7 +444,6 @@ impl PromptState {
             | EventMsg::PatchApplyEnd(..)
             | EventMsg::TurnStarted(..)
             | EventMsg::TurnComplete(..)
-            | EventMsg::TokenCount(..)
             | EventMsg::TurnDiff(..)
             | EventMsg::TurnAborted(..)
             | EventMsg::EnteredReviewMode(..)
@@ -456,6 +461,73 @@ impl PromptState {
                 turn_id,
             }) => {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
+            }
+            EventMsg::TokenCount(TokenCountEvent { info, rate_limits }) => {
+                if let Some(TokenUsageInfo{total_token_usage: _, last_token_usage: usage, model_context_window}) = info{
+                    let raw_value = match to_raw_value(&SessionUsageUpdate{
+                        usage: SessionUsage {
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                            cache_read_input_tokens: usage.cached_input_tokens,
+                            reasoning_output_tokens: usage.reasoning_output_tokens,
+                            context_window: model_context_window
+                         }
+                    }){
+                        Ok(v)=>v,
+                        Err(err)=>{
+                            if let Some(response_tx) = self.response_tx.take() {
+                                drop(response_tx.send(Err(err.into())));
+                            }
+                            return;
+                        }
+                    };
+
+                    if let Some(size) = model_context_window {
+                        let used = usage.tokens_in_context_window().max(0) as u64;
+                        client
+                            .send_notification(SessionUpdate::UsageUpdate(UsageUpdate::new(
+                                used,
+                                size as u64,
+                            )))
+                            .await;
+                    };
+
+
+                    let response =  client.ext_method(ExtRequest::new(
+                        USAGE_METHOD, Arc::from(raw_value)
+                     )).await;
+                     if let Err(err) = response && let Some(response_tx) = self.response_tx.take() {
+                        drop(response_tx.send(Err(err)));
+                    }
+                }
+
+                if let Some(rate_limits) = rate_limits{
+                    let primary = rate_limits.primary.as_ref();
+                    let secondary = rate_limits.secondary.as_ref();
+                    let raw_value = match serde_json::to_string(&RaceLimitUpdate{
+                        five_hour: primary.map(|r|r.used_percent),
+                        five_hour_reset_at: primary.and_then(|r|r.resets_at),
+                        seven_day: secondary.map(|r|r.used_percent),
+                        limit_id: rate_limits.limit_id,
+                        limit_name: rate_limits.limit_name,
+                        seven_day_reset_at: secondary.and_then(|r|r.resets_at),
+                        plan_name: rate_limits.plan_type.map(|p|serde_json::to_string(&p).unwrap())
+                    }).and_then(|json|{
+                        RawValue::from_string(json)
+                    }){
+                        Ok(v)=>v,
+                        Err(err)=>{
+                            if let Some(response_tx) = self.response_tx.take() {
+                                drop(response_tx.send(Err(err.into())));
+                            }
+                            return;
+                        }
+                    };
+                    let response = client.ext_method(ExtRequest::new(RATE_LIMITS_METHOD, Arc::from(raw_value))).await;
+                    if let Err(err) = response && let Some(response_tx) = self.response_tx.take() {
+                        drop(response_tx.send(Err(err)));
+                    }
+                }
             }
             EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
@@ -505,7 +577,7 @@ impl PromptState {
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought("\n\n").await;
             }
-            EventMsg::AgentMessage(AgentMessageEvent { message }) => {
+            EventMsg::AgentMessage(AgentMessageEvent { message , phase: _ }) => {
                 info!("Agent message (non-delta) received: {message:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_message_deltas) {
@@ -586,6 +658,17 @@ impl PromptState {
                     event.call_id, event.process_id, event.stdin
                 );
                 self.terminal_interaction(client, event).await;
+            }
+            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, tool, arguments }) => {
+                info!("Dynamic tool call request: call_id={call_id}, turn_id={turn_id}, tool={tool}");
+                self.start_dynamic_tool_call(client, call_id, tool, arguments).await;
+            }
+            EventMsg::DynamicToolCallResponse(event) => {
+                info!(
+                    "Dynamic tool call response: call_id={}, turn_id={}, tool={}",
+                    event.call_id, event.turn_id, event.tool
+                );
+                self.end_dynamic_tool_call(client, event).await;
             }
             EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
                 call_id,
@@ -750,61 +833,6 @@ impl PromptState {
                 }
             }
 
-            // In the future we can use this to update usage stats
-            EventMsg::TokenCount(TokenCountEvent{info, rate_limits}) =>{
-                if let Some(TokenUsageInfo{total_token_usage: _, last_token_usage: usage, model_context_window}) = info{
-                    let raw_value = match to_raw_value(&SessionUsageUpdate{
-                        usage: SessionUsage {
-                            input_tokens: usage.input_tokens,
-                            output_tokens: usage.output_tokens,
-                            cache_read_input_tokens: usage.cached_input_tokens,
-                            reasoning_output_tokens: usage.reasoning_output_tokens,
-                            context_window: model_context_window
-                         }
-                    }){
-                        Ok(v)=>v,
-                        Err(err)=>{
-                            if let Some(response_tx) = self.response_tx.take() {
-                                drop(response_tx.send(Err(err.into())));
-                            }
-                            return;
-                        }
-                    };
-
-                    let response =  client.ext_method(ExtRequest::new(
-                        USAGE_METHOD, Arc::from(raw_value)
-                     )).await;
-                     if let Err(err) = response && let Some(response_tx) = self.response_tx.take() {
-                        drop(response_tx.send(Err(err)));
-                    }
-                }
-
-                if let Some(rate_limits) = rate_limits{
-                    let primary = rate_limits.primary.as_ref();
-                    let secondary = rate_limits.secondary.as_ref();
-                    let raw_value = match serde_json::to_string(&RaceLimitUpdate{
-                        five_hour: primary.map(|r|r.used_percent),
-                        five_hour_reset_at: primary.and_then(|r|r.resets_at),
-                        seven_day: secondary.map(|r|r.used_percent),
-                        seven_day_reset_at: secondary.and_then(|r|r.resets_at),
-                        plan_name: rate_limits.plan_type.map(|p|serde_json::to_string(&p).unwrap())
-                    }).and_then(|json|{
-                        RawValue::from_string(json)
-                    }){
-                        Ok(v)=>v,
-                        Err(err)=>{
-                            if let Some(response_tx) = self.response_tx.take() {
-                                drop(response_tx.send(Err(err.into())));
-                            }
-                            return;
-                        }
-                    };
-                    let response = client.ext_method(ExtRequest::new(RATE_LIMITS_METHOD, Arc::from(raw_value))).await;
-                    if let Err(err) = response && let Some(response_tx) = self.response_tx.take() {
-                        drop(response_tx.send(Err(err)));
-                    }
-                }
-            }
             EventMsg::ModelReroute(ModelRerouteEvent { from_model, to_model, reason }) => {
                 info!("Model reroute: from={from_model}, to={to_model}, reason={reason:?}");
             }
@@ -829,6 +857,9 @@ impl PromptState {
             | EventMsg::CollabAgentSpawnEnd(..)
             | EventMsg::CollabAgentInteractionBegin(..)
             | EventMsg::CollabAgentInteractionEnd(..)
+            | EventMsg::RealtimeConversationStarted(..)
+            | EventMsg::RealtimeConversationRealtime(..)
+            | EventMsg::RealtimeConversationClosed(..)
             | EventMsg::CollabWaitingBegin(..)
             | EventMsg::CollabWaitingEnd(..)
             | EventMsg::CollabResumeBegin(..)
@@ -844,7 +875,6 @@ impl PromptState {
             | EventMsg::GetHistoryEntryResponse(..)
             | EventMsg::DeprecationNotice(..)
             | EventMsg::RequestUserInput(..)
-            | EventMsg::DynamicToolCallRequest(..)
             | EventMsg::ListRemoteSkillsResponse(..)
             | EventMsg::RemoteSkillDownloaded(..)) => {
                 warn!("Unexpected event: {:?}", e);
@@ -1082,6 +1112,22 @@ impl PromptState {
             .await;
     }
 
+    async fn start_dynamic_tool_call(
+        &self,
+        client: &SessionClient,
+        call_id: String,
+        tool: String,
+        arguments: serde_json::Value,
+    ) {
+        client
+            .send_tool_call(
+                ToolCall::new(call_id, format!("Tool: {tool}"))
+                    .status(ToolCallStatus::InProgress)
+                    .raw_input(serde_json::json!(&arguments)),
+            )
+            .await;
+    }
+
     async fn start_mcp_tool_call(
         &self,
         client: &SessionClient,
@@ -1095,6 +1141,56 @@ impl PromptState {
                     .status(ToolCallStatus::InProgress)
                     .raw_input(serde_json::json!(&invocation)),
             )
+            .await;
+    }
+
+    async fn end_dynamic_tool_call(
+        &self,
+        client: &SessionClient,
+        event: DynamicToolCallResponseEvent,
+    ) {
+        let raw_output = serde_json::json!(event);
+        let DynamicToolCallResponseEvent {
+            call_id,
+            turn_id: _,
+            tool: _,
+            arguments: _,
+            content_items,
+            success,
+            error,
+            duration: _,
+        } = event;
+
+        client
+            .send_tool_call_update(ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(if success {
+                        ToolCallStatus::Completed
+                    } else {
+                        ToolCallStatus::Failed
+                    })
+                    .raw_output(raw_output)
+                    .content(
+                        content_items
+                            .into_iter()
+                            .map(|item| match item {
+                                DynamicToolCallOutputContentItem::InputText { text } => {
+                                    ToolCallContent::Content(Content::new(text))
+                                }
+                                DynamicToolCallOutputContentItem::InputImage { image_url } => {
+                                    ToolCallContent::Content(Content::new(
+                                        ContentBlock::ResourceLink(ResourceLink::new(
+                                            image_url.clone(),
+                                            image_url,
+                                        )),
+                                    ))
+                                }
+                            })
+                            .chain(error.map(|e| ToolCallContent::Content(Content::new(e))))
+                            .collect::<Vec<_>>(),
+                    ),
+            ))
             .await;
     }
 
@@ -1154,7 +1250,10 @@ impl PromptState {
             parsed_cmd,
             proposed_execpolicy_amendment,
             approval_id,
-            network_approval_context: _,
+            network_approval_context,
+            additional_permissions,
+            available_decisions,
+            proposed_network_policy_amendments,
         } = event;
 
         // Create a new tool call for the command execution
@@ -1185,6 +1284,34 @@ impl PromptState {
             content.push(format!(
                 "Proposed Amendment: {}",
                 amendment.command().join("\n")
+            ));
+        }
+        if let Some(policy) = network_approval_context {
+            let NetworkApprovalContext { host, protocol } = policy;
+            content.push(format!("Network Approval Context: {:?} {}", protocol, host));
+        }
+        if let Some(permissions) = additional_permissions {
+            content.push(format!(
+                "Additional Permissions: {}",
+                serde_json::to_string_pretty(&permissions)?
+            ));
+        }
+        if let Some(decisions) = available_decisions {
+            content.push(format!(
+                "Available Decisions: {}",
+                decisions.into_iter().map(|d| d.to_string()).join("\n")
+            ));
+        }
+        if let Some(amendments) = proposed_network_policy_amendments {
+            content.push(format!(
+                "Proposed Network Policy Amendments: {}",
+                amendments
+                    .into_iter()
+                    .map(|NetworkPolicyAmendment { host, action }| format!(
+                        "{:?} {:?}",
+                        action, host
+                    ))
+                    .join("\n")
             ));
         }
 
@@ -2511,7 +2638,7 @@ impl<A: Auth> ThreadActor<A> {
             EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
                 self.client.send_user_message(message.clone()).await;
             }
-            EventMsg::AgentMessage(AgentMessageEvent { message }) => {
+            EventMsg::AgentMessage(AgentMessageEvent { message, phase: _ }) => {
                 self.client.send_agent_text(message.clone()).await;
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
@@ -2778,10 +2905,7 @@ impl<A: Auth> ThreadActor<A> {
             }
             ResponseItem::CustomToolCallOutput { call_id, output } => {
                 self.client
-                    .send_tool_call_completed(
-                        call_id.clone(),
-                        Some(serde_json::Value::String(output.clone())),
-                    )
+                    .send_tool_call_completed(call_id.clone(), Some(serde_json::json!(output)))
                     .await;
             }
             ResponseItem::WebSearchCall { id, action, .. } => {
@@ -2879,11 +3003,11 @@ fn extract_tool_call_content_from_changes(
         changes.keys().map(ToolCallLocation::new).collect(),
         changes.into_iter().map(|(path, change)| {
             ToolCallContent::Diff(match change {
-                codex_core::protocol::FileChange::Add { content } => Diff::new(path, content),
-                codex_core::protocol::FileChange::Delete { content } => {
+                codex_protocol::protocol::FileChange::Add { content } => Diff::new(path, content),
+                codex_protocol::protocol::FileChange::Delete { content } => {
                     Diff::new(path, String::new()).old_text(content)
                 }
-                codex_core::protocol::FileChange::Update {
+                codex_protocol::protocol::FileChange::Update {
                     unified_diff: _,
                     move_path,
                     old_content,
@@ -2953,9 +3077,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use agent_client_protocol::TextContent;
-    use codex_core::{
-        config::ConfigOverrides, protocol::AgentMessageEvent, test_support::all_model_presets,
-    };
+    use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
     use codex_protocol::config_types::ModeKind;
     use tokio::{
         sync::{Mutex, mpsc::UnboundedSender},
@@ -3648,7 +3770,10 @@ mod tests {
                         self.op_tx
                             .send(Event {
                                 id: id.to_string(),
-                                msg: EventMsg::AgentMessage(AgentMessageEvent { message: prompt }),
+                                msg: EventMsg::AgentMessage(AgentMessageEvent {
+                                    message: prompt,
+                                    phase: None,
+                                }),
                             })
                             .unwrap();
                         self.op_tx
@@ -3678,6 +3803,7 @@ mod tests {
                             id: id.to_string(),
                             msg: EventMsg::AgentMessage(AgentMessageEvent {
                                 message: "Compact task completed".to_string(),
+                                phase: None,
                             }),
                         })
                         .unwrap();
@@ -3695,16 +3821,18 @@ mod tests {
                     self.op_tx
                         .send(Event {
                             id: id.to_string(),
-                            msg: EventMsg::UndoStarted(codex_core::protocol::UndoStartedEvent {
-                                message: Some("Undo in progress...".to_string()),
-                            }),
+                            msg: EventMsg::UndoStarted(
+                                codex_protocol::protocol::UndoStartedEvent {
+                                    message: Some("Undo in progress...".to_string()),
+                                },
+                            ),
                         })
                         .unwrap();
                     self.op_tx
                         .send(Event {
                             id: id.to_string(),
                             msg: EventMsg::UndoCompleted(
-                                codex_core::protocol::UndoCompletedEvent {
+                                codex_protocol::protocol::UndoCompletedEvent {
                                     success: true,
                                     message: Some("Undo completed.".to_string()),
                                 },
