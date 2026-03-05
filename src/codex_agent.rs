@@ -144,6 +144,8 @@ impl CodexAgent {
                 McpServer::Http(McpServerHttp {
                     name, url, headers, ..
                 }) => {
+                    // Codex does not allow whitespace in MCP server names; replace with underscores.
+                    let name = name.replace(|c: char| c.is_whitespace(), "_");
                     new_mcp_servers.insert(
                         name,
                         McpServerConfig {
@@ -176,6 +178,8 @@ impl CodexAgent {
                     env,
                     ..
                 }) => {
+                    // Codex does not allow whitespace in MCP server names; replace with underscores.
+                    let name = name.replace(|c: char| c.is_whitespace(), "_");
                     new_mcp_servers.insert(
                         name,
                         McpServerConfig {
