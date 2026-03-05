@@ -48,6 +48,7 @@ use codex_protocol::{
     config_types::TrustLevel,
     custom_prompts::CustomPrompt,
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
+    items::TurnItem,
     mcp::CallToolResult,
     models::{ResponseItem, WebSearchAction},
     openai_models::{ModelPreset, ReasoningEffort},
@@ -637,6 +638,11 @@ impl PromptState {
                 item,
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
+                // Notify the client when context compaction completes so users see
+                // a status message rather than silence during /compact.
+                if matches!(item, TurnItem::ContextCompaction(..)) {
+                    client.send_agent_text("Context compacted".to_string()).await;
+                }
             }
             EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id }) => {
                 info!(
@@ -725,6 +731,9 @@ impl PromptState {
             }
             EventMsg::Warning(WarningEvent { message }) => {
                 warn!("Warning: {message}");
+                // Forward warnings to the client as agent messages so users see
+                // informational notices (e.g., the post-compact advisory message).
+                client.send_agent_text(message).await;
             }
             EventMsg::McpStartupUpdate(McpStartupUpdateEvent { server, status }) => {
                 info!("MCP startup update: server={server}, status={status:?}");
@@ -750,6 +759,11 @@ impl PromptState {
                 info!("Model reroute: from={from_model}, to={to_model}, reason={reason:?}");
             }
 
+            EventMsg::ContextCompacted(..) => {
+                info!("Context compacted");
+                client.send_agent_text("Context compacted".to_string()).await;
+            }
+
             // Ignore these events
             EventMsg::AgentReasoningRawContent(..)
             | EventMsg::ThreadRolledBack(..)
@@ -757,7 +771,6 @@ impl PromptState {
             | EventMsg::TurnDiff(..)
             // Revisit when we can emit status updates
             | EventMsg::BackgroundEvent(..)
-            | EventMsg::ContextCompacted(..)
             | EventMsg::SkillsUpdateAvailable
             // Old events
             | EventMsg::AgentMessageDelta(..)
