@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 mod codex_agent;
 mod local_spawner;
 mod prompt_args;
+mod session_mode_store;
 mod thread;
 
 pub static ACP_CLIENT: OnceLock<Arc<AgentSideConnection>> = OnceLock::new();
