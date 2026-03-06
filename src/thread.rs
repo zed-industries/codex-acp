@@ -463,13 +463,13 @@ impl PromptState {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
             }
             EventMsg::TokenCount(TokenCountEvent { info, rate_limits }) => {
-                if let Some(TokenUsageInfo{total_token_usage: _, last_token_usage: usage, model_context_window}) = info{
+                if let Some(TokenUsageInfo{total_token_usage, last_token_usage, model_context_window}) = info{
                     let raw_value = match to_raw_value(&SessionUsageUpdate{
                         usage: SessionUsage {
-                            input_tokens: usage.input_tokens,
-                            output_tokens: usage.output_tokens,
-                            cache_read_input_tokens: usage.cached_input_tokens,
-                            reasoning_output_tokens: usage.reasoning_output_tokens,
+                            input_tokens: total_token_usage.input_tokens,
+                            output_tokens: total_token_usage.output_tokens,
+                            cache_read_input_tokens: total_token_usage.cached_input_tokens,
+                            reasoning_output_tokens: total_token_usage.reasoning_output_tokens,
                             context_window: model_context_window
                          }
                     }){
@@ -483,7 +483,7 @@ impl PromptState {
                     };
 
                     if let Some(size) = model_context_window {
-                        let used = usage.tokens_in_context_window().max(0) as u64;
+                        let used = last_token_usage.tokens_in_context_window().max(0) as u64;
                         client
                             .send_notification(SessionUpdate::UsageUpdate(UsageUpdate::new(
                                 used,
