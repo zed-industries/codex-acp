@@ -5,8 +5,8 @@ use agent_client_protocol::{
     LoadSessionResponse, McpCapabilities, McpServer, McpServerHttp, McpServerStdio,
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
     ProtocolVersion, SessionCapabilities, SessionId, SessionInfo, SessionListCapabilities,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
+    SessionModeId, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
 use codex_core::{
     CodexAuth, NewThread, RolloutRecorder, ThreadManager, ThreadSortKey,
@@ -31,11 +31,12 @@ use std::{
     rc::Rc,
     sync::{Arc, Mutex},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     local_spawner::{AcpFs, LocalSpawner},
+    mode_overrides::ModeOverrideStore,
     thread::Thread,
 };
 
@@ -56,6 +57,8 @@ pub struct CodexAgent {
     sessions: Rc<RefCell<HashMap<SessionId, Rc<Thread>>>>,
     /// Session working directories for filesystem sandboxing
     session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>>,
+    /// Persists per-project session mode overrides across restarts
+    mode_override_store: ModeOverrideStore,
 }
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
@@ -94,6 +97,7 @@ impl CodexAgent {
                 ))
             }),
         );
+        let mode_override_store = ModeOverrideStore::new(&config.codex_home);
         Self {
             auth_manager,
             client_capabilities,
@@ -101,6 +105,7 @@ impl CodexAgent {
             thread_manager,
             sessions: Rc::default(),
             session_roots,
+            mode_override_store,
         }
     }
 
@@ -362,6 +367,14 @@ impl Agent for CodexAgent {
         ));
         let load = thread.load().await?;
 
+        // Replay any mode override persisted for this project directory so that
+        // the client's last explicit mode choice survives server restarts.
+        if let Some(mode_id) = self.mode_override_store.get(&config.cwd) {
+            if let Err(e) = thread.set_mode(SessionModeId::new(mode_id)).await {
+                warn!("Failed to replay stored mode override: {e}");
+            }
+        }
+
         self.sessions
             .borrow_mut()
             .insert(session_id.clone(), thread);
@@ -431,6 +444,14 @@ impl Agent for CodexAgent {
         thread.replay_history(rollout_items).await?;
 
         let load = thread.load().await?;
+
+        // Replay any mode override persisted for this project directory so that
+        // the client's last explicit mode choice survives server restarts.
+        if let Some(mode_id) = self.mode_override_store.get(&config.cwd) {
+            if let Err(e) = thread.set_mode(SessionModeId::new(mode_id)).await {
+                warn!("Failed to replay stored mode override: {e}");
+            }
+        }
 
         self.session_roots
             .lock()
@@ -528,10 +549,25 @@ impl Agent for CodexAgent {
         &self,
         args: SetSessionModeRequest,
     ) -> Result<SetSessionModeResponse, Error> {
-        info!("Setting session mode for session: {}", args.session_id);
-        self.get_thread(&args.session_id)?
-            .set_mode(args.mode_id)
-            .await?;
+        let SetSessionModeRequest {
+            session_id,
+            mode_id,
+            ..
+        } = args;
+        info!("Setting session mode for session: {session_id}");
+        self.get_thread(&session_id)?.set_mode(mode_id.clone()).await?;
+
+        // Persist the mode override so it survives server restarts.
+        if let Some(cwd) = self
+            .session_roots
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .cloned()
+        {
+            self.mode_override_store.set(&cwd, mode_id.0.as_ref());
+        }
+
         Ok(SetSessionModeResponse::default())
     }
 
@@ -557,9 +593,30 @@ impl Agent for CodexAgent {
             args.session_id, args.config_id.0, args.value.0
         );
 
+        // If this is a mode change, capture the value before it is moved so we
+        // can persist it after the call succeeds.
+        let pending_mode_override: Option<String> = if args.config_id.0.as_ref() == "mode" {
+            Some(format!("{}", args.value.0))
+        } else {
+            None
+        };
+
         let thread = self.get_thread(&args.session_id)?;
 
         thread.set_config_option(args.config_id, args.value).await?;
+
+        // Persist mode override so it survives server restarts.
+        if let Some(mode_id) = pending_mode_override {
+            if let Some(cwd) = self
+                .session_roots
+                .lock()
+                .unwrap()
+                .get(&args.session_id)
+                .cloned()
+            {
+                self.mode_override_store.set(&cwd, &mode_id);
+            }
+        }
 
         let config_options = thread.config_options().await?;
 
