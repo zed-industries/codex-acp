@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::DerefMut,
     path::{Path, PathBuf},
     rc::Rc,
@@ -35,13 +35,13 @@ use codex_protocol::protocol::{
     ElicitationAction, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent,
     ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus,
     ExitedReviewModeEvent, FileChange, ItemCompletedEvent, ItemStartedEvent,
-    ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent,
-    McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, Op, PatchApplyBeginEvent,
-    PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
-    ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget,
-    SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent, TurnAbortedEvent,
-    TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
-    WebSearchBeginEvent, WebSearchEndEvent,
+    ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent, McpStartupStatus,
+    McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent,
+    ModelRerouteReason, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
+    ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent,
+    ReviewRequest, ReviewTarget, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent,
+    TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+    ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
 };
 use codex_protocol::{
     approvals::ElicitationRequestEvent,
@@ -113,14 +113,14 @@ impl ModelsManagerImpl for ModelsManager {
 }
 
 pub trait Auth {
-    fn logout(&self) -> Result<bool, Error>;
+    fn logout(&self) -> Result<bool, Box<Error>>;
 }
 
 impl Auth for Arc<AuthManager> {
-    fn logout(&self) -> Result<bool, Error> {
+    fn logout(&self) -> Result<bool, Box<Error>> {
         self.as_ref()
             .logout()
-            .map_err(|e| Error::internal_error().data(e.to_string()))
+            .map_err(|e| Box::new(Error::internal_error().data(e.to_string())))
     }
 }
 
@@ -300,7 +300,7 @@ enum SubmissionState {
     /// Loading custom prompts from the project
     CustomPrompts(CustomPromptsState),
     /// User prompts, including slash commands like /init, /review, /compact, /undo.
-    Prompt(PromptState),
+    Prompt(Box<PromptState>),
 }
 
 impl SubmissionState {
@@ -362,28 +362,305 @@ struct ActiveCommand {
 
 struct PromptState {
     active_commands: HashMap<String, ActiveCommand>,
+    active_mcp_startup_servers: HashSet<String>,
     active_web_search: Option<String>,
     thread: Arc<dyn CodexThreadImpl>,
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
+    pending_user_message_id: Option<String>,
+    message_ids: ContentMessageIds,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
+}
+
+#[derive(Debug, Default)]
+struct ActiveMessageId {
+    logical_key: Option<String>,
+    message_id: Option<String>,
+}
+
+impl ActiveMessageId {
+    fn for_logical_key(&mut self, logical_key: &str) -> String {
+        if self.logical_key.as_deref() == Some(logical_key)
+            && let Some(message_id) = &self.message_id
+        {
+            return message_id.clone();
+        }
+
+        let message_id = generate_message_id();
+        self.logical_key = Some(logical_key.to_owned());
+        self.message_id = Some(message_id.clone());
+        message_id
+    }
+
+    fn next_message_id(&mut self) -> String {
+        let message_id = generate_message_id();
+        self.logical_key = None;
+        self.message_id = Some(message_id.clone());
+        message_id
+    }
+
+    fn clear(&mut self) {
+        self.logical_key = None;
+        self.message_id = None;
+    }
+}
+
+#[derive(Debug, Default)]
+struct ContentMessageIds {
+    user: ActiveMessageId,
+    assistant: ActiveMessageId,
+    reasoning: ActiveMessageId,
+}
+
+impl ContentMessageIds {
+    fn next_user_message_id(&mut self) -> String {
+        self.user.next_message_id()
+    }
+
+    fn assistant_message_id_for_item(&mut self, item_id: &str) -> String {
+        self.assistant.for_logical_key(item_id)
+    }
+
+    fn next_assistant_message_id(&mut self) -> String {
+        self.assistant.next_message_id()
+    }
+
+    fn clear_assistant(&mut self) {
+        self.assistant.clear();
+    }
+
+    fn reasoning_message_id_for_item(&mut self, item_id: &str) -> String {
+        self.reasoning.for_logical_key(item_id)
+    }
+
+    fn next_reasoning_message_id(&mut self) -> String {
+        self.reasoning.next_message_id()
+    }
+
+    fn clear_reasoning(&mut self) {
+        self.reasoning.clear();
+    }
+
+    fn clear_all(&mut self) {
+        self.user.clear();
+        self.assistant.clear();
+        self.reasoning.clear();
+    }
+}
+
+fn model_reroute_reason_text(reason: &ModelRerouteReason) -> &'static str {
+    match reason {
+        ModelRerouteReason::HighRiskCyberActivity => "high-risk cyber activity",
+    }
+}
+
+fn model_reroute_notice(from_model: &str, to_model: &str, reason: &ModelRerouteReason) -> String {
+    format!(
+        "Model rerouted from {from_model} to {to_model} due to {}.",
+        model_reroute_reason_text(reason)
+    )
+}
+
+async fn send_review_mode_exit(
+    client: &SessionClient,
+    event: ExitedReviewModeEvent,
+) -> Result<(), Error> {
+    let ExitedReviewModeEvent { review_output } = event;
+    let Some(ReviewOutputEvent {
+        findings,
+        overall_correctness: _,
+        overall_explanation,
+        overall_confidence_score: _,
+    }) = review_output
+    else {
+        return Ok(());
+    };
+
+    let text = if findings.is_empty() {
+        let explanation = overall_explanation.trim();
+        if explanation.is_empty() {
+            "Reviewer failed to output a response"
+        } else {
+            explanation
+        }
+        .to_string()
+    } else {
+        format_review_findings_block(&findings, None)
+    };
+
+    client.send_agent_text(&text).await;
+    Ok(())
+}
+
+fn mcp_startup_tool_call_id(server: &str) -> String {
+    format!("mcp_startup:{server}")
+}
+
+fn mcp_startup_tool_call_title(server: &str) -> String {
+    format!("MCP Startup: {server}")
+}
+
+fn mcp_startup_summary_tool_call_id() -> String {
+    "mcp_startup".to_string()
+}
+
+fn mcp_startup_tool_status(status: &McpStartupStatus) -> ToolCallStatus {
+    match status {
+        McpStartupStatus::Starting => ToolCallStatus::InProgress,
+        McpStartupStatus::Ready => ToolCallStatus::Completed,
+        // ACP has no cancelled tool-call status, so preserve the backend payload verbatim
+        // in raw_output and map non-ready terminal states to failed.
+        McpStartupStatus::Failed { .. } | McpStartupStatus::Cancelled => ToolCallStatus::Failed,
+    }
+}
+
+fn mcp_startup_summary_status(event: &McpStartupCompleteEvent) -> ToolCallStatus {
+    if event.failed.is_empty() && event.cancelled.is_empty() {
+        ToolCallStatus::Completed
+    } else {
+        ToolCallStatus::Failed
+    }
+}
+
+fn mcp_startup_server_status_from_summary(
+    event: &McpStartupCompleteEvent,
+    server: &str,
+) -> Option<ToolCallStatus> {
+    if event.ready.iter().any(|ready| ready == server) {
+        Some(ToolCallStatus::Completed)
+    } else if event.failed.iter().any(|failed| failed.server == server)
+        || event.cancelled.iter().any(|cancelled| cancelled == server)
+    {
+        Some(ToolCallStatus::Failed)
+    } else {
+        None
+    }
+}
+
+async fn send_mcp_startup_update(
+    client: &SessionClient,
+    active_mcp_startup_servers: &mut HashSet<String>,
+    event: McpStartupUpdateEvent,
+) {
+    let raw_event = serde_json::json!(&event);
+    let McpStartupUpdateEvent { server, status } = event;
+    let call_id = mcp_startup_tool_call_id(&server);
+    let title = mcp_startup_tool_call_title(&server);
+
+    match status {
+        McpStartupStatus::Starting => {
+            if active_mcp_startup_servers.insert(server) {
+                client
+                    .send_tool_call(
+                        ToolCall::new(call_id, title)
+                            .status(ToolCallStatus::InProgress)
+                            .raw_input(raw_event),
+                    )
+                    .await;
+            } else {
+                client
+                    .send_tool_call_update(ToolCallUpdate::new(
+                        call_id,
+                        ToolCallUpdateFields::new()
+                            .status(ToolCallStatus::InProgress)
+                            .title(title)
+                            .raw_output(raw_event),
+                    ))
+                    .await;
+            }
+        }
+        status => {
+            let tool_status = mcp_startup_tool_status(&status);
+            if active_mcp_startup_servers.remove(&server) {
+                client
+                    .send_tool_call_update(ToolCallUpdate::new(
+                        call_id,
+                        ToolCallUpdateFields::new()
+                            .status(tool_status)
+                            .title(title)
+                            .raw_output(raw_event),
+                    ))
+                    .await;
+            } else {
+                client
+                    .send_tool_call(
+                        ToolCall::new(call_id, title)
+                            .status(tool_status)
+                            .raw_output(raw_event),
+                    )
+                    .await;
+            }
+        }
+    }
+}
+
+async fn send_mcp_startup_complete(
+    client: &SessionClient,
+    active_mcp_startup_servers: &mut HashSet<String>,
+    event: McpStartupCompleteEvent,
+) {
+    let raw_output = serde_json::json!(&event);
+    let active_servers = active_mcp_startup_servers
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for server in active_servers {
+        let Some(status) = mcp_startup_server_status_from_summary(&event, &server) else {
+            continue;
+        };
+
+        client
+            .send_tool_call_update(ToolCallUpdate::new(
+                mcp_startup_tool_call_id(&server),
+                ToolCallUpdateFields::new()
+                    .status(status)
+                    .title(mcp_startup_tool_call_title(&server))
+                    .raw_output(raw_output.clone()),
+            ))
+            .await;
+        active_mcp_startup_servers.remove(&server);
+    }
+
+    client
+        .send_tool_call(
+            ToolCall::new(mcp_startup_summary_tool_call_id(), "MCP Startup")
+                .status(mcp_startup_summary_status(&event))
+                .raw_output(raw_output),
+        )
+        .await;
 }
 
 impl PromptState {
     fn new(
         thread: Arc<dyn CodexThreadImpl>,
         response_tx: oneshot::Sender<Result<StopReason, Error>>,
+        pending_user_message_id: Option<String>,
     ) -> Self {
         Self {
             active_commands: HashMap::new(),
+            active_mcp_startup_servers: HashSet::new(),
             active_web_search: None,
             thread,
             event_count: 0,
             response_tx: Some(response_tx),
+            pending_user_message_id,
+            message_ids: ContentMessageIds::default(),
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
         }
+    }
+
+    fn next_user_message_id(&mut self) -> String {
+        self.pending_user_message_id
+            .take()
+            .unwrap_or_else(|| self.message_ids.next_user_message_id())
+    }
+
+    fn clear_content_message_ids(&mut self) {
+        self.pending_user_message_id = None;
+        self.message_ids.clear_all();
     }
 
     fn is_active(&self) -> bool {
@@ -454,6 +731,9 @@ impl PromptState {
                 local_images: _,
             }) => {
                 info!("User message: {message:?}");
+                client
+                    .send_user_message_with_id(message, self.next_user_message_id())
+                    .await;
             }
             EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
                 thread_id,
@@ -463,7 +743,12 @@ impl PromptState {
             }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
                 self.seen_message_deltas = true;
-                client.send_agent_text(delta).await;
+                client
+                    .send_agent_text_with_id(
+                        delta,
+                        self.message_ids.assistant_message_id_for_item(&item_id),
+                    )
+                    .await;
             }
             EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
                 thread_id,
@@ -481,7 +766,12 @@ impl PromptState {
             }) => {
                 info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
                 self.seen_reasoning_deltas = true;
-                client.send_agent_thought(delta).await;
+                client
+                    .send_agent_thought_with_id(
+                        delta,
+                        self.message_ids.reasoning_message_id_for_item(&item_id),
+                    )
+                    .await;
             }
             EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
                 item_id,
@@ -490,20 +780,39 @@ impl PromptState {
                 info!("Agent reasoning section break received:  item_id: {item_id}, index: {summary_index}");
                 // Make sure the section heading actually get spacing
                 self.seen_reasoning_deltas = true;
-                client.send_agent_thought("\n\n").await;
+                client
+                    .send_agent_thought_with_id(
+                        "\n\n",
+                        self.message_ids.reasoning_message_id_for_item(&item_id),
+                    )
+                    .await;
             }
             EventMsg::AgentMessage(AgentMessageEvent { message , phase: _ }) => {
                 info!("Agent message (non-delta) received: {message:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_message_deltas) {
-                    client.send_agent_text(message).await;
+                    client
+                        .send_agent_text_with_id(
+                            message,
+                            self.message_ids.next_assistant_message_id(),
+                        )
+                        .await;
+                } else {
+                    self.message_ids.clear_assistant();
                 }
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
                 info!("Agent reasoning (non-delta) received: {text:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_reasoning_deltas) {
-                    client.send_agent_thought(text).await;
+                    client
+                        .send_agent_thought_with_id(
+                            text,
+                            self.message_ids.next_reasoning_message_id(),
+                        )
+                        .await;
+                } else {
+                    self.message_ids.clear_reasoning();
                 }
             }
             EventMsg::ThreadNameUpdated(event) => {
@@ -649,6 +958,7 @@ impl PromptState {
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
                 );
+                self.clear_content_message_ids();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
@@ -694,12 +1004,14 @@ impl PromptState {
             }
             EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
+                self.clear_content_message_ids();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
                 }
             }
             EventMsg::ShutdownComplete => {
                 info!("Agent shutting down");
+                self.clear_content_message_ids();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
                 }
@@ -737,6 +1049,8 @@ impl PromptState {
             }
             EventMsg::McpStartupUpdate(McpStartupUpdateEvent { server, status }) => {
                 info!("MCP startup update: server={server}, status={status:?}");
+                self.mcp_startup_update(client, McpStartupUpdateEvent { server, status })
+                    .await;
             }
             EventMsg::McpStartupComplete(McpStartupCompleteEvent {
                 ready,
@@ -746,6 +1060,15 @@ impl PromptState {
                 info!(
                     "MCP startup complete: ready={ready:?}, failed={failed:?}, cancelled={cancelled:?}"
                 );
+                self.mcp_startup_complete(
+                    client,
+                    McpStartupCompleteEvent {
+                        ready,
+                        failed,
+                        cancelled,
+                    },
+                )
+                .await;
             }
             EventMsg::ElicitationRequest(event) => {
                 info!("Elicitation request: server={}, id={:?}, message={}", event.server_name, event.id, event.message);
@@ -757,6 +1080,10 @@ impl PromptState {
             }
             EventMsg::ModelReroute(ModelRerouteEvent { from_model, to_model, reason }) => {
                 info!("Model reroute: from={from_model}, to={to_model}, reason={reason:?}");
+                // Surface reroutes as standalone notices without touching grouped content IDs.
+                client
+                    .send_agent_text(model_reroute_notice(&from_model, &to_model, &reason))
+                    .await;
             }
 
             EventMsg::ContextCompacted(..) => {
@@ -892,31 +1219,7 @@ impl PromptState {
         client: &SessionClient,
         event: ExitedReviewModeEvent,
     ) -> Result<(), Error> {
-        let ExitedReviewModeEvent { review_output } = event;
-        let Some(ReviewOutputEvent {
-            findings,
-            overall_correctness: _,
-            overall_explanation,
-            overall_confidence_score: _,
-        }) = review_output
-        else {
-            return Ok(());
-        };
-
-        let text = if findings.is_empty() {
-            let explanation = overall_explanation.trim();
-            if explanation.is_empty() {
-                "Reviewer failed to output a response"
-            } else {
-                explanation
-            }
-            .to_string()
-        } else {
-            format_review_findings_block(&findings, None)
-        };
-
-        client.send_agent_text(&text).await;
-        Ok(())
+        send_review_mode_exit(client, event).await
     }
 
     async fn patch_approval(
@@ -1068,6 +1371,18 @@ impl PromptState {
                     .raw_input(serde_json::json!(&invocation)),
             )
             .await;
+    }
+
+    async fn mcp_startup_update(&mut self, client: &SessionClient, event: McpStartupUpdateEvent) {
+        send_mcp_startup_update(client, &mut self.active_mcp_startup_servers, event).await;
+    }
+
+    async fn mcp_startup_complete(
+        &mut self,
+        client: &SessionClient,
+        event: McpStartupCompleteEvent,
+    ) {
+        send_mcp_startup_complete(client, &mut self.active_mcp_startup_servers, event).await;
     }
 
     async fn end_dynamic_tool_call(
@@ -1524,31 +1839,12 @@ impl PromptState {
         query: String,
         action: WebSearchAction,
     ) {
-        let title = match &action {
-            WebSearchAction::Search { query, queries } => queries
-                .as_ref()
-                .map(|q| format!("Searching for: {}", q.join(", ")))
-                .or_else(|| query.as_ref().map(|q| format!("Searching for: {q}")))
-                .unwrap_or_else(|| "Web search".to_string()),
-            WebSearchAction::OpenPage { url } => url
-                .as_ref()
-                .map(|u| format!("Opening: {u}"))
-                .unwrap_or_else(|| "Open page".to_string()),
-            WebSearchAction::FindInPage { pattern, url } => match (pattern, url) {
-                (Some(p), Some(u)) => format!("Finding: {p} in {u}"),
-                (Some(p), None) => format!("Finding: {p}"),
-                (None, Some(u)) => format!("Find in page: {u}"),
-                (None, None) => "Find in page".to_string(),
-            },
-            WebSearchAction::Other => "Web search".to_string(),
-        };
-
         client
             .send_tool_call_update(ToolCallUpdate::new(
                 call_id,
                 ToolCallUpdateFields::new()
                     .status(ToolCallStatus::InProgress)
-                    .title(title)
+                    .title(web_search_action_to_title(&action))
                     .raw_input(serde_json::json!({
                         "query": query,
                         "action": action
@@ -1690,23 +1986,44 @@ impl SessionClient {
         }
     }
 
-    async fn send_user_message(&self, text: impl Into<String>) {
-        self.send_notification(SessionUpdate::UserMessageChunk(ContentChunk::new(
-            text.into().into(),
+    fn text_chunk(text: impl Into<String>, message_id: impl Into<String>) -> ContentChunk {
+        ContentChunk::new(text.into().into()).message_id(message_id.into())
+    }
+
+    async fn send_user_message_with_id(
+        &self,
+        text: impl Into<String>,
+        message_id: impl Into<String>,
+    ) {
+        self.send_notification(SessionUpdate::UserMessageChunk(Self::text_chunk(
+            text, message_id,
         )))
         .await;
     }
 
     async fn send_agent_text(&self, text: impl Into<String>) {
-        self.send_notification(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-            text.into().into(),
+        self.send_agent_text_with_id(text, generate_message_id())
+            .await;
+    }
+
+    async fn send_agent_text_with_id(
+        &self,
+        text: impl Into<String>,
+        message_id: impl Into<String>,
+    ) {
+        self.send_notification(SessionUpdate::AgentMessageChunk(Self::text_chunk(
+            text, message_id,
         )))
         .await;
     }
 
-    async fn send_agent_thought(&self, text: impl Into<String>) {
-        self.send_notification(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
-            text.into().into(),
+    async fn send_agent_thought_with_id(
+        &self,
+        text: impl Into<String>,
+        message_id: impl Into<String>,
+    ) {
+        self.send_notification(SessionUpdate::AgentThoughtChunk(Self::text_chunk(
+            text, message_id,
         )))
         .await;
     }
@@ -1721,17 +2038,16 @@ impl SessionClient {
             .await;
     }
 
-    /// Send a completed tool call (used for replay and simple cases)
-    async fn send_completed_tool_call(
+    /// Send a replayed tool call with an explicit starting status.
+    async fn send_replayed_tool_call(
         &self,
         call_id: impl Into<ToolCallId>,
         title: impl Into<String>,
         kind: ToolKind,
+        status: ToolCallStatus,
         raw_input: Option<serde_json::Value>,
     ) {
-        let mut tool_call = ToolCall::new(call_id, title)
-            .kind(kind)
-            .status(ToolCallStatus::Completed);
+        let mut tool_call = ToolCall::new(call_id, title).kind(kind).status(status);
         if let Some(input) = raw_input {
             tool_call = tool_call.raw_input(input);
         }
@@ -2329,6 +2645,7 @@ impl<A: Auth> ThreadActor<A> {
     ) -> Result<oneshot::Receiver<Result<StopReason, Error>>, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
+        let pending_user_message_id = request.message_id.clone();
         let items = build_prompt_items(request.prompt);
         let op;
         if let Some((name, rest)) = extract_slash_command(&items) {
@@ -2385,7 +2702,7 @@ impl<A: Auth> ThreadActor<A> {
                     }
                 }
                 "logout" => {
-                    self.auth.logout()?;
+                    self.auth.logout().map_err(|error| *error)?;
                     return Err(Error::auth_required());
                 }
                 _ => {
@@ -2424,7 +2741,11 @@ impl<A: Auth> ThreadActor<A> {
         info!("Submitted prompt with submission_id: {submission_id}");
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
 
-        let state = SubmissionState::Prompt(PromptState::new(self.thread.clone(), response_tx));
+        let state = SubmissionState::Prompt(Box::new(PromptState::new(
+            self.thread.clone(),
+            response_tx,
+            pending_user_message_id,
+        )));
 
         self.submissions.insert(submission_id, state);
 
@@ -2535,13 +2856,22 @@ impl<A: Auth> ThreadActor<A> {
     /// This is called when loading a session to stream all prior messages.
     ///
     /// We process both `EventMsg` and `ResponseItem`:
-    /// - `EventMsg` for user/agent messages and reasoning (like the TUI does)
+    /// - `EventMsg` for user/agent messages, reasoning, direct ACP-mappable notices,
+    ///   and replayable MCP startup status events
     /// - `ResponseItem` for tool calls only (not persisted as EventMsg)
     async fn handle_replay_history(&mut self, history: Vec<RolloutItem>) -> Result<(), Error> {
+        let mut message_ids = ContentMessageIds::default();
+        let mut active_mcp_startup_servers = HashSet::new();
+
         for item in history {
             match item {
                 RolloutItem::EventMsg(event_msg) => {
-                    self.replay_event_msg(&event_msg).await;
+                    self.replay_event_msg(
+                        event_msg,
+                        &mut message_ids,
+                        &mut active_mcp_startup_servers,
+                    )
+                    .await;
                 }
                 RolloutItem::ResponseItem(response_item) => {
                     self.replay_response_item(&response_item).await;
@@ -2554,26 +2884,109 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     /// Convert and send an EventMsg as ACP notification(s) during replay.
-    /// Handles messages and reasoning - mirrors the live event handling in PromptState.
-    async fn replay_event_msg(&self, msg: &EventMsg) {
+    /// Handles messages, reasoning, direct ACP-mappable notices, and replayable MCP startup
+    /// status events.
+    async fn replay_event_msg(
+        &self,
+        msg: EventMsg,
+        message_ids: &mut ContentMessageIds,
+        active_mcp_startup_servers: &mut HashSet<String>,
+    ) {
         match msg {
             EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
-                self.client.send_user_message(message.clone()).await;
+                self.client
+                    .send_user_message_with_id(message, message_ids.next_user_message_id())
+                    .await;
             }
             EventMsg::AgentMessage(AgentMessageEvent { message, phase: _ }) => {
-                self.client.send_agent_text(message.clone()).await;
+                self.client
+                    .send_agent_text_with_id(message, message_ids.next_assistant_message_id())
+                    .await;
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
-                self.client.send_agent_thought(text.clone()).await;
+                self.client
+                    .send_agent_thought_with_id(text, message_ids.next_reasoning_message_id())
+                    .await;
             }
             EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text }) => {
-                self.client.send_agent_thought(text.clone()).await;
+                self.client
+                    .send_agent_thought_with_id(text, message_ids.next_reasoning_message_id())
+                    .await;
+            }
+            EventMsg::ThreadNameUpdated(event) => {
+                if let Some(title) = event.thread_name {
+                    self.client
+                        .send_notification(SessionUpdate::SessionInfoUpdate(
+                            SessionInfoUpdate::new().title(title),
+                        ))
+                        .await;
+                }
+            }
+            EventMsg::PlanUpdate(UpdatePlanArgs {
+                explanation: _,
+                plan,
+            }) => {
+                self.client.update_plan(plan).await;
+            }
+            EventMsg::Warning(WarningEvent { message }) => {
+                self.client.send_agent_text(message).await;
+            }
+            EventMsg::ModelReroute(ModelRerouteEvent {
+                from_model,
+                to_model,
+                reason,
+            }) => {
+                self.client
+                    .send_agent_text(model_reroute_notice(&from_model, &to_model, &reason))
+                    .await;
+            }
+            EventMsg::ExitedReviewMode(event) => {
+                if let Err(err) = send_review_mode_exit(&self.client, event).await {
+                    error!("Failed to replay review mode exit: {err:?}");
+                }
+            }
+            EventMsg::UndoStarted(event) => {
+                self.client
+                    .send_agent_text(
+                        event
+                            .message
+                            .unwrap_or_else(|| "Undo in progress...".to_string()),
+                    )
+                    .await;
+            }
+            EventMsg::UndoCompleted(event) => {
+                let fallback = if event.success {
+                    "Undo completed.".to_string()
+                } else {
+                    "Undo failed.".to_string()
+                };
+                self.client
+                    .send_agent_text(event.message.unwrap_or(fallback))
+                    .await;
+            }
+            EventMsg::ContextCompacted(..) => {
+                self.client
+                    .send_agent_text("Context compacted".to_string())
+                    .await;
+            }
+            EventMsg::McpStartupUpdate(event) => {
+                send_mcp_startup_update(&self.client, active_mcp_startup_servers, event).await;
+            }
+            EventMsg::McpStartupComplete(event) => {
+                send_mcp_startup_complete(&self.client, active_mcp_startup_servers, event).await;
+            }
+            EventMsg::ViewImageToolCall(..) => {
+                // Intentionally omitted during replay. View-image invocations can already surface
+                // through persisted ResponseItem tool reconstruction, and replaying the event-side
+                // tool notification here would risk duplicate tool state.
             }
             // Skip other event types during replay - they either:
             // - Are transient (deltas, turn lifecycle)
             // - Don't have direct ACP equivalents
             // - Are handled via ResponseItem instead
-            _ => {}
+            _ => {
+                // no-op
+            }
         }
     }
 
@@ -2717,7 +3130,9 @@ impl<A: Auth> ThreadActor<A> {
                 call_id,
                 ..
             } => {
-                // Check if this is a shell command - parse it like we do for LocalShellCall
+                // Replay the opening lifecycle step here and let the paired output item
+                // deliver completion so ACP preserves the persisted two-step tool flow.
+                // Check if this is a shell command - parse it like we do for LocalShellCall.
                 if matches!(name.as_str(), "shell" | "container.exec" | "shell_command")
                     && let Some((title, kind, locations)) =
                         self.parse_shell_function_call(name, arguments)
@@ -2726,7 +3141,7 @@ impl<A: Auth> ThreadActor<A> {
                         .send_tool_call(
                             ToolCall::new(call_id.clone(), title)
                                 .kind(kind)
-                                .status(ToolCallStatus::Completed)
+                                .status(ToolCallStatus::InProgress)
                                 .locations(locations)
                                 .raw_input(
                                     serde_json::from_str::<serde_json::Value>(arguments).ok(),
@@ -2738,10 +3153,11 @@ impl<A: Auth> ThreadActor<A> {
 
                 // Fall through to generic function call handling
                 self.client
-                    .send_completed_tool_call(
+                    .send_replayed_tool_call(
                         call_id.clone(),
                         name.clone(),
                         ToolKind::Other,
+                        ToolCallStatus::InProgress,
                         serde_json::from_str(arguments).ok(),
                     )
                     .await;
@@ -2778,10 +3194,10 @@ impl<A: Auth> ThreadActor<A> {
                     codex_protocol::models::LocalShellStatus::Completed => {
                         ToolCallStatus::Completed
                     }
-                    codex_protocol::models::LocalShellStatus::InProgress
-                    | codex_protocol::models::LocalShellStatus::Incomplete => {
-                        ToolCallStatus::Failed
+                    codex_protocol::models::LocalShellStatus::InProgress => {
+                        ToolCallStatus::InProgress
                     }
+                    codex_protocol::models::LocalShellStatus::Incomplete => ToolCallStatus::Failed,
                 };
                 self.client
                     .send_tool_call(
@@ -2798,7 +3214,9 @@ impl<A: Auth> ThreadActor<A> {
                 call_id,
                 ..
             } => {
-                // Check if this is an apply_patch call - show the patch content
+                // Replay the opening lifecycle step here and let the paired output item
+                // deliver completion so ACP preserves the persisted two-step tool flow.
+                // Check if this is an apply_patch call - show the patch content.
                 if name == "apply_patch"
                     && let Some((title, locations, content)) = self.parse_apply_patch_call(input)
                 {
@@ -2806,7 +3224,7 @@ impl<A: Auth> ThreadActor<A> {
                         .send_tool_call(
                             ToolCall::new(call_id.clone(), title)
                                 .kind(ToolKind::Edit)
-                                .status(ToolCallStatus::Completed)
+                                .status(ToolCallStatus::InProgress)
                                 .locations(locations)
                                 .content(content)
                                 .raw_input(serde_json::from_str::<serde_json::Value>(input).ok()),
@@ -2817,10 +3235,11 @@ impl<A: Auth> ThreadActor<A> {
 
                 // Fall through to generic custom tool call handling
                 self.client
-                    .send_completed_tool_call(
+                    .send_replayed_tool_call(
                         call_id.clone(),
                         name.clone(),
                         ToolKind::Other,
+                        ToolCallStatus::InProgress,
                         serde_json::from_str(input).ok(),
                     )
                     .await;
@@ -2830,19 +3249,23 @@ impl<A: Auth> ThreadActor<A> {
                     .send_tool_call_completed(call_id.clone(), Some(serde_json::json!(output)))
                     .await;
             }
-            ResponseItem::WebSearchCall { id, action, .. } => {
-                let (title, call_id) = if let Some(action) = action {
-                    web_search_action_to_title_and_id(id, action)
-                } else {
-                    ("Web Search".into(), generate_fallback_id("web_search"))
-                };
-                self.client
-                    .send_tool_call(
-                        ToolCall::new(call_id, title)
-                            .kind(ToolKind::Search)
-                            .status(ToolCallStatus::Completed),
-                    )
-                    .await;
+            ResponseItem::WebSearchCall { id, status, action } => {
+                let call_id = web_search_call_id(id, action.as_ref());
+                let status = web_search_status_to_tool_call_status(status.as_deref());
+                let title = action
+                    .as_ref()
+                    .map(web_search_action_to_title)
+                    .unwrap_or_else(|| default_web_search_title(status));
+
+                let mut tool_call = ToolCall::new(call_id, title)
+                    .kind(ToolKind::Fetch)
+                    .status(status);
+                if let Some(raw_input) = action.as_ref().map(web_search_action_to_replay_raw_input)
+                {
+                    tool_call = tool_call.raw_input(raw_input);
+                }
+
+                self.client.send_tool_call(tool_call).await;
             }
             // Skip GhostSnapshot, Compaction, Other, LocalShellCall without call_id
             _ => {}
@@ -2940,43 +3363,74 @@ fn extract_tool_call_content_from_changes(
     )
 }
 
-/// Extract title and call_id from a WebSearchAction (used for replay)
-fn web_search_action_to_title_and_id(
-    id: &Option<String>,
-    action: &codex_protocol::models::WebSearchAction,
-) -> (String, String) {
+/// Shared title mapping for live web-search updates and replayed web-search items.
+fn web_search_action_to_title(action: &WebSearchAction) -> String {
     match action {
-        codex_protocol::models::WebSearchAction::Search { query, queries } => {
-            let title = queries
-                .as_ref()
-                .map(|q| q.join(", "))
-                .or_else(|| query.clone())
-                .unwrap_or_else(|| "Web search".to_string());
-            let call_id = id
-                .clone()
-                .unwrap_or_else(|| generate_fallback_id("web_search"));
-            (title, call_id)
-        }
-        codex_protocol::models::WebSearchAction::OpenPage { url } => {
-            let title = url.clone().unwrap_or_else(|| "Open page".to_string());
-            let call_id = id
-                .clone()
-                .unwrap_or_else(|| generate_fallback_id("web_open"));
-            (title, call_id)
-        }
-        codex_protocol::models::WebSearchAction::FindInPage { pattern, .. } => {
-            let title = pattern
-                .clone()
-                .unwrap_or_else(|| "Find in page".to_string());
-            let call_id = id
-                .clone()
-                .unwrap_or_else(|| generate_fallback_id("web_find"));
-            (title, call_id)
-        }
-        codex_protocol::models::WebSearchAction::Other => {
-            ("Unknown".to_string(), generate_fallback_id("web_search"))
-        }
+        WebSearchAction::Search { query, queries } => queries
+            .as_ref()
+            .map(|q| format!("Searching for: {}", q.join(", ")))
+            .or_else(|| query.as_ref().map(|q| format!("Searching for: {q}")))
+            .unwrap_or_else(|| "Web search".to_string()),
+        WebSearchAction::OpenPage { url } => url
+            .as_ref()
+            .map(|u| format!("Opening: {u}"))
+            .unwrap_or_else(|| "Open page".to_string()),
+        WebSearchAction::FindInPage { pattern, url } => match (pattern, url) {
+            (Some(p), Some(u)) => format!("Finding: {p} in {u}"),
+            (Some(p), None) => format!("Finding: {p}"),
+            (None, Some(u)) => format!("Find in page: {u}"),
+            (None, None) => "Find in page".to_string(),
+        },
+        WebSearchAction::Other => "Web search".to_string(),
     }
+}
+
+fn web_search_action_to_replay_raw_input(action: &WebSearchAction) -> serde_json::Value {
+    let mut raw_input = serde_json::json!({
+        "action": action,
+    });
+
+    if let WebSearchAction::Search {
+        query: Some(query), ..
+    } = action
+    {
+        raw_input["query"] = serde_json::Value::String(query.clone());
+    }
+
+    raw_input
+}
+
+fn web_search_call_id(id: &Option<String>, action: Option<&WebSearchAction>) -> String {
+    if let Some(id) = id {
+        return id.clone();
+    }
+
+    match action {
+        Some(WebSearchAction::OpenPage { .. }) => generate_fallback_id("web_open"),
+        Some(WebSearchAction::FindInPage { .. }) => generate_fallback_id("web_find"),
+        _ => generate_fallback_id("web_search"),
+    }
+}
+
+fn web_search_status_to_tool_call_status(status: Option<&str>) -> ToolCallStatus {
+    match status {
+        Some("completed") => ToolCallStatus::Completed,
+        Some("open" | "in_progress") => ToolCallStatus::InProgress,
+        Some("failed" | "incomplete") => ToolCallStatus::Failed,
+        _ => ToolCallStatus::Completed,
+    }
+}
+
+fn default_web_search_title(status: ToolCallStatus) -> String {
+    match status {
+        ToolCallStatus::InProgress | ToolCallStatus::Pending => "Searching the Web".to_string(),
+        ToolCallStatus::Completed | ToolCallStatus::Failed | _ => "Web search".to_string(),
+    }
+}
+
+/// Generate a UUID-format ACP message ID.
+fn generate_message_id() -> String {
+    Uuid::new_v4().to_string()
 }
 
 /// Generate a fallback ID using UUID (used when id is missing)
@@ -3005,8 +3459,74 @@ mod tests {
         sync::{Mutex, mpsc::UnboundedSender},
         task::LocalSet,
     };
+    use uuid::Uuid;
 
     use super::*;
+
+    fn message_chunk_id(update: &SessionUpdate) -> &str {
+        match update {
+            SessionUpdate::UserMessageChunk(ContentChunk { message_id, .. })
+            | SessionUpdate::AgentMessageChunk(ContentChunk { message_id, .. })
+            | SessionUpdate::AgentThoughtChunk(ContentChunk { message_id, .. }) => message_id
+                .as_deref()
+                .unwrap_or_else(|| panic!("missing message_id on {update:?}")),
+            _ => panic!("expected content chunk update, got {update:?}"),
+        }
+    }
+
+    fn message_chunk_text(update: &SessionUpdate) -> &str {
+        match update {
+            SessionUpdate::UserMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            })
+            | SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            })
+            | SessionUpdate::AgentThoughtChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) => text,
+            _ => panic!("expected text content chunk update, got {update:?}"),
+        }
+    }
+
+    fn assert_uuid_message_id(message_id: &str) {
+        assert!(
+            Uuid::parse_str(message_id).is_ok(),
+            "expected UUID message_id, got {message_id}"
+        );
+    }
+
+    fn is_content_update(update: &SessionUpdate) -> bool {
+        matches!(
+            update,
+            SessionUpdate::UserMessageChunk(..)
+                | SessionUpdate::AgentThoughtChunk(..)
+                | SessionUpdate::AgentMessageChunk(..)
+        )
+    }
+
+    fn tool_calls(notifications: &[SessionNotification]) -> Vec<ToolCall> {
+        notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCall(tool_call) => Some(tool_call.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tool_call_updates(notifications: &[SessionNotification]) -> Vec<ToolCallUpdate> {
+        notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCallUpdate(update) => Some(update.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 
     #[tokio::test]
     async fn test_prompt() -> anyhow::Result<()> {
@@ -3504,6 +4024,1407 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_live_message_id_grouping() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+        let user_message_id = Uuid::new_v4().to_string();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["grouped-live".into()])
+                .message_id(user_message_id.clone()),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(
+            notifications.len(),
+            8,
+            "unexpected notifications: {notifications:?}"
+        );
+
+        let live_user_id = message_chunk_id(&notifications[0].update);
+        let reasoning_id = message_chunk_id(&notifications[1].update);
+        let reasoning_follow_up_id = message_chunk_id(&notifications[2].update);
+        let reasoning_section_break_id = message_chunk_id(&notifications[3].update);
+        let second_reasoning_id = message_chunk_id(&notifications[4].update);
+        let assistant_id = message_chunk_id(&notifications[5].update);
+        let assistant_follow_up_id = message_chunk_id(&notifications[6].update);
+        let second_assistant_id = message_chunk_id(&notifications[7].update);
+
+        for message_id in [
+            live_user_id,
+            reasoning_id,
+            reasoning_follow_up_id,
+            reasoning_section_break_id,
+            second_reasoning_id,
+            assistant_id,
+            assistant_follow_up_id,
+            second_assistant_id,
+        ] {
+            assert_uuid_message_id(message_id);
+        }
+
+        assert_eq!(live_user_id, user_message_id);
+        assert_eq!(reasoning_id, reasoning_follow_up_id);
+        assert_eq!(reasoning_id, reasoning_section_break_id);
+        assert_ne!(reasoning_id, second_reasoning_id);
+        assert_eq!(assistant_id, assistant_follow_up_id);
+        assert_ne!(assistant_id, second_assistant_id);
+        assert_ne!(live_user_id, reasoning_id);
+        assert_ne!(live_user_id, assistant_id);
+        assert_ne!(reasoning_id, assistant_id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_model_reroute_is_surfaced_without_breaking_message_grouping() -> anyhow::Result<()>
+    {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+        let user_message_id = Uuid::new_v4().to_string();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["reroute-live".into()])
+                .message_id(user_message_id.clone()),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(
+            notifications.len(),
+            7,
+            "unexpected notifications: {notifications:?}"
+        );
+
+        assert_eq!(message_chunk_text(&notifications[0].update), "reroute-live");
+        assert_eq!(message_chunk_text(&notifications[1].update), "thinking ");
+        assert_eq!(
+            message_chunk_text(&notifications[2].update),
+            "Model rerouted from gpt-5.3-codex to gpt-5.2 due to high-risk cyber activity."
+        );
+        assert_eq!(message_chunk_text(&notifications[3].update), "deeply");
+        assert_eq!(message_chunk_text(&notifications[4].update), "Hello");
+        assert_eq!(
+            message_chunk_text(&notifications[5].update),
+            "Fallback warning"
+        );
+        assert_eq!(message_chunk_text(&notifications[6].update), " world");
+
+        let live_user_id = message_chunk_id(&notifications[0].update);
+        let reasoning_id = message_chunk_id(&notifications[1].update);
+        let reroute_id = message_chunk_id(&notifications[2].update);
+        let reasoning_follow_up_id = message_chunk_id(&notifications[3].update);
+        let assistant_id = message_chunk_id(&notifications[4].update);
+        let warning_id = message_chunk_id(&notifications[5].update);
+        let assistant_follow_up_id = message_chunk_id(&notifications[6].update);
+
+        for message_id in [
+            live_user_id,
+            reasoning_id,
+            reroute_id,
+            assistant_id,
+            warning_id,
+        ] {
+            assert_uuid_message_id(message_id);
+        }
+
+        assert_eq!(live_user_id, user_message_id);
+        assert_eq!(reasoning_id, reasoning_follow_up_id);
+        assert_eq!(assistant_id, assistant_follow_up_id);
+        assert_ne!(reroute_id, reasoning_id);
+        assert_ne!(reroute_id, assistant_id);
+        assert_ne!(warning_id, reasoning_id);
+        assert_ne!(warning_id, assistant_id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mcp_startup_events_are_surfaced_without_breaking_message_grouping()
+    -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+        let user_message_id = Uuid::new_v4().to_string();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["mcp-startup-live".into()])
+                .message_id(user_message_id.clone()),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let content_notifications: Vec<_> = notifications
+            .iter()
+            .filter(|notification| is_content_update(&notification.update))
+            .collect();
+        let tool_calls: Vec<_> = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCall(tool_call) => Some(tool_call.clone()),
+                _ => None,
+            })
+            .collect();
+        let tool_call_updates: Vec<_> = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCallUpdate(update) => Some(update.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            content_notifications.len(),
+            5,
+            "unexpected content notifications: {notifications:?}"
+        );
+        assert_eq!(
+            content_notifications
+                .iter()
+                .map(|notification| message_chunk_text(&notification.update))
+                .collect::<Vec<_>>(),
+            vec!["mcp-startup-live", "thinking ", "deeply", "Hello", " world"]
+        );
+
+        let live_user_id = message_chunk_id(&content_notifications[0].update);
+        let reasoning_id = message_chunk_id(&content_notifications[1].update);
+        let reasoning_follow_up_id = message_chunk_id(&content_notifications[2].update);
+        let assistant_id = message_chunk_id(&content_notifications[3].update);
+        let assistant_follow_up_id = message_chunk_id(&content_notifications[4].update);
+
+        for message_id in [live_user_id, reasoning_id, assistant_id] {
+            assert_uuid_message_id(message_id);
+        }
+
+        assert_eq!(live_user_id, user_message_id);
+        assert_eq!(reasoning_id, reasoning_follow_up_id);
+        assert_eq!(assistant_id, assistant_follow_up_id);
+        assert_ne!(live_user_id, reasoning_id);
+        assert_ne!(live_user_id, assistant_id);
+        assert_ne!(reasoning_id, assistant_id);
+
+        assert_eq!(
+            tool_calls.len(),
+            4,
+            "unexpected ToolCall notifications: {tool_calls:?}"
+        );
+        assert_eq!(
+            tool_call_updates.len(),
+            3,
+            "unexpected ToolCallUpdate notifications: {tool_call_updates:?}"
+        );
+
+        let alpha_start_raw = serde_json::to_value(&McpStartupUpdateEvent {
+            server: "alpha".into(),
+            status: McpStartupStatus::Starting,
+        })?;
+        let beta_start_raw = serde_json::to_value(&McpStartupUpdateEvent {
+            server: "beta".into(),
+            status: McpStartupStatus::Starting,
+        })?;
+        let gamma_start_raw = serde_json::to_value(&McpStartupUpdateEvent {
+            server: "gamma".into(),
+            status: McpStartupStatus::Starting,
+        })?;
+        let alpha_ready_raw = serde_json::to_value(&McpStartupUpdateEvent {
+            server: "alpha".into(),
+            status: McpStartupStatus::Ready,
+        })?;
+        let beta_failed_raw = serde_json::to_value(&McpStartupUpdateEvent {
+            server: "beta".into(),
+            status: McpStartupStatus::Failed {
+                error: "auth failed".into(),
+            },
+        })?;
+        let gamma_cancelled_raw = serde_json::to_value(&McpStartupUpdateEvent {
+            server: "gamma".into(),
+            status: McpStartupStatus::Cancelled,
+        })?;
+        let summary_raw = serde_json::to_value(&McpStartupCompleteEvent {
+            ready: vec!["alpha".into()],
+            failed: vec![codex_protocol::protocol::McpStartupFailure {
+                server: "beta".into(),
+                error: "auth failed".into(),
+            }],
+            cancelled: vec!["gamma".into()],
+        })?;
+
+        let alpha_start_id = ToolCallId::new(mcp_startup_tool_call_id("alpha"));
+        let beta_start_id = ToolCallId::new(mcp_startup_tool_call_id("beta"));
+        let gamma_start_id = ToolCallId::new(mcp_startup_tool_call_id("gamma"));
+        let summary_id = ToolCallId::new(mcp_startup_summary_tool_call_id());
+
+        let alpha_start = tool_calls
+            .iter()
+            .find(|tool_call| tool_call.tool_call_id == alpha_start_id)
+            .unwrap_or_else(|| panic!("missing alpha startup tool call: {tool_calls:?}"));
+        assert_eq!(alpha_start.title, mcp_startup_tool_call_title("alpha"));
+        assert_eq!(alpha_start.status, ToolCallStatus::InProgress);
+        assert_eq!(alpha_start.raw_input.as_ref(), Some(&alpha_start_raw));
+
+        let beta_start = tool_calls
+            .iter()
+            .find(|tool_call| tool_call.tool_call_id == beta_start_id)
+            .unwrap_or_else(|| panic!("missing beta startup tool call: {tool_calls:?}"));
+        assert_eq!(beta_start.title, mcp_startup_tool_call_title("beta"));
+        assert_eq!(beta_start.status, ToolCallStatus::InProgress);
+        assert_eq!(beta_start.raw_input.as_ref(), Some(&beta_start_raw));
+
+        let gamma_start = tool_calls
+            .iter()
+            .find(|tool_call| tool_call.tool_call_id == gamma_start_id)
+            .unwrap_or_else(|| panic!("missing gamma startup tool call: {tool_calls:?}"));
+        assert_eq!(gamma_start.title, mcp_startup_tool_call_title("gamma"));
+        assert_eq!(gamma_start.status, ToolCallStatus::InProgress);
+        assert_eq!(gamma_start.raw_input.as_ref(), Some(&gamma_start_raw));
+
+        let summary = tool_calls
+            .iter()
+            .find(|tool_call| tool_call.tool_call_id == summary_id)
+            .unwrap_or_else(|| panic!("missing startup summary tool call: {tool_calls:?}"));
+        assert_eq!(summary.title, "MCP Startup");
+        assert_eq!(summary.status, ToolCallStatus::Failed);
+        assert_eq!(summary.raw_output.as_ref(), Some(&summary_raw));
+
+        let alpha_ready = tool_call_updates
+            .iter()
+            .find(|update| {
+                update.tool_call_id == ToolCallId::new(mcp_startup_tool_call_id("alpha"))
+            })
+            .unwrap_or_else(|| panic!("missing alpha startup update: {tool_call_updates:?}"));
+        assert_eq!(alpha_ready.fields.status, Some(ToolCallStatus::Completed));
+        assert_eq!(
+            alpha_ready.fields.title.as_deref(),
+            Some(mcp_startup_tool_call_title("alpha").as_str())
+        );
+        assert_eq!(
+            alpha_ready.fields.raw_output.as_ref(),
+            Some(&alpha_ready_raw)
+        );
+
+        let beta_failed = tool_call_updates
+            .iter()
+            .find(|update| update.tool_call_id == ToolCallId::new(mcp_startup_tool_call_id("beta")))
+            .unwrap_or_else(|| panic!("missing beta startup update: {tool_call_updates:?}"));
+        assert_eq!(beta_failed.fields.status, Some(ToolCallStatus::Failed));
+        assert_eq!(
+            beta_failed.fields.title.as_deref(),
+            Some(mcp_startup_tool_call_title("beta").as_str())
+        );
+        assert_eq!(
+            beta_failed.fields.raw_output.as_ref(),
+            Some(&beta_failed_raw)
+        );
+
+        let gamma_cancelled = tool_call_updates
+            .iter()
+            .find(|update| {
+                update.tool_call_id == ToolCallId::new(mcp_startup_tool_call_id("gamma"))
+            })
+            .unwrap_or_else(|| panic!("missing gamma startup update: {tool_call_updates:?}"));
+        assert_eq!(gamma_cancelled.fields.status, Some(ToolCallStatus::Failed));
+        assert_eq!(
+            gamma_cancelled.fields.title.as_deref(),
+            Some(mcp_startup_tool_call_title("gamma").as_str())
+        );
+        assert_eq!(
+            gamma_cancelled.fields.raw_output.as_ref(),
+            Some(&gamma_cancelled_raw)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_notice_events_are_surfaced_during_replay_history() -> anyhow::Result<()> {
+        let (_, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (replay_response_tx, replay_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::ReplayHistory {
+            history: vec![
+                RolloutItem::EventMsg(EventMsg::ThreadNameUpdated(
+                    codex_protocol::protocol::ThreadNameUpdatedEvent {
+                        thread_id: codex_protocol::ThreadId::new(),
+                        thread_name: Some("Replay title".into()),
+                    },
+                )),
+                RolloutItem::EventMsg(EventMsg::PlanUpdate(UpdatePlanArgs {
+                    explanation: Some("Replay plan".into()),
+                    plan: vec![
+                        PlanItemArg {
+                            step: "first step".into(),
+                            status: StepStatus::InProgress,
+                        },
+                        PlanItemArg {
+                            step: "done step".into(),
+                            status: StepStatus::Completed,
+                        },
+                    ],
+                })),
+                RolloutItem::EventMsg(EventMsg::Warning(WarningEvent {
+                    message: "Persisted warning".into(),
+                })),
+                RolloutItem::EventMsg(EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+                    review_output: Some(ReviewOutputEvent {
+                        findings: vec![],
+                        overall_correctness: String::new(),
+                        overall_explanation: "Replay review output".into(),
+                        overall_confidence_score: 0.75,
+                    }),
+                })),
+                RolloutItem::EventMsg(EventMsg::UndoStarted(
+                    codex_protocol::protocol::UndoStartedEvent { message: None },
+                )),
+                RolloutItem::EventMsg(EventMsg::UndoCompleted(
+                    codex_protocol::protocol::UndoCompletedEvent {
+                        success: false,
+                        message: None,
+                    },
+                )),
+                RolloutItem::EventMsg(EventMsg::ContextCompacted(
+                    codex_protocol::protocol::ContextCompactedEvent,
+                )),
+            ],
+            response_tx: replay_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                replay_response_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(
+            notifications.len(),
+            7,
+            "unexpected notifications: {notifications:?}"
+        );
+
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::SessionInfoUpdate(update)
+                if update.title.as_opt_deref() == Some(Some("Replay title"))
+        ));
+        assert!(matches!(
+            &notifications[1].update,
+            SessionUpdate::Plan(plan)
+                if plan.entries
+                    == vec![
+                        PlanEntry::new(
+                            "first step",
+                            PlanEntryPriority::Medium,
+                            PlanEntryStatus::InProgress,
+                        ),
+                        PlanEntry::new(
+                            "done step",
+                            PlanEntryPriority::Medium,
+                            PlanEntryStatus::Completed,
+                        ),
+                    ]
+        ));
+
+        assert_eq!(
+            message_chunk_text(&notifications[2].update),
+            "Persisted warning"
+        );
+        assert_eq!(
+            message_chunk_text(&notifications[3].update),
+            "Replay review output"
+        );
+        assert_eq!(
+            message_chunk_text(&notifications[4].update),
+            "Undo in progress..."
+        );
+        assert_eq!(message_chunk_text(&notifications[5].update), "Undo failed.");
+        assert_eq!(
+            message_chunk_text(&notifications[6].update),
+            "Context compacted"
+        );
+
+        let content_message_ids: Vec<_> = notifications[2..]
+            .iter()
+            .map(|notification| message_chunk_id(&notification.update).to_string())
+            .collect();
+        for message_id in &content_message_ids {
+            assert_uuid_message_id(message_id);
+        }
+        assert_eq!(
+            content_message_ids.len(),
+            content_message_ids
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            "expected unique message ids for replayed notices: {notifications:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_message_id_grouping() -> anyhow::Result<()> {
+        let (_, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (replay_response_tx, replay_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::ReplayHistory {
+            history: vec![
+                RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                    message: "replayed user".into(),
+                    images: None,
+                    text_elements: vec![],
+                    local_images: vec![],
+                })),
+                RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                    message: "assistant one".into(),
+                    phase: None,
+                })),
+                RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                    message: "assistant two".into(),
+                    phase: None,
+                })),
+                RolloutItem::EventMsg(EventMsg::AgentReasoning(AgentReasoningEvent {
+                    text: "reasoning one".into(),
+                })),
+                RolloutItem::EventMsg(EventMsg::AgentReasoningRawContent(
+                    AgentReasoningRawContentEvent {
+                        text: "reasoning two".into(),
+                    },
+                )),
+            ],
+            response_tx: replay_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                replay_response_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(
+            notifications.len(),
+            5,
+            "unexpected notifications: {notifications:?}"
+        );
+
+        let user_id = message_chunk_id(&notifications[0].update);
+        let first_assistant_id = message_chunk_id(&notifications[1].update);
+        let second_assistant_id = message_chunk_id(&notifications[2].update);
+        let first_reasoning_id = message_chunk_id(&notifications[3].update);
+        let second_reasoning_id = message_chunk_id(&notifications[4].update);
+
+        for message_id in [
+            user_id,
+            first_assistant_id,
+            second_assistant_id,
+            first_reasoning_id,
+            second_reasoning_id,
+        ] {
+            assert_uuid_message_id(message_id);
+        }
+
+        assert_ne!(user_id, first_assistant_id);
+        assert_ne!(first_assistant_id, second_assistant_id);
+        assert_ne!(first_reasoning_id, second_reasoning_id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_model_reroute_and_notices_preserve_existing_message_grouping()
+    -> anyhow::Result<()> {
+        let (_, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (replay_response_tx, replay_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::ReplayHistory {
+            history: vec![
+                RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                    message: "reroute-replay".into(),
+                    images: None,
+                    text_elements: vec![],
+                    local_images: vec![],
+                })),
+                RolloutItem::EventMsg(EventMsg::AgentReasoning(AgentReasoningEvent {
+                    text: "thinking ".into(),
+                })),
+                RolloutItem::EventMsg(EventMsg::ModelReroute(ModelRerouteEvent {
+                    from_model: "gpt-5.3-codex".into(),
+                    to_model: "gpt-5.2".into(),
+                    reason: ModelRerouteReason::HighRiskCyberActivity,
+                })),
+                RolloutItem::EventMsg(EventMsg::Warning(WarningEvent {
+                    message: "Fallback warning".into(),
+                })),
+                RolloutItem::EventMsg(EventMsg::AgentReasoningRawContent(
+                    AgentReasoningRawContentEvent {
+                        text: "deeply".into(),
+                    },
+                )),
+                RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                    message: "Hello".into(),
+                    phase: None,
+                })),
+                RolloutItem::EventMsg(EventMsg::UndoStarted(
+                    codex_protocol::protocol::UndoStartedEvent { message: None },
+                )),
+                RolloutItem::EventMsg(EventMsg::ContextCompacted(
+                    codex_protocol::protocol::ContextCompactedEvent,
+                )),
+                RolloutItem::EventMsg(EventMsg::UndoCompleted(
+                    codex_protocol::protocol::UndoCompletedEvent {
+                        success: true,
+                        message: None,
+                    },
+                )),
+                RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                    message: " world".into(),
+                    phase: None,
+                })),
+            ],
+            response_tx: replay_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                replay_response_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(
+            notifications.len(),
+            10,
+            "unexpected notifications: {notifications:?}"
+        );
+
+        assert_eq!(
+            message_chunk_text(&notifications[0].update),
+            "reroute-replay"
+        );
+        assert_eq!(message_chunk_text(&notifications[1].update), "thinking ");
+        assert_eq!(
+            message_chunk_text(&notifications[2].update),
+            "Model rerouted from gpt-5.3-codex to gpt-5.2 due to high-risk cyber activity."
+        );
+        assert_eq!(
+            message_chunk_text(&notifications[3].update),
+            "Fallback warning"
+        );
+        assert_eq!(message_chunk_text(&notifications[4].update), "deeply");
+        assert_eq!(message_chunk_text(&notifications[5].update), "Hello");
+        assert_eq!(
+            message_chunk_text(&notifications[6].update),
+            "Undo in progress..."
+        );
+        assert_eq!(
+            message_chunk_text(&notifications[7].update),
+            "Context compacted"
+        );
+        assert_eq!(
+            message_chunk_text(&notifications[8].update),
+            "Undo completed."
+        );
+        assert_eq!(message_chunk_text(&notifications[9].update), " world");
+
+        let user_id = message_chunk_id(&notifications[0].update).to_string();
+        let reasoning_id = message_chunk_id(&notifications[1].update).to_string();
+        let reroute_id = message_chunk_id(&notifications[2].update).to_string();
+        let warning_id = message_chunk_id(&notifications[3].update).to_string();
+        let reasoning_follow_up_id = message_chunk_id(&notifications[4].update).to_string();
+        let assistant_id = message_chunk_id(&notifications[5].update).to_string();
+        let undo_started_id = message_chunk_id(&notifications[6].update).to_string();
+        let compacted_id = message_chunk_id(&notifications[7].update).to_string();
+        let undo_completed_id = message_chunk_id(&notifications[8].update).to_string();
+        let assistant_follow_up_id = message_chunk_id(&notifications[9].update).to_string();
+
+        let all_ids = [
+            user_id.clone(),
+            reasoning_id.clone(),
+            reroute_id.clone(),
+            warning_id.clone(),
+            reasoning_follow_up_id.clone(),
+            assistant_id.clone(),
+            undo_started_id.clone(),
+            compacted_id.clone(),
+            undo_completed_id.clone(),
+            assistant_follow_up_id.clone(),
+        ];
+        for message_id in &all_ids {
+            assert_uuid_message_id(message_id);
+        }
+
+        assert_eq!(
+            all_ids.len(),
+            all_ids
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            "expected unique replay message ids with notices interleaved: {notifications:?}"
+        );
+
+        assert_ne!(user_id, reasoning_id);
+        assert_ne!(reasoning_id, reasoning_follow_up_id);
+        assert_ne!(assistant_id, assistant_follow_up_id);
+        assert_ne!(reroute_id, reasoning_id);
+        assert_ne!(reroute_id, assistant_id);
+        assert_ne!(warning_id, reasoning_id);
+        assert_ne!(warning_id, assistant_id);
+        assert_ne!(undo_started_id, assistant_id);
+        assert_ne!(compacted_id, assistant_id);
+        assert_ne!(undo_completed_id, assistant_follow_up_id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_tool_lifecycle_function_and_custom_calls_start_in_progress()
+    -> anyhow::Result<()> {
+        let (_, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (replay_response_tx, replay_response_rx) = tokio::sync::oneshot::channel();
+
+        let function_output =
+            codex_protocol::models::FunctionCallOutputPayload::from_text("ok".to_string());
+        let custom_output =
+            codex_protocol::models::FunctionCallOutputPayload::from_text("done".to_string());
+
+        message_tx.send(ThreadMessage::ReplayHistory {
+            history: vec![
+                RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                    id: None,
+                    name: "do_thing".into(),
+                    arguments: r#"{"value":1}"#.into(),
+                    call_id: "function-call-id".into(),
+                }),
+                RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+                    call_id: "function-call-id".into(),
+                    output: function_output.clone(),
+                }),
+                RolloutItem::ResponseItem(ResponseItem::CustomToolCall {
+                    id: None,
+                    status: Some("completed".into()),
+                    call_id: "custom-tool-call-id".into(),
+                    name: "custom_tool".into(),
+                    input: r#"{"task":"patch"}"#.into(),
+                }),
+                RolloutItem::ResponseItem(ResponseItem::CustomToolCallOutput {
+                    call_id: "custom-tool-call-id".into(),
+                    output: custom_output.clone(),
+                }),
+            ],
+            response_tx: replay_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                replay_response_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let tool_calls = tool_calls(&notifications);
+        let tool_call_updates = tool_call_updates(&notifications);
+
+        assert_eq!(
+            tool_calls.len(),
+            2,
+            "unexpected ToolCall notifications: {tool_calls:?}"
+        );
+        assert_eq!(
+            tool_call_updates.len(),
+            2,
+            "unexpected ToolCallUpdate notifications: {tool_call_updates:?}"
+        );
+
+        let function_call = tool_calls
+            .iter()
+            .find(|tool_call| tool_call.tool_call_id == ToolCallId::new("function-call-id"))
+            .unwrap_or_else(|| panic!("missing function tool call: {tool_calls:?}"));
+        assert_eq!(function_call.title, "do_thing");
+        assert_eq!(function_call.status, ToolCallStatus::InProgress);
+        assert_eq!(
+            function_call.raw_input.as_ref(),
+            Some(&serde_json::json!({ "value": 1 }))
+        );
+
+        let function_update = tool_call_updates
+            .iter()
+            .find(|update| update.tool_call_id == ToolCallId::new("function-call-id"))
+            .unwrap_or_else(|| panic!("missing function tool call update: {tool_call_updates:?}"));
+        assert_eq!(
+            function_update.fields.status,
+            Some(ToolCallStatus::Completed)
+        );
+        assert_eq!(
+            function_update.fields.raw_output.as_ref(),
+            Some(&serde_json::to_value(&function_output)?)
+        );
+
+        let custom_call = tool_calls
+            .iter()
+            .find(|tool_call| tool_call.tool_call_id == ToolCallId::new("custom-tool-call-id"))
+            .unwrap_or_else(|| panic!("missing custom tool call: {tool_calls:?}"));
+        assert_eq!(custom_call.title, "custom_tool");
+        assert_eq!(custom_call.status, ToolCallStatus::InProgress);
+        assert_eq!(
+            custom_call.raw_input.as_ref(),
+            Some(&serde_json::json!({ "task": "patch" }))
+        );
+
+        let custom_update = tool_call_updates
+            .iter()
+            .find(|update| update.tool_call_id == ToolCallId::new("custom-tool-call-id"))
+            .unwrap_or_else(|| panic!("missing custom tool call update: {tool_call_updates:?}"));
+        assert_eq!(custom_update.fields.status, Some(ToolCallStatus::Completed));
+        assert_eq!(
+            custom_update.fields.raw_output.as_ref(),
+            Some(&serde_json::json!(custom_output))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_tool_lifecycle_shell_and_apply_patch_calls_start_in_progress()
+    -> anyhow::Result<()> {
+        let (_, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (replay_response_tx, replay_response_rx) = tokio::sync::oneshot::channel();
+
+        let shell_output =
+            codex_protocol::models::FunctionCallOutputPayload::from_text("shell ok".to_string());
+        let patch_output =
+            codex_protocol::models::FunctionCallOutputPayload::from_text("patch ok".to_string());
+        let shell_arguments = serde_json::json!({
+            "command": ["echo", "hello"],
+        })
+        .to_string();
+        let apply_patch_input = [
+            "*** Begin Patch",
+            "*** Add File: hello.txt",
+            "+hello",
+            "*** End Patch",
+        ]
+        .join("\n");
+
+        message_tx.send(ThreadMessage::ReplayHistory {
+            history: vec![
+                RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                    id: None,
+                    name: "shell".into(),
+                    arguments: shell_arguments,
+                    call_id: "shell-call-id".into(),
+                }),
+                RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+                    call_id: "shell-call-id".into(),
+                    output: shell_output.clone(),
+                }),
+                RolloutItem::ResponseItem(ResponseItem::CustomToolCall {
+                    id: None,
+                    status: Some("completed".into()),
+                    call_id: "apply-patch-call-id".into(),
+                    name: "apply_patch".into(),
+                    input: apply_patch_input,
+                }),
+                RolloutItem::ResponseItem(ResponseItem::CustomToolCallOutput {
+                    call_id: "apply-patch-call-id".into(),
+                    output: patch_output.clone(),
+                }),
+            ],
+            response_tx: replay_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                replay_response_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let tool_calls = tool_calls(&notifications);
+        let tool_call_updates = tool_call_updates(&notifications);
+
+        assert_eq!(
+            tool_calls.len(),
+            2,
+            "unexpected ToolCall notifications: {tool_calls:?}"
+        );
+        assert_eq!(
+            tool_call_updates.len(),
+            2,
+            "unexpected ToolCallUpdate notifications: {tool_call_updates:?}"
+        );
+
+        let shell_call = tool_calls
+            .iter()
+            .find(|tool_call| tool_call.tool_call_id == ToolCallId::new("shell-call-id"))
+            .unwrap_or_else(|| panic!("missing shell tool call: {tool_calls:?}"));
+        assert_eq!(shell_call.status, ToolCallStatus::InProgress);
+
+        let shell_update = tool_call_updates
+            .iter()
+            .find(|update| update.tool_call_id == ToolCallId::new("shell-call-id"))
+            .unwrap_or_else(|| panic!("missing shell tool call update: {tool_call_updates:?}"));
+        assert_eq!(shell_update.fields.status, Some(ToolCallStatus::Completed));
+        assert_eq!(
+            shell_update.fields.raw_output.as_ref(),
+            Some(&serde_json::to_value(&shell_output)?)
+        );
+
+        let apply_patch_call = tool_calls
+            .iter()
+            .find(|tool_call| tool_call.tool_call_id == ToolCallId::new("apply-patch-call-id"))
+            .unwrap_or_else(|| panic!("missing apply_patch tool call: {tool_calls:?}"));
+        assert_eq!(apply_patch_call.title, "Edit hello.txt");
+        assert_eq!(apply_patch_call.status, ToolCallStatus::InProgress);
+
+        let apply_patch_update = tool_call_updates
+            .iter()
+            .find(|update| update.tool_call_id == ToolCallId::new("apply-patch-call-id"))
+            .unwrap_or_else(|| {
+                panic!("missing apply_patch tool call update: {tool_call_updates:?}")
+            });
+        assert_eq!(
+            apply_patch_update.fields.status,
+            Some(ToolCallStatus::Completed)
+        );
+        assert_eq!(
+            apply_patch_update.fields.raw_output.as_ref(),
+            Some(&serde_json::json!(patch_output))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_tool_lifecycle_local_shell_in_progress_is_preserved() -> anyhow::Result<()>
+    {
+        let (_, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (replay_response_tx, replay_response_rx) = tokio::sync::oneshot::channel();
+
+        let shell_output =
+            codex_protocol::models::FunctionCallOutputPayload::from_text("hello".to_string());
+
+        message_tx.send(ThreadMessage::ReplayHistory {
+            history: vec![
+                RolloutItem::ResponseItem(ResponseItem::LocalShellCall {
+                    id: None,
+                    call_id: Some("local-shell-call-id".into()),
+                    status: codex_protocol::models::LocalShellStatus::InProgress,
+                    action: codex_protocol::models::LocalShellAction::Exec(
+                        codex_protocol::models::LocalShellExecAction {
+                            command: vec!["echo".into(), "hello".into()],
+                            timeout_ms: None,
+                            working_directory: None,
+                            env: None,
+                            user: None,
+                        },
+                    ),
+                }),
+                RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+                    call_id: "local-shell-call-id".into(),
+                    output: shell_output.clone(),
+                }),
+            ],
+            response_tx: replay_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                replay_response_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let tool_calls = tool_calls(&notifications);
+        let tool_call_updates = tool_call_updates(&notifications);
+
+        assert_eq!(
+            tool_calls.len(),
+            1,
+            "unexpected ToolCall notifications: {tool_calls:?}"
+        );
+        assert_eq!(
+            tool_call_updates.len(),
+            1,
+            "unexpected ToolCallUpdate notifications: {tool_call_updates:?}"
+        );
+
+        assert_eq!(tool_calls[0].status, ToolCallStatus::InProgress);
+        assert_eq!(
+            tool_call_updates[0].fields.status,
+            Some(ToolCallStatus::Completed)
+        );
+        assert_eq!(
+            tool_call_updates[0].fields.raw_output.as_ref(),
+            Some(&serde_json::to_value(&shell_output)?)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_tool_lifecycle_web_search_calls_preserve_truthful_status_kind_and_input()
+    -> anyhow::Result<()> {
+        let (_, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (replay_response_tx, replay_response_rx) = tokio::sync::oneshot::channel();
+
+        let search_action = WebSearchAction::Search {
+            query: Some("weather seattle".into()),
+            queries: Some(vec!["weather seattle".into(), "seattle weather now".into()]),
+        };
+        let open_page_action = WebSearchAction::OpenPage {
+            url: Some("https://example.com".into()),
+        };
+
+        message_tx.send(ThreadMessage::ReplayHistory {
+            history: vec![
+                RolloutItem::ResponseItem(ResponseItem::WebSearchCall {
+                    id: Some("ws_search".into()),
+                    status: Some("open".into()),
+                    action: Some(search_action.clone()),
+                }),
+                RolloutItem::ResponseItem(ResponseItem::WebSearchCall {
+                    id: Some("ws_open".into()),
+                    status: Some("completed".into()),
+                    action: Some(open_page_action.clone()),
+                }),
+                RolloutItem::ResponseItem(ResponseItem::WebSearchCall {
+                    id: Some("ws_partial".into()),
+                    status: Some("in_progress".into()),
+                    action: None,
+                }),
+            ],
+            response_tx: replay_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                replay_response_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let tool_calls = tool_calls(&notifications);
+        let tool_call_updates = tool_call_updates(&notifications);
+
+        assert_eq!(
+            tool_calls.len(),
+            3,
+            "unexpected ToolCall notifications: {tool_calls:?}"
+        );
+        assert!(
+            tool_call_updates.is_empty(),
+            "unexpected ToolCallUpdate notifications: {tool_call_updates:?}"
+        );
+
+        let search_call = tool_calls
+            .iter()
+            .find(|tool_call| tool_call.tool_call_id == ToolCallId::new("ws_search"))
+            .unwrap_or_else(|| panic!("missing web search tool call: {tool_calls:?}"));
+        assert_eq!(search_call.kind, ToolKind::Fetch);
+        assert_eq!(search_call.status, ToolCallStatus::InProgress);
+        assert_eq!(
+            search_call.title,
+            "Searching for: weather seattle, seattle weather now"
+        );
+        assert_eq!(
+            search_call.raw_input.as_ref(),
+            Some(&serde_json::json!({
+                "query": "weather seattle",
+                "action": search_action.clone(),
+            }))
+        );
+
+        let open_page_call = tool_calls
+            .iter()
+            .find(|tool_call| tool_call.tool_call_id == ToolCallId::new("ws_open"))
+            .unwrap_or_else(|| panic!("missing open-page tool call: {tool_calls:?}"));
+        assert_eq!(open_page_call.kind, ToolKind::Fetch);
+        assert_eq!(open_page_call.status, ToolCallStatus::Completed);
+        assert_eq!(open_page_call.title, "Opening: https://example.com");
+        assert_eq!(
+            open_page_call.raw_input.as_ref(),
+            Some(&serde_json::json!({
+                "action": open_page_action.clone(),
+            }))
+        );
+
+        let partial_call = tool_calls
+            .iter()
+            .find(|tool_call| tool_call.tool_call_id == ToolCallId::new("ws_partial"))
+            .unwrap_or_else(|| panic!("missing partial web search tool call: {tool_calls:?}"));
+        assert_eq!(partial_call.kind, ToolKind::Fetch);
+        assert_eq!(partial_call.status, ToolCallStatus::InProgress);
+        assert_eq!(partial_call.title, "Searching the Web");
+        assert_eq!(partial_call.raw_input.as_ref(), None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_mcp_startup_events_preserve_existing_message_grouping()
+    -> anyhow::Result<()> {
+        let (_, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (replay_response_tx, replay_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::ReplayHistory {
+            history: vec![
+                RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                    message: "mcp-startup-replay".into(),
+                    images: None,
+                    text_elements: vec![],
+                    local_images: vec![],
+                })),
+                RolloutItem::EventMsg(EventMsg::AgentReasoning(AgentReasoningEvent {
+                    text: "thinking ".into(),
+                })),
+                RolloutItem::EventMsg(EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+                    server: "alpha".into(),
+                    status: McpStartupStatus::Starting,
+                })),
+                RolloutItem::EventMsg(EventMsg::AgentReasoningRawContent(
+                    AgentReasoningRawContentEvent {
+                        text: "deeply".into(),
+                    },
+                )),
+                RolloutItem::EventMsg(EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+                    server: "beta".into(),
+                    status: McpStartupStatus::Starting,
+                })),
+                RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                    message: "Hello".into(),
+                    phase: None,
+                })),
+                RolloutItem::EventMsg(EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+                    server: "gamma".into(),
+                    status: McpStartupStatus::Starting,
+                })),
+                RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                    message: " world".into(),
+                    phase: None,
+                })),
+                RolloutItem::EventMsg(EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+                    server: "alpha".into(),
+                    status: McpStartupStatus::Ready,
+                })),
+                RolloutItem::EventMsg(EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+                    server: "beta".into(),
+                    status: McpStartupStatus::Failed {
+                        error: "auth failed".into(),
+                    },
+                })),
+                RolloutItem::EventMsg(EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+                    server: "gamma".into(),
+                    status: McpStartupStatus::Cancelled,
+                })),
+                RolloutItem::EventMsg(EventMsg::McpStartupComplete(McpStartupCompleteEvent {
+                    ready: vec!["alpha".into()],
+                    failed: vec![codex_protocol::protocol::McpStartupFailure {
+                        server: "beta".into(),
+                        error: "auth failed".into(),
+                    }],
+                    cancelled: vec!["gamma".into()],
+                })),
+            ],
+            response_tx: replay_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                replay_response_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let content_notifications: Vec<_> = notifications
+            .iter()
+            .filter(|notification| is_content_update(&notification.update))
+            .collect();
+        let tool_calls: Vec<_> = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCall(tool_call) => Some(tool_call.clone()),
+                _ => None,
+            })
+            .collect();
+        let tool_call_updates: Vec<_> = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCallUpdate(update) => Some(update.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            notifications.len(),
+            12,
+            "unexpected notifications: {notifications:?}"
+        );
+        assert_eq!(
+            content_notifications.len(),
+            5,
+            "unexpected content notifications: {notifications:?}"
+        );
+        assert_eq!(
+            content_notifications
+                .iter()
+                .map(|notification| message_chunk_text(&notification.update))
+                .collect::<Vec<_>>(),
+            vec![
+                "mcp-startup-replay",
+                "thinking ",
+                "deeply",
+                "Hello",
+                " world"
+            ]
+        );
+
+        let replay_user_id = message_chunk_id(&content_notifications[0].update);
+        let reasoning_id = message_chunk_id(&content_notifications[1].update);
+        let reasoning_follow_up_id = message_chunk_id(&content_notifications[2].update);
+        let assistant_id = message_chunk_id(&content_notifications[3].update);
+        let assistant_follow_up_id = message_chunk_id(&content_notifications[4].update);
+
+        for message_id in [
+            replay_user_id,
+            reasoning_id,
+            reasoning_follow_up_id,
+            assistant_id,
+            assistant_follow_up_id,
+        ] {
+            assert_uuid_message_id(message_id);
+        }
+
+        assert_ne!(replay_user_id, reasoning_id);
+        assert_ne!(replay_user_id, reasoning_follow_up_id);
+        assert_ne!(replay_user_id, assistant_id);
+        assert_ne!(replay_user_id, assistant_follow_up_id);
+        assert_ne!(reasoning_id, reasoning_follow_up_id);
+        assert_ne!(reasoning_id, assistant_id);
+        assert_ne!(reasoning_follow_up_id, assistant_id);
+        assert_ne!(assistant_id, assistant_follow_up_id);
+
+        assert_eq!(
+            tool_calls.len(),
+            4,
+            "unexpected ToolCall notifications: {tool_calls:?}"
+        );
+        assert_eq!(
+            tool_call_updates.len(),
+            3,
+            "unexpected ToolCallUpdate notifications: {tool_call_updates:?}"
+        );
+
+        let alpha_start_raw = serde_json::to_value(&McpStartupUpdateEvent {
+            server: "alpha".into(),
+            status: McpStartupStatus::Starting,
+        })?;
+        let beta_start_raw = serde_json::to_value(&McpStartupUpdateEvent {
+            server: "beta".into(),
+            status: McpStartupStatus::Starting,
+        })?;
+        let gamma_start_raw = serde_json::to_value(&McpStartupUpdateEvent {
+            server: "gamma".into(),
+            status: McpStartupStatus::Starting,
+        })?;
+        let alpha_ready_raw = serde_json::to_value(&McpStartupUpdateEvent {
+            server: "alpha".into(),
+            status: McpStartupStatus::Ready,
+        })?;
+        let beta_failed_raw = serde_json::to_value(&McpStartupUpdateEvent {
+            server: "beta".into(),
+            status: McpStartupStatus::Failed {
+                error: "auth failed".into(),
+            },
+        })?;
+        let gamma_cancelled_raw = serde_json::to_value(&McpStartupUpdateEvent {
+            server: "gamma".into(),
+            status: McpStartupStatus::Cancelled,
+        })?;
+        let summary_raw = serde_json::to_value(&McpStartupCompleteEvent {
+            ready: vec!["alpha".into()],
+            failed: vec![codex_protocol::protocol::McpStartupFailure {
+                server: "beta".into(),
+                error: "auth failed".into(),
+            }],
+            cancelled: vec!["gamma".into()],
+        })?;
+
+        let alpha_start_id = ToolCallId::new(mcp_startup_tool_call_id("alpha"));
+        let beta_start_id = ToolCallId::new(mcp_startup_tool_call_id("beta"));
+        let gamma_start_id = ToolCallId::new(mcp_startup_tool_call_id("gamma"));
+        let summary_id = ToolCallId::new(mcp_startup_summary_tool_call_id());
+
+        let alpha_start = tool_calls
+            .iter()
+            .find(|tool_call| tool_call.tool_call_id == alpha_start_id)
+            .unwrap_or_else(|| panic!("missing alpha startup tool call: {tool_calls:?}"));
+        assert_eq!(alpha_start.title, mcp_startup_tool_call_title("alpha"));
+        assert_eq!(alpha_start.status, ToolCallStatus::InProgress);
+        assert_eq!(alpha_start.raw_input.as_ref(), Some(&alpha_start_raw));
+
+        let beta_start = tool_calls
+            .iter()
+            .find(|tool_call| tool_call.tool_call_id == beta_start_id)
+            .unwrap_or_else(|| panic!("missing beta startup tool call: {tool_calls:?}"));
+        assert_eq!(beta_start.title, mcp_startup_tool_call_title("beta"));
+        assert_eq!(beta_start.status, ToolCallStatus::InProgress);
+        assert_eq!(beta_start.raw_input.as_ref(), Some(&beta_start_raw));
+
+        let gamma_start = tool_calls
+            .iter()
+            .find(|tool_call| tool_call.tool_call_id == gamma_start_id)
+            .unwrap_or_else(|| panic!("missing gamma startup tool call: {tool_calls:?}"));
+        assert_eq!(gamma_start.title, mcp_startup_tool_call_title("gamma"));
+        assert_eq!(gamma_start.status, ToolCallStatus::InProgress);
+        assert_eq!(gamma_start.raw_input.as_ref(), Some(&gamma_start_raw));
+
+        let summary = tool_calls
+            .iter()
+            .find(|tool_call| tool_call.tool_call_id == summary_id)
+            .unwrap_or_else(|| panic!("missing startup summary tool call: {tool_calls:?}"));
+        assert_eq!(summary.title, "MCP Startup");
+        assert_eq!(summary.status, ToolCallStatus::Failed);
+        assert_eq!(summary.raw_output.as_ref(), Some(&summary_raw));
+
+        let alpha_ready = tool_call_updates
+            .iter()
+            .find(|update| {
+                update.tool_call_id == ToolCallId::new(mcp_startup_tool_call_id("alpha"))
+            })
+            .unwrap_or_else(|| panic!("missing alpha startup update: {tool_call_updates:?}"));
+        assert_eq!(alpha_ready.fields.status, Some(ToolCallStatus::Completed));
+        assert_eq!(
+            alpha_ready.fields.title.as_deref(),
+            Some(mcp_startup_tool_call_title("alpha").as_str())
+        );
+        assert_eq!(
+            alpha_ready.fields.raw_output.as_ref(),
+            Some(&alpha_ready_raw)
+        );
+
+        let beta_failed = tool_call_updates
+            .iter()
+            .find(|update| update.tool_call_id == ToolCallId::new(mcp_startup_tool_call_id("beta")))
+            .unwrap_or_else(|| panic!("missing beta startup update: {tool_call_updates:?}"));
+        assert_eq!(beta_failed.fields.status, Some(ToolCallStatus::Failed));
+        assert_eq!(
+            beta_failed.fields.title.as_deref(),
+            Some(mcp_startup_tool_call_title("beta").as_str())
+        );
+        assert_eq!(
+            beta_failed.fields.raw_output.as_ref(),
+            Some(&beta_failed_raw)
+        );
+
+        let gamma_cancelled = tool_call_updates
+            .iter()
+            .find(|update| {
+                update.tool_call_id == ToolCallId::new(mcp_startup_tool_call_id("gamma"))
+            })
+            .unwrap_or_else(|| panic!("missing gamma startup update: {tool_call_updates:?}"));
+        assert_eq!(gamma_cancelled.fields.status, Some(ToolCallStatus::Failed));
+        assert_eq!(
+            gamma_cancelled.fields.title.as_deref(),
+            Some(mcp_startup_tool_call_title("gamma").as_str())
+        );
+        assert_eq!(
+            gamma_cancelled.fields.raw_output.as_ref(),
+            Some(&gamma_cancelled_raw)
+        );
+
+        Ok(())
+    }
+
     async fn setup(
         custom_prompts: Vec<CustomPrompt>,
     ) -> anyhow::Result<(
@@ -3544,7 +5465,7 @@ mod tests {
     struct StubAuth;
 
     impl Auth for StubAuth {
-        fn logout(&self) -> Result<bool, Error> {
+        fn logout(&self) -> Result<bool, Box<Error>> {
             Ok(true)
         }
     }
@@ -3669,6 +5590,236 @@ mod tests {
                             duration: std::time::Duration::from_millis(10),
                             formatted_output: "b\n".into(),
                             status: ExecCommandStatus::Completed,
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id,
+                        }));
+                    } else if prompt == "grouped-live" {
+                        let turn_id = id.to_string();
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+
+                        send(EventMsg::UserMessage(UserMessageEvent {
+                            message: prompt.clone(),
+                            images: None,
+                            text_elements: vec![],
+                            local_images: vec![],
+                        }));
+                        send(EventMsg::ReasoningContentDelta(
+                            ReasoningContentDeltaEvent {
+                                thread_id: id.to_string(),
+                                turn_id: turn_id.clone(),
+                                item_id: "reasoning-1".into(),
+                                delta: "thinking ".into(),
+                                summary_index: 0,
+                            },
+                        ));
+                        send(EventMsg::ReasoningRawContentDelta(
+                            ReasoningRawContentDeltaEvent {
+                                thread_id: id.to_string(),
+                                turn_id: turn_id.clone(),
+                                item_id: "reasoning-1".into(),
+                                delta: "deeply".into(),
+                                content_index: 1,
+                            },
+                        ));
+                        send(EventMsg::AgentReasoningSectionBreak(
+                            AgentReasoningSectionBreakEvent {
+                                item_id: "reasoning-1".into(),
+                                summary_index: 1,
+                            },
+                        ));
+                        send(EventMsg::ReasoningContentDelta(
+                            ReasoningContentDeltaEvent {
+                                thread_id: id.to_string(),
+                                turn_id: turn_id.clone(),
+                                item_id: "reasoning-2".into(),
+                                delta: "next thought".into(),
+                                summary_index: 2,
+                            },
+                        ));
+                        send(EventMsg::AgentMessageContentDelta(
+                            AgentMessageContentDeltaEvent {
+                                thread_id: id.to_string(),
+                                turn_id: turn_id.clone(),
+                                item_id: "assistant-1".into(),
+                                delta: "Hello".into(),
+                            },
+                        ));
+                        send(EventMsg::AgentMessageContentDelta(
+                            AgentMessageContentDeltaEvent {
+                                thread_id: id.to_string(),
+                                turn_id: turn_id.clone(),
+                                item_id: "assistant-1".into(),
+                                delta: " world".into(),
+                            },
+                        ));
+                        send(EventMsg::AgentMessageContentDelta(
+                            AgentMessageContentDeltaEvent {
+                                thread_id: id.to_string(),
+                                turn_id: turn_id.clone(),
+                                item_id: "assistant-2".into(),
+                                delta: "Second reply".into(),
+                            },
+                        ));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id,
+                        }));
+                    } else if prompt == "reroute-live" {
+                        let turn_id = id.to_string();
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+
+                        send(EventMsg::UserMessage(UserMessageEvent {
+                            message: prompt.clone(),
+                            images: None,
+                            text_elements: vec![],
+                            local_images: vec![],
+                        }));
+                        send(EventMsg::ReasoningContentDelta(
+                            ReasoningContentDeltaEvent {
+                                thread_id: id.to_string(),
+                                turn_id: turn_id.clone(),
+                                item_id: "reasoning-reroute".into(),
+                                delta: "thinking ".into(),
+                                summary_index: 0,
+                            },
+                        ));
+                        send(EventMsg::ModelReroute(ModelRerouteEvent {
+                            from_model: "gpt-5.3-codex".into(),
+                            to_model: "gpt-5.2".into(),
+                            reason: ModelRerouteReason::HighRiskCyberActivity,
+                        }));
+                        send(EventMsg::ReasoningRawContentDelta(
+                            ReasoningRawContentDeltaEvent {
+                                thread_id: id.to_string(),
+                                turn_id: turn_id.clone(),
+                                item_id: "reasoning-reroute".into(),
+                                delta: "deeply".into(),
+                                content_index: 1,
+                            },
+                        ));
+                        send(EventMsg::AgentMessageContentDelta(
+                            AgentMessageContentDeltaEvent {
+                                thread_id: id.to_string(),
+                                turn_id: turn_id.clone(),
+                                item_id: "assistant-reroute".into(),
+                                delta: "Hello".into(),
+                            },
+                        ));
+                        send(EventMsg::Warning(WarningEvent {
+                            message: "Fallback warning".into(),
+                        }));
+                        send(EventMsg::AgentMessageContentDelta(
+                            AgentMessageContentDeltaEvent {
+                                thread_id: id.to_string(),
+                                turn_id: turn_id.clone(),
+                                item_id: "assistant-reroute".into(),
+                                delta: " world".into(),
+                            },
+                        ));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id,
+                        }));
+                    } else if prompt == "mcp-startup-live" {
+                        let turn_id = id.to_string();
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+
+                        send(EventMsg::UserMessage(UserMessageEvent {
+                            message: prompt.clone(),
+                            images: None,
+                            text_elements: vec![],
+                            local_images: vec![],
+                        }));
+                        send(EventMsg::ReasoningContentDelta(
+                            ReasoningContentDeltaEvent {
+                                thread_id: id.to_string(),
+                                turn_id: turn_id.clone(),
+                                item_id: "reasoning-mcp".into(),
+                                delta: "thinking ".into(),
+                                summary_index: 0,
+                            },
+                        ));
+                        send(EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+                            server: "alpha".into(),
+                            status: McpStartupStatus::Starting,
+                        }));
+                        send(EventMsg::ReasoningRawContentDelta(
+                            ReasoningRawContentDeltaEvent {
+                                thread_id: id.to_string(),
+                                turn_id: turn_id.clone(),
+                                item_id: "reasoning-mcp".into(),
+                                delta: "deeply".into(),
+                                content_index: 1,
+                            },
+                        ));
+                        send(EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+                            server: "beta".into(),
+                            status: McpStartupStatus::Starting,
+                        }));
+                        send(EventMsg::AgentMessageContentDelta(
+                            AgentMessageContentDeltaEvent {
+                                thread_id: id.to_string(),
+                                turn_id: turn_id.clone(),
+                                item_id: "assistant-mcp".into(),
+                                delta: "Hello".into(),
+                            },
+                        ));
+                        send(EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+                            server: "gamma".into(),
+                            status: McpStartupStatus::Starting,
+                        }));
+                        send(EventMsg::AgentMessageContentDelta(
+                            AgentMessageContentDeltaEvent {
+                                thread_id: id.to_string(),
+                                turn_id: turn_id.clone(),
+                                item_id: "assistant-mcp".into(),
+                                delta: " world".into(),
+                            },
+                        ));
+                        send(EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+                            server: "alpha".into(),
+                            status: McpStartupStatus::Ready,
+                        }));
+                        send(EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+                            server: "beta".into(),
+                            status: McpStartupStatus::Failed {
+                                error: "auth failed".into(),
+                            },
+                        }));
+                        send(EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+                            server: "gamma".into(),
+                            status: McpStartupStatus::Cancelled,
+                        }));
+                        send(EventMsg::McpStartupComplete(McpStartupCompleteEvent {
+                            ready: vec!["alpha".into()],
+                            failed: vec![codex_protocol::protocol::McpStartupFailure {
+                                server: "beta".into(),
+                                error: "auth failed".into(),
+                            }],
+                            cancelled: vec!["gamma".into()],
                         }));
                         send(EventMsg::TurnComplete(TurnCompleteEvent {
                             last_agent_message: None,

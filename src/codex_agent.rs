@@ -1,12 +1,12 @@
 use agent_client_protocol::{
-    Agent, AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, ClientCapabilities, Error, Implementation, InitializeRequest,
-    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, McpCapabilities, McpServer, McpServerHttp, McpServerStdio,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    ProtocolVersion, SessionCapabilities, SessionId, SessionInfo, SessionListCapabilities,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
+    Agent, AgentCapabilities, AuthMethod, AuthMethodAgent, AuthMethodId, AuthenticateRequest,
+    AuthenticateResponse, CancelNotification, ClientCapabilities, Error, Implementation,
+    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, McpServerHttp,
+    McpServerStdio, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
+    PromptResponse, ProtocolVersion, SessionCapabilities, SessionId, SessionInfo,
+    SessionListCapabilities, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
 use codex_core::{
     CodexAuth, NewThread, RolloutRecorder, ThreadManager, ThreadSortKey,
@@ -108,18 +108,37 @@ impl CodexAgent {
         SessionId::new(thread_id.to_string())
     }
 
-    fn get_thread(&self, session_id: &SessionId) -> Result<Rc<Thread>, Error> {
+    fn get_thread(&self, session_id: &SessionId) -> Result<Rc<Thread>, Box<Error>> {
         Ok(self
             .sessions
             .borrow()
             .get(session_id)
-            .ok_or_else(|| Error::resource_not_found(None))?
+            .ok_or_else(|| Box::new(Error::resource_not_found(None)))?
             .clone())
+    }
+
+    fn available_auth_methods() -> Vec<AuthMethod> {
+        let mut methods = vec![
+            CodexAuthMethod::ChatGpt,
+            CodexAuthMethod::CodexApiKey,
+            CodexAuthMethod::OpenAiApiKey,
+        ];
+
+        // Until codex device code auth works, we can't use this in remote ssh projects.
+        if std::env::var("NO_BROWSER").is_ok() {
+            methods.retain(|method| *method != CodexAuthMethod::ChatGpt);
+        }
+
+        methods.into_iter().map(Into::into).collect()
+    }
+
+    fn auth_required_error() -> Error {
+        Error::auth_required().auth_methods(Self::available_auth_methods())
     }
 
     async fn check_auth(&self) -> Result<(), Error> {
         if self.config.model_provider_id == "openai" && self.auth_manager.auth().await.is_none() {
-            return Err(Error::auth_required());
+            return Err(Self::auth_required_error());
         }
         Ok(())
     }
@@ -130,7 +149,7 @@ impl CodexAgent {
         &self,
         cwd: &PathBuf,
         mcp_servers: Vec<McpServer>,
-    ) -> Result<Config, Error> {
+    ) -> Result<Config, Box<Error>> {
         let mut config = self.config.clone();
         config.include_apply_patch_tool = true;
         config.cwd.clone_from(cwd);
@@ -213,7 +232,7 @@ impl CodexAgent {
         config
             .mcp_servers
             .set(new_mcp_servers)
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| Box::new(Error::internal_error().data(e.to_string())))?;
 
         Ok(config)
     }
@@ -229,7 +248,11 @@ impl Agent for CodexAgent {
             ..
         } = request;
         debug!("Received initialize request with protocol version {protocol_version:?}",);
-        let protocol_version = ProtocolVersion::V1;
+        let protocol_version = if protocol_version == ProtocolVersion::V1 {
+            protocol_version
+        } else {
+            ProtocolVersion::LATEST
+        };
 
         *self.client_capabilities.lock().unwrap() = client_capabilities;
 
@@ -241,15 +264,7 @@ impl Agent for CodexAgent {
         agent_capabilities.session_capabilities =
             SessionCapabilities::new().list(SessionListCapabilities::new());
 
-        let mut auth_methods = vec![
-            CodexAuthMethod::ChatGpt.into(),
-            CodexAuthMethod::CodexApiKey.into(),
-            CodexAuthMethod::OpenAiApiKey.into(),
-        ];
-        // Until codex device code auth works, we can't use this in remote ssh projects
-        if std::env::var("NO_BROWSER").is_ok() {
-            auth_methods.remove(0);
-        }
+        let auth_methods = Self::available_auth_methods();
 
         Ok(InitializeResponse::new(protocol_version)
             .agent_capabilities(agent_capabilities)
@@ -335,7 +350,9 @@ impl Agent for CodexAgent {
         } = request;
         info!("Creating new session with cwd: {}", cwd.display());
 
-        let config = self.build_session_config(&cwd, mcp_servers)?;
+        let config = self
+            .build_session_config(&cwd, mcp_servers)
+            .map_err(|error| *error)?;
         let num_mcp_servers = config.mcp_servers.len();
 
         let NewThread {
@@ -405,7 +422,9 @@ impl Agent for CodexAgent {
             InitialHistory::New => Vec::new(),
         };
 
-        let config = self.build_session_config(&cwd, mcp_servers)?;
+        let config = self
+            .build_session_config(&cwd, mcp_servers)
+            .map_err(|error| *error)?;
 
         let NewThread {
             thread_id: _,
@@ -512,7 +531,9 @@ impl Agent for CodexAgent {
         self.check_auth().await?;
 
         // Get the session state
-        let thread = self.get_thread(&request.session_id)?;
+        let thread = self
+            .get_thread(&request.session_id)
+            .map_err(|error| *error)?;
         let stop_reason = thread.prompt(request).await?;
 
         Ok(PromptResponse::new(stop_reason))
@@ -520,7 +541,10 @@ impl Agent for CodexAgent {
 
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
         info!("Cancelling operations for session: {}", args.session_id);
-        self.get_thread(&args.session_id)?.cancel().await?;
+        self.get_thread(&args.session_id)
+            .map_err(|error| *error)?
+            .cancel()
+            .await?;
         Ok(())
     }
 
@@ -529,7 +553,8 @@ impl Agent for CodexAgent {
         args: SetSessionModeRequest,
     ) -> Result<SetSessionModeResponse, Error> {
         info!("Setting session mode for session: {}", args.session_id);
-        self.get_thread(&args.session_id)?
+        self.get_thread(&args.session_id)
+            .map_err(|error| *error)?
             .set_mode(args.mode_id)
             .await?;
         Ok(SetSessionModeResponse::default())
@@ -541,7 +566,8 @@ impl Agent for CodexAgent {
     ) -> Result<SetSessionModelResponse, Error> {
         info!("Setting session model for session: {}", args.session_id);
 
-        self.get_thread(&args.session_id)?
+        self.get_thread(&args.session_id)
+            .map_err(|error| *error)?
             .set_model(args.model_id)
             .await?;
 
@@ -557,7 +583,7 @@ impl Agent for CodexAgent {
             args.session_id, args.config_id.0, args.value.0
         );
 
-        let thread = self.get_thread(&args.session_id)?;
+        let thread = self.get_thread(&args.session_id).map_err(|error| *error)?;
 
         thread.set_config_option(args.config_id, args.value).await?;
 
@@ -586,21 +612,26 @@ impl From<CodexAuthMethod> for AuthMethodId {
 
 impl From<CodexAuthMethod> for AuthMethod {
     fn from(method: CodexAuthMethod) -> Self {
-        match method {
-            CodexAuthMethod::ChatGpt => Self::new(method, "Login with ChatGPT").description(
-                "Use your ChatGPT login with Codex CLI (requires a paid ChatGPT subscription)",
-            ),
+        let method = match method {
+            CodexAuthMethod::ChatGpt => AuthMethodAgent::new(method, "Login with ChatGPT")
+                .description(
+                    "Use your ChatGPT login with Codex CLI (requires a paid ChatGPT subscription)",
+                ),
             CodexAuthMethod::CodexApiKey => {
-                Self::new(method, format!("Use {CODEX_API_KEY_ENV_VAR}")).description(format!(
-                    "Requires setting the `{CODEX_API_KEY_ENV_VAR}` environment variable."
-                ))
+                AuthMethodAgent::new(method, format!("Use {CODEX_API_KEY_ENV_VAR}")).description(
+                    format!("Requires setting the `{CODEX_API_KEY_ENV_VAR}` environment variable."),
+                )
             }
             CodexAuthMethod::OpenAiApiKey => {
-                Self::new(method, format!("Use {OPENAI_API_KEY_ENV_VAR}")).description(format!(
-                    "Requires setting the `{OPENAI_API_KEY_ENV_VAR}` environment variable."
-                ))
+                AuthMethodAgent::new(method, format!("Use {OPENAI_API_KEY_ENV_VAR}")).description(
+                    format!(
+                        "Requires setting the `{OPENAI_API_KEY_ENV_VAR}` environment variable."
+                    ),
+                )
             }
-        }
+        };
+
+        Self::Agent(method)
     }
 }
 
