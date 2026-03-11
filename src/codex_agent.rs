@@ -5,8 +5,8 @@ use agent_client_protocol::{
     LoadSessionResponse, McpCapabilities, McpServer, McpServerHttp, McpServerStdio,
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
     ProtocolVersion, SessionCapabilities, SessionId, SessionInfo, SessionListCapabilities,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
+    SessionModeId, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
 use codex_core::{
     CodexAuth, NewThread, RolloutRecorder, ThreadManager, ThreadSortKey,
@@ -31,11 +31,12 @@ use std::{
     rc::Rc,
     sync::{Arc, Mutex},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     local_spawner::{AcpFs, LocalSpawner},
+    session_mode_store::SessionModeStore,
     thread::Thread,
 };
 
@@ -56,6 +57,8 @@ pub struct CodexAgent {
     sessions: Rc<RefCell<HashMap<SessionId, Rc<Thread>>>>,
     /// Session working directories for filesystem sandboxing
     session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>>,
+    /// Session mode overrides persisted across reconnects.
+    session_mode_store: Rc<RefCell<SessionModeStore>>,
 }
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
@@ -76,6 +79,7 @@ impl CodexAgent {
         let capabilities_clone = client_capabilities.clone();
         let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
         let session_roots_clone = session_roots.clone();
+        let session_mode_store = Rc::new(RefCell::new(SessionModeStore::load(&config.codex_home)));
         let thread_manager = ThreadManager::new_with_fs(
             config.codex_home.clone(),
             auth_manager.clone(),
@@ -101,6 +105,7 @@ impl CodexAgent {
             thread_manager,
             sessions: Rc::default(),
             session_roots,
+            session_mode_store,
         }
     }
 
@@ -115,6 +120,25 @@ impl CodexAgent {
             .get(session_id)
             .ok_or_else(|| Error::resource_not_found(None))?
             .clone())
+    }
+
+    async fn replay_saved_mode_if_any(&self, session_id: &SessionId, thread: &Rc<Thread>) {
+        let saved_mode = {
+            let store = self.session_mode_store.borrow();
+            store.get(session_id)
+        };
+
+        let Some(saved_mode) = saved_mode else {
+            return;
+        };
+
+        if let Err(error) = thread.set_mode(saved_mode.clone()).await {
+            warn!(
+                "Failed to replay saved mode '{}' for session '{}': {}",
+                saved_mode.0, session_id.0, error
+            );
+            self.session_mode_store.borrow_mut().remove(session_id);
+        }
     }
 
     async fn check_auth(&self) -> Result<(), Error> {
@@ -360,6 +384,7 @@ impl Agent for CodexAgent {
             self.client_capabilities.clone(),
             config.clone(),
         ));
+        self.replay_saved_mode_if_any(&session_id, &thread).await;
         let load = thread.load().await?;
 
         self.sessions
@@ -429,6 +454,7 @@ impl Agent for CodexAgent {
         ));
 
         thread.replay_history(rollout_items).await?;
+        self.replay_saved_mode_if_any(&session_id, &thread).await;
 
         let load = thread.load().await?;
 
@@ -529,9 +555,13 @@ impl Agent for CodexAgent {
         args: SetSessionModeRequest,
     ) -> Result<SetSessionModeResponse, Error> {
         info!("Setting session mode for session: {}", args.session_id);
+        let mode_id = args.mode_id.clone();
         self.get_thread(&args.session_id)?
             .set_mode(args.mode_id)
             .await?;
+        self.session_mode_store
+            .borrow_mut()
+            .set(&args.session_id, &mode_id);
         Ok(SetSessionModeResponse::default())
     }
 
@@ -558,8 +588,19 @@ impl Agent for CodexAgent {
         );
 
         let thread = self.get_thread(&args.session_id)?;
+        let mode_override = if args.config_id.0.as_ref() == "mode" {
+            Some(SessionModeId::new(args.value.0.as_ref()))
+        } else {
+            None
+        };
 
         thread.set_config_option(args.config_id, args.value).await?;
+
+        if let Some(mode_override) = mode_override {
+            self.session_mode_store
+                .borrow_mut()
+                .set(&args.session_id, &mode_override);
+        }
 
         let config_options = thread.config_options().await?;
 
