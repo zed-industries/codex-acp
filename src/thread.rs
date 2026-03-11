@@ -14,11 +14,11 @@ use agent_client_protocol::{
     PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
     PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId,
-    SessionInfoUpdate, SessionMode, SessionModeId, SessionModeState, SessionModelState,
-    SessionNotification, SessionUpdate, StopReason, Terminal, TextResourceContents, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, UsageUpdate,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
+    SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
+    SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal,
+    TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, UsageUpdate,
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
@@ -145,7 +145,7 @@ enum ThreadMessage {
     },
     SetConfigOption {
         config_id: SessionConfigId,
-        value: SessionConfigValueId,
+        value: SessionConfigOptionValue,
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
     Cancel {
@@ -254,7 +254,7 @@ impl Thread {
     pub async fn set_config_option(
         &self,
         config_id: SessionConfigId,
-        value: SessionConfigValueId,
+        value: SessionConfigOptionValue,
     ) -> Result<(), Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -748,7 +748,7 @@ impl PromptState {
                 );
             }
             EventMsg::ElicitationRequest(event) => {
-                info!("Elicitation request: server={}, id={:?}, message={}", event.server_name, event.id, event.message);
+                info!("Elicitation request: server={}, id={:?}", event.server_name, event.id);
                 if let Err(err) = self.mcp_elicitation(client, event).await
                     && let Some(response_tx) = self.response_tx.take()
                 {
@@ -765,7 +765,9 @@ impl PromptState {
             }
 
             // Ignore these events
-            EventMsg::AgentReasoningRawContent(..)
+            EventMsg::ImageGenerationBegin(..)
+            | EventMsg::ImageGenerationEnd(..)
+            | EventMsg::AgentReasoningRawContent(..)
             | EventMsg::ThreadRolledBack(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
@@ -817,7 +819,8 @@ impl PromptState {
         let ElicitationRequestEvent {
             server_name,
             id,
-            message,
+            request,
+            turn_id: _,
         } = event;
         let tool_call_id = ToolCallId::new(match &id {
             codex_protocol::mcp::RequestId::String(s) => s.clone(),
@@ -830,7 +833,7 @@ impl PromptState {
                     ToolCallUpdateFields::new()
                         .title(server_name.clone())
                         .status(ToolCallStatus::Pending)
-                        .content(vec![message.into()])
+                        .content(vec![request.message().into()])
                         .raw_input(raw_input),
                 ),
                 vec![
@@ -869,6 +872,8 @@ impl PromptState {
                 server_name,
                 request_id: id,
                 decision,
+                content: None,
+                meta: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2177,8 +2182,11 @@ impl<A: Auth> ThreadActor<A> {
     async fn handle_set_config_option(
         &mut self,
         config_id: SessionConfigId,
-        value: SessionConfigValueId,
+        value: SessionConfigOptionValue,
     ) -> Result<(), Error> {
+        let SessionConfigOptionValue::ValueId { value } = value else {
+            return Err(Error::invalid_params().data("Unsupported config option value"));
+        };
         match config_id.0.as_ref() {
             "mode" => self.handle_set_mode(SessionModeId::new(value.0)).await,
             "model" => self.handle_set_config_model(value).await,
@@ -2229,6 +2237,7 @@ impl<A: Auth> ThreadActor<A> {
                 collaboration_mode: None,
                 personality: None,
                 windows_sandbox_level: None,
+                service_tier: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2274,6 +2283,7 @@ impl<A: Auth> ThreadActor<A> {
                 collaboration_mode: None,
                 personality: None,
                 windows_sandbox_level: None,
+                service_tier: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2448,6 +2458,7 @@ impl<A: Auth> ThreadActor<A> {
                 collaboration_mode: None,
                 personality: None,
                 windows_sandbox_level: None,
+                service_tier: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2513,6 +2524,7 @@ impl<A: Auth> ThreadActor<A> {
                 collaboration_mode: None,
                 personality: None,
                 windows_sandbox_level: None,
+                service_tier: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
