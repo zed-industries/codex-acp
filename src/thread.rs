@@ -3326,7 +3326,7 @@ mod tests {
 
     use agent_client_protocol::TextContent;
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
-    use codex_protocol::{config_types::ModeKind};
+    use codex_protocol::{config_types::ModeKind, protocol::ExecCommandSource};
     use tokio::{
         sync::{Mutex, mpsc::UnboundedSender},
         task::LocalSet,
@@ -3867,6 +3867,32 @@ mod tests {
         Ok((session_id, client, conversation, message_tx, local_set))
     }
 
+    async fn setup_actor(
+        custom_prompts: Vec<CustomPrompt>,
+    ) -> anyhow::Result<(Arc<StubClient>, Arc<StubCodexThread>, ThreadActor<StubAuth>)> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let conversation = Arc::new(StubCodexThread::new());
+        let models_manager = Arc::new(StubModelsManager);
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        let (_message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            conversation.clone(),
+            models_manager,
+            config,
+            message_rx,
+        );
+        actor.custom_prompts = Rc::new(RefCell::new(custom_prompts));
+        Ok((client, conversation, actor))
+    }
 
     struct StubAuth;
 
@@ -4173,6 +4199,87 @@ mod tests {
         }
     }
 
+    fn replay_turn_context(turn_id: &str) -> RolloutItem {
+        RolloutItem::TurnContext(codex_protocol::protocol::TurnContextItem {
+            turn_id: Some(turn_id.to_string()),
+            cwd: std::env::current_dir().unwrap(),
+            current_date: None,
+            timezone: None,
+            approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
+            sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+            network: None,
+            model: "gpt-5".to_string(),
+            personality: None,
+            collaboration_mode: None,
+            effort: None,
+            summary: Default::default(),
+            user_instructions: None,
+            developer_instructions: None,
+            final_output_json_schema: None,
+            truncation_policy: None,
+        })
+    }
+
+    fn replay_function_call(
+        name: &str,
+        call_id: &str,
+        arguments: serde_json::Value,
+    ) -> RolloutItem {
+        RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+            id: None,
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+            call_id: call_id.to_string(),
+        })
+    }
+
+    fn replay_function_call_output(call_id: &str, output: impl Into<String>) -> RolloutItem {
+        RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: FunctionCallOutputPayload::from_text(output.into()),
+        })
+    }
+
+    fn unified_exec_output_text(
+        output: &str,
+        process_id: Option<&str>,
+        exit_code: Option<i32>,
+    ) -> String {
+        let mut lines = vec![
+            "Chunk ID: replay".to_string(),
+            "Wall time: 0.0100 seconds".to_string(),
+        ];
+        if let Some(exit_code) = exit_code {
+            lines.push(format!("Process exited with code {exit_code}"));
+        }
+        if let Some(process_id) = process_id {
+            lines.push(format!("Process running with session ID {process_id}"));
+        }
+        lines.push("Original token count: 0".to_string());
+        lines.push("Output:".to_string());
+        lines.push(output.to_string());
+        lines.join("\n")
+    }
+
+    fn tool_calls(notifications: &[SessionNotification]) -> Vec<ToolCall> {
+        notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCall(tool_call) => Some(tool_call.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tool_call_updates(notifications: &[SessionNotification]) -> Vec<ToolCallUpdate> {
+        notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCallUpdate(update) => Some(update.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 
     #[tokio::test]
     async fn test_parallel_exec_commands() -> anyhow::Result<()> {
@@ -4255,4 +4362,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_replay_unified_exec_routes_write_stdin_to_original_command() -> anyhow::Result<()>
+    {
+        let (client, _, mut actor) = setup_actor(vec![]).await?;
+        let turn_id = "turn-replay";
+        let cwd = std::env::current_dir().unwrap();
+        actor
+            .handle_replay_history(vec![
+                replay_turn_context(turn_id),
+                replay_function_call(
+                    "exec_command",
+                    "call-exec",
+                    serde_json::json!({
+                        "cmd": "make build",
+                        "workdir": cwd,
+                    }),
+                ),
+                replay_function_call_output(
+                    "call-exec",
+                    unified_exec_output_text("Compiling...\n", Some("74418"), None),
+                ),
+                replay_function_call(
+                    "write_stdin",
+                    "call-poll-1",
+                    serde_json::json!({
+                        "session_id": 74418,
+                        "chars": "status\n",
+                    }),
+                ),
+                replay_function_call_output(
+                    "call-poll-1",
+                    unified_exec_output_text("Still running...\n", Some("74418"), None),
+                ),
+                replay_function_call(
+                    "write_stdin",
+                    "call-poll-2",
+                    serde_json::json!({
+                        "session_id": 74418,
+                        "chars": "",
+                    }),
+                ),
+                replay_function_call_output(
+                    "call-poll-2",
+                    unified_exec_output_text("Done\n", None, Some(0)),
+                ),
+                RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                    last_agent_message: None,
+                    turn_id: turn_id.to_string(),
+                })),
+            ])
+            .await?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let tool_calls = tool_calls(&notifications);
+        let updates = tool_call_updates(&notifications);
+
+        assert_eq!(
+            tool_calls.len(),
+            1,
+            "expected only the original exec_command tool call, got {tool_calls:?}"
+        );
+        assert_eq!(tool_calls[0].tool_call_id, ToolCallId::new("call-exec"));
+
+        let completed_updates: Vec<_> = updates
+            .iter()
+            .filter(|update| {
+                update.tool_call_id == ToolCallId::new("call-exec")
+                    && update.fields.status == Some(ToolCallStatus::Completed)
+            })
+            .collect();
+        assert_eq!(
+            completed_updates.len(),
+            1,
+            "expected one completion for the original exec_command, got {updates:?}"
+        );
+        assert!(
+            !format!("{tool_calls:?}").contains("call-poll"),
+            "write_stdin polling should not create separate tool calls: {tool_calls:?}"
+        );
+        assert!(
+            format!("{updates:?}").contains("Still running...")
+                && format!("{updates:?}").contains("status"),
+            "expected replayed polling output and stdin to attach to the original command: {updates:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_unified_exec_preserves_active_command_for_live_terminal_end()
+    -> anyhow::Result<()> {
+        let (client, _, mut actor) = setup_actor(vec![]).await?;
+        let turn_id = "turn-live";
+        let cwd = std::env::current_dir().unwrap();
+        actor
+            .handle_replay_history(vec![
+                replay_turn_context(turn_id),
+                replay_function_call(
+                    "exec_command",
+                    "call-live",
+                    serde_json::json!({
+                        "cmd": "make build",
+                        "workdir": cwd.clone(),
+                    }),
+                ),
+                replay_function_call_output(
+                    "call-live",
+                    unified_exec_output_text("Compiling...\n", Some("74418"), None),
+                ),
+            ])
+            .await?;
+
+        actor
+            .handle_event(Event {
+                id: turn_id.to_string(),
+                msg: EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                    call_id: "call-live".into(),
+                    stream: codex_protocol::protocol::ExecOutputStream::Stdout,
+                    chunk: b"Done\n".to_vec(),
+                }),
+            })
+            .await;
+        actor
+            .handle_event(Event {
+                id: turn_id.to_string(),
+                msg: EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                    call_id: "call-live".into(),
+                    process_id: Some("74418".into()),
+                    turn_id: turn_id.to_string(),
+                    command: vec!["make".into(), "build".into()],
+                    cwd,
+                    parsed_cmd: vec![],
+                    source: ExecCommandSource::UnifiedExecStartup,
+                    interaction_input: None,
+                    stdout: "Compiling...\nDone\n".into(),
+                    stderr: String::new(),
+                    aggregated_output: "Compiling...\nDone\n".into(),
+                    exit_code: 0,
+                    duration: std::time::Duration::from_millis(10),
+                    formatted_output: "Compiling...\nDone\n".into(),
+                    status: ExecCommandStatus::Completed,
+                }),
+            })
+            .await;
+        actor
+            .handle_event(Event {
+                id: turn_id.to_string(),
+                msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                    last_agent_message: None,
+                    turn_id: turn_id.to_string(),
+                }),
+            })
+            .await;
+
+        let notifications = client.notifications.lock().unwrap();
+        let tool_calls = tool_calls(&notifications);
+        let updates = tool_call_updates(&notifications);
+
+        assert_eq!(
+            tool_calls.len(),
+            1,
+            "expected one replayed exec tool call, got {tool_calls:?}"
+        );
+        let completed_updates: Vec<_> = updates
+            .iter()
+            .filter(|update| {
+                update.tool_call_id == ToolCallId::new("call-live")
+                    && update.fields.status == Some(ToolCallStatus::Completed)
+            })
+            .collect();
+        assert_eq!(
+            completed_updates.len(),
+            1,
+            "expected the live terminal end to complete the replayed exec command, got {updates:?}"
+        );
+        assert!(
+            format!("{updates:?}").contains("Compiling...")
+                && format!("{updates:?}").contains("Done"),
+            "expected replayed output and live output to land on the same tool call: {updates:?}"
+        );
+
+        Ok(())
+    }
 }
