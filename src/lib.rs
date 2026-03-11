@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
 mod local_spawner;
+mod mode_overrides;
 mod prompt_args;
 mod thread;
 
