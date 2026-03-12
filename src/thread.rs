@@ -643,11 +643,6 @@ impl PromptState {
                 item,
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
-                // Notify the client when context compaction completes so users see
-                // a status message rather than silence during /compact.
-                if matches!(item, TurnItem::ContextCompaction(..)) {
-                    client.send_agent_text("Context compacted".to_string()).await;
-                }
             }
             EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id }) => {
                 info!(
@@ -766,7 +761,7 @@ impl PromptState {
 
             EventMsg::ContextCompacted(..) => {
                 info!("Context compacted");
-                client.send_agent_text("Context compacted".to_string()).await;
+                client.send_agent_text("Context compacted\n".to_string()).await;
             }
             EventMsg::RequestPermissions(event) => {
                 info!("Request permissions: {} {}", event.call_id, event.turn_id);
