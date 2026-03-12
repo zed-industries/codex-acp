@@ -512,8 +512,7 @@ impl Agent for CodexAgent {
         &self,
         request: CloseSessionRequest,
     ) -> Result<CloseSessionResponse, Error> {
-        self.cancel(CancelNotification::new(request.session_id.clone()))
-            .await?;
+        self.get_thread(&request.session_id)?.shutdown().await?;
         self.thread_manager
             .remove_thread(
                 &ThreadId::from_string(&request.session_id.0)
