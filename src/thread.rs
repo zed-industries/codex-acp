@@ -29,20 +29,6 @@ use codex_core::{
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
-use codex_protocol::protocol::{
-    AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
-    AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent,
-    ElicitationAction, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent,
-    ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus,
-    ExitedReviewModeEvent, FileChange, ItemCompletedEvent, ItemStartedEvent,
-    ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent,
-    McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, Op, PatchApplyBeginEvent,
-    PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
-    ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget,
-    SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent, TurnAbortedEvent,
-    TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
-    WebSearchBeginEvent, WebSearchEndEvent,
-};
 use codex_protocol::{
     approvals::ElicitationRequestEvent,
     config_types::TrustLevel,
@@ -50,14 +36,33 @@ use codex_protocol::{
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     items::TurnItem,
     mcp::CallToolResult,
-    models::{ResponseItem, WebSearchAction},
+    models::{MacOsSeatbeltProfileExtensions, PermissionProfile, ResponseItem, WebSearchAction},
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
         DynamicToolCallResponseEvent, NetworkApprovalContext, NetworkPolicyAmendment, RolloutItem,
     },
+    request_permissions::{PermissionGrantScope, RequestPermissionsResponse},
     user_input::UserInput,
+};
+use codex_protocol::{
+    protocol::{
+        AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
+        AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent,
+        ApplyPatchApprovalRequestEvent, ElicitationAction, ErrorEvent, Event, EventMsg,
+        ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent,
+        ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent, FileChange,
+        ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation,
+        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
+        ModelRerouteEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
+        ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
+        ReviewOutputEvent, ReviewRequest, ReviewTarget, SandboxPolicy, StreamErrorEvent,
+        TerminalInteractionEvent, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
+        TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
+        WebSearchBeginEvent, WebSearchEndEvent,
+    },
+    request_permissions::RequestPermissionsEvent,
 };
 use codex_shell_command::parse_command::parse_command;
 use codex_utils_approval_presets::{ApprovalPreset, builtin_approval_presets};
@@ -763,12 +768,22 @@ impl PromptState {
                 info!("Context compacted");
                 client.send_agent_text("Context compacted".to_string()).await;
             }
+            EventMsg::RequestPermissions(event) => {
+                info!("Request permissions: {} {}", event.call_id, event.turn_id);
+                if let Err(err) = self.request_permissions(client, event).await
+                    && let Some(response_tx) = self.response_tx.take()
+                {
+                    drop(response_tx.send(Err(err)));
+                }
+            }
 
             // Ignore these events
             EventMsg::ImageGenerationBegin(..)
             | EventMsg::ImageGenerationEnd(..)
             | EventMsg::AgentReasoningRawContent(..)
             | EventMsg::ThreadRolledBack(..)
+            | EventMsg::HookStarted(..)
+            | EventMsg::HookCompleted(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
             // Revisit when we can emit status updates
@@ -1185,6 +1200,7 @@ impl PromptState {
             additional_permissions,
             available_decisions,
             proposed_network_policy_amendments,
+            skill_metadata: _,
         } = event;
 
         // Create a new tool call for the command execution
@@ -1571,6 +1587,129 @@ impl PromptState {
                 ))
                 .await;
         }
+    }
+
+    async fn request_permissions(
+        &self,
+        client: &SessionClient,
+        event: RequestPermissionsEvent,
+    ) -> Result<(), Error> {
+        let raw_input = serde_json::json!(&event);
+        let RequestPermissionsEvent {
+            call_id,
+            turn_id: _,
+            reason,
+            permissions,
+        } = event;
+
+        // Create a new tool call for the command execution
+        let tool_call_id = ToolCallId::new(call_id.clone());
+
+        let mut content = vec![];
+
+        if let Some(reason) = reason.as_ref() {
+            content.push(reason.clone());
+        }
+        if let Some(file_system) = permissions.file_system.as_ref() {
+            if let Some(read) = file_system.read.as_ref() {
+                content.push(format!(
+                    "File System Read Access: {}",
+                    read.iter().map(|p| p.display()).join(", ")
+                ));
+            }
+            if let Some(write) = file_system.write.as_ref() {
+                content.push(format!(
+                    "File System Write Access: {}",
+                    write.iter().map(|p| p.display()).join(", ")
+                ));
+            }
+        }
+        if let Some(network) = permissions.network.as_ref()
+            && let Some(enabled) = network.enabled
+        {
+            content.push(format!("Network Access: {enabled}"));
+        }
+        if let Some(mac) = permissions.macos.as_ref() {
+            let MacOsSeatbeltProfileExtensions {
+                macos_preferences,
+                macos_automation,
+                macos_launch_services,
+                macos_accessibility,
+                macos_calendar,
+                macos_reminders,
+                macos_contacts,
+            } = mac;
+
+            content.push("MacOS Seatbelt Profile Extensions: ".to_string());
+            content.push(format!("Preferences: {:?}", macos_preferences));
+            content.push(format!("Automation: {:?}", macos_automation));
+            content.push(format!("Launch Services: {}", macos_launch_services));
+            content.push(format!("Accessibility: {}", macos_accessibility));
+            content.push(format!("Calendar: {}", macos_calendar));
+            content.push(format!("Reminders: {}", macos_reminders));
+            content.push(format!("Contacts: {:?}", macos_contacts));
+        }
+
+        let content = if content.is_empty() {
+            None
+        } else {
+            Some(vec![content.join("\n").into()])
+        };
+
+        let response = client
+            .request_permission(
+                ToolCallUpdate::new(
+                    tool_call_id,
+                    ToolCallUpdateFields::new()
+                        .status(ToolCallStatus::Pending)
+                        .title(reason.unwrap_or_else(|| "Permissions Request".to_string()))
+                        .raw_input(raw_input)
+                        .content(content),
+                ),
+                vec![
+                    PermissionOption::new(
+                        "approved-for-session",
+                        "Yes, for session",
+                        PermissionOptionKind::AllowAlways,
+                    ),
+                    PermissionOption::new("approved", "Yes", PermissionOptionKind::AllowOnce),
+                    PermissionOption::new("abort", "No", PermissionOptionKind::RejectOnce),
+                ],
+            )
+            .await?;
+
+        let response = match response.outcome {
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome { option_id, .. }) => {
+                match option_id.0.as_ref() {
+                    "approved-for-session" => RequestPermissionsResponse {
+                        permissions,
+                        scope: PermissionGrantScope::Session,
+                    },
+                    "approved" => RequestPermissionsResponse {
+                        permissions,
+                        scope: PermissionGrantScope::Turn,
+                    },
+                    _ => RequestPermissionsResponse {
+                        permissions: PermissionProfile::default(),
+                        scope: PermissionGrantScope::Turn,
+                    },
+                }
+            }
+            RequestPermissionOutcome::Cancelled | _ => RequestPermissionsResponse {
+                permissions: PermissionProfile::default(),
+                scope: PermissionGrantScope::Turn,
+            },
+        };
+
+        self.thread
+            .submit(Op::RequestPermissionsResponse {
+                id: call_id,
+                response,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        Ok(())
     }
 }
 
@@ -3010,7 +3149,7 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
-    use agent_client_protocol::TextContent;
+    use agent_client_protocol::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
     use codex_protocol::config_types::ModeKind;
     use tokio::{

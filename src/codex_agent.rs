@@ -78,10 +78,9 @@ impl CodexAgent {
         let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
         let session_roots_clone = session_roots.clone();
         let thread_manager = ThreadManager::new_with_fs(
-            config.codex_home.clone(),
+            &config,
             auth_manager.clone(),
             SessionSource::Unknown,
-            config.model_catalog.clone(),
             CollaborationModesConfig {
                 // False for now
                 default_mode_request_user_input: false,
