@@ -2208,6 +2208,7 @@ struct ThreadActor<A> {
 }
 
 impl<A: Auth> ThreadActor<A> {
+    #[expect(clippy::too_many_arguments)]
     fn new(
         auth: A,
         client: SessionClient,
@@ -2242,9 +2243,8 @@ impl<A: Auth> ThreadActor<A> {
                     Some(message) => self.handle_message(message).await,
                     None => message_rx_open = false,
                 },
-                message = self.resolution_rx.recv() => match message {
-                    Some(message) => self.handle_message(message).await,
-                    None => {}
+                message = self.resolution_rx.recv() => if let Some(message) = message {
+                    self.handle_message(message).await
                 },
                 event = self.thread.next_event() => match event {
                     Ok(event) => self.handle_event(event).await,
