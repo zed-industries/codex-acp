@@ -62,6 +62,7 @@ pub struct CodexAgent {
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
+const ACP_SESSION_SOURCE: SessionSource = SessionSource::Cli;
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
@@ -81,7 +82,7 @@ impl CodexAgent {
         let thread_manager = ThreadManager::new_with_fs(
             &config,
             auth_manager.clone(),
-            SessionSource::Unknown,
+            ACP_SESSION_SOURCE,
             CollaborationModesConfig {
                 // False for now
                 default_mode_request_user_input: false,
@@ -678,5 +679,27 @@ fn format_session_title(message: &str) -> Option<String> {
         None
     } else {
         Some(truncate_graphemes(trimmed, SESSION_TITLE_MAX_GRAPHEMES))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use codex_core::config::ConfigOverrides;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn codex_agent_uses_cli_session_source() -> anyhow::Result<()> {
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+
+        let agent = CodexAgent::new(config);
+
+        assert_eq!(agent.thread_manager.session_source(), SessionSource::Cli);
+
+        Ok(())
     }
 }
