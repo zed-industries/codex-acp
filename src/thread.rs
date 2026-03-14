@@ -2771,7 +2771,9 @@ impl<A: Auth> ThreadActor<A> {
     ) -> Result<oneshot::Receiver<Result<StopReason, Error>>, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
+        let history_text = history_text_from_prompt(&request.prompt);
         let items = build_prompt_items(request.prompt);
+        let mut add_to_history = false;
         let op;
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
@@ -2851,6 +2853,7 @@ impl<A: Auth> ThreadActor<A> {
                 }
             }
         } else {
+            add_to_history = true;
             op = Op::UserInput {
                 items,
                 final_output_json_schema: None,
@@ -2862,6 +2865,13 @@ impl<A: Auth> ThreadActor<A> {
             .submit(op.clone())
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        if add_to_history
+            && let Some(text) = history_text
+            && let Err(err) = self.thread.submit(Op::AddToHistory { text }).await
+        {
+            warn!("failed to enqueue prompt history entry: {err}");
+        }
 
         info!("Submitted prompt with submission_id: {submission_id}");
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
@@ -3359,6 +3369,19 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<UserInput> {
         .collect()
 }
 
+fn history_text_from_prompt(prompt: &[ContentBlock]) -> Option<String> {
+    let history_text = prompt
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text_block) => Some(text_block.text.as_str()),
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+        .join("\n");
+
+    (!history_text.is_empty()).then_some(history_text)
+}
+
 fn format_uri_as_link(name: Option<String>, uri: String) -> String {
     if let Some(name) = name
         && !name.is_empty()
@@ -3478,7 +3501,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prompt() -> anyhow::Result<()> {
-        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -3508,6 +3531,20 @@ mod tests {
                 ..
             }) if text == "Hi"
         ));
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(
+            ops.as_slice(),
+            &[
+                Op::UserInput {
+                    items: vec![UserInput::Text {
+                        text: "Hi".into(),
+                        text_elements: vec![]
+                    }],
+                    final_output_json_schema: None,
+                },
+                Op::AddToHistory { text: "Hi".into() }
+            ]
+        );
 
         Ok(())
     }
@@ -3932,6 +3969,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_prompt_history_ignores_embedded_resources() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec![
+                    ContentBlock::Text(TextContent::new("Summarize this selection")),
+                    ContentBlock::Resource(EmbeddedResource::new(
+                        EmbeddedResourceResource::TextResourceContents(TextResourceContents::new(
+                            "secret file contents",
+                            "file:///tmp/secret.txt",
+                        )),
+                    )),
+                ],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(
+            ops.as_slice(),
+            &[
+                Op::UserInput {
+                    items: vec![
+                        UserInput::Text {
+                            text: "Summarize this selection".into(),
+                            text_elements: vec![],
+                        },
+                        UserInput::Text {
+                            text: "[@secret.txt](file:///tmp/secret.txt)\n<context ref=\"file:///tmp/secret.txt\">\nsecret file contents\n</context>".into(),
+                            text_elements: vec![],
+                        },
+                    ],
+                    final_output_json_schema: None,
+                },
+                Op::AddToHistory {
+                    text: "Summarize this selection".into(),
+                },
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_delta_deduplication() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -4304,7 +4401,8 @@ mod tests {
                         })
                         .unwrap();
                 }
-                Op::ExecApproval { .. }
+                Op::AddToHistory { .. }
+                | Op::ExecApproval { .. }
                 | Op::ResolveElicitation { .. }
                 | Op::RequestPermissionsResponse { .. }
                 | Op::PatchApproval { .. }
