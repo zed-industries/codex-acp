@@ -2771,15 +2771,22 @@ impl<A: Auth> ThreadActor<A> {
     ) -> Result<oneshot::Receiver<Result<StopReason, Error>>, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let history_text = history_text_from_prompt(&request.prompt);
+        let prompt_history_text = history_text_from_prompt(&request.prompt);
         let items = build_prompt_items(request.prompt);
-        let mut add_to_history = false;
+        let history_text;
         let op;
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
-                "compact" => op = Op::Compact,
-                "undo" => op = Op::Undo,
+                "compact" => {
+                    history_text = None;
+                    op = Op::Compact
+                }
+                "undo" => {
+                    history_text = None;
+                    op = Op::Undo
+                }
                 "init" => {
+                    history_text = None;
                     op = Op::UserInput {
                         items: vec![UserInput::Text {
                             text: INIT_COMMAND_PROMPT.into(),
@@ -2789,6 +2796,7 @@ impl<A: Auth> ThreadActor<A> {
                     }
                 }
                 "review" => {
+                    history_text = None;
                     let instructions = rest.trim();
                     let target = if instructions.is_empty() {
                         ReviewTarget::UncommittedChanges
@@ -2806,6 +2814,7 @@ impl<A: Auth> ThreadActor<A> {
                     }
                 }
                 "review-branch" if !rest.is_empty() => {
+                    history_text = None;
                     let target = ReviewTarget::BaseBranch {
                         branch: rest.trim().to_owned(),
                     };
@@ -2817,6 +2826,7 @@ impl<A: Auth> ThreadActor<A> {
                     }
                 }
                 "review-commit" if !rest.is_empty() => {
+                    history_text = None;
                     let target = ReviewTarget::Commit {
                         sha: rest.trim().to_owned(),
                         title: None,
@@ -2837,6 +2847,7 @@ impl<A: Auth> ThreadActor<A> {
                         expand_custom_prompt(name, rest, self.custom_prompts.borrow().as_ref())
                             .map_err(|e| Error::invalid_params().data(e.user_message()))?
                     {
+                        history_text = (!prompt.is_empty()).then_some(prompt.clone());
                         op = Op::UserInput {
                             items: vec![UserInput::Text {
                                 text: prompt,
@@ -2845,6 +2856,7 @@ impl<A: Auth> ThreadActor<A> {
                             final_output_json_schema: None,
                         }
                     } else {
+                        history_text = prompt_history_text.clone();
                         op = Op::UserInput {
                             items,
                             final_output_json_schema: None,
@@ -2853,7 +2865,7 @@ impl<A: Auth> ThreadActor<A> {
                 }
             }
         } else {
-            add_to_history = true;
+            history_text = prompt_history_text;
             op = Op::UserInput {
                 items,
                 final_output_json_schema: None,
@@ -2866,8 +2878,7 @@ impl<A: Auth> ThreadActor<A> {
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
-        if add_to_history
-            && let Some(text) = history_text
+        if let Some(text) = history_text
             && let Err(err) = self.thread.submit(Op::AddToHistory { text }).await
         {
             warn!("failed to enqueue prompt history entry: {err}");
@@ -3373,7 +3384,10 @@ fn history_text_from_prompt(prompt: &[ContentBlock]) -> Option<String> {
     let history_text = prompt
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text(text_block) => Some(text_block.text.as_str()),
+            ContentBlock::Text(text_block) => Some(text_block.text.clone()),
+            ContentBlock::ResourceLink(ResourceLink { name, uri, .. }) => {
+                Some(format_uri_as_link(Some(name.clone()), uri.clone()))
+            }
             _ => None,
         })
         .filter(|text| !text.is_empty())
@@ -3489,7 +3503,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
-    use agent_client_protocol::{RequestPermissionResponse, TextContent};
+    use agent_client_protocol::{ImageContent, RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
     use codex_protocol::config_types::ModeKind;
     use tokio::{
@@ -3955,13 +3969,18 @@ mod tests {
         let ops = thread.ops.lock().unwrap();
         assert_eq!(
             ops.as_slice(),
-            &[Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: "Custom prompt with foo arg.".into(),
-                    text_elements: vec![]
-                }],
-                final_output_json_schema: None,
-            }],
+            &[
+                Op::UserInput {
+                    items: vec![UserInput::Text {
+                        text: "Custom prompt with foo arg.".into(),
+                        text_elements: vec![]
+                    }],
+                    final_output_json_schema: None,
+                },
+                Op::AddToHistory {
+                    text: "Custom prompt with foo arg.".into()
+                }
+            ],
             "ops don't match {ops:?}"
         );
 
@@ -3969,7 +3988,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_prompt_history_ignores_embedded_resources() -> anyhow::Result<()> {
+    async fn test_prompt_history_includes_resource_links() -> anyhow::Result<()> {
         let (session_id, _client, thread, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
@@ -3978,6 +3997,10 @@ mod tests {
                 session_id.clone(),
                 vec![
                     ContentBlock::Text(TextContent::new("Summarize this selection")),
+                    ContentBlock::ResourceLink(ResourceLink::new(
+                        "notes.md",
+                        "file:///tmp/notes.md",
+                    )),
                     ContentBlock::Resource(EmbeddedResource::new(
                         EmbeddedResourceResource::TextResourceContents(TextResourceContents::new(
                             "secret file contents",
@@ -4013,6 +4036,10 @@ mod tests {
                             text_elements: vec![],
                         },
                         UserInput::Text {
+                            text: "[@notes.md](file:///tmp/notes.md)".into(),
+                            text_elements: vec![],
+                        },
+                        UserInput::Text {
                             text: "[@secret.txt](file:///tmp/secret.txt)\n<context ref=\"file:///tmp/secret.txt\">\nsecret file contents\n</context>".into(),
                             text_elements: vec![],
                         },
@@ -4020,8 +4047,192 @@ mod tests {
                     final_output_json_schema: None,
                 },
                 Op::AddToHistory {
-                    text: "Summarize this selection".into(),
+                    text: "Summarize this selection\n[@notes.md](file:///tmp/notes.md)".into(),
                 },
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prompt_history_joins_multiple_text_blocks() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec![
+                    ContentBlock::Text(TextContent::new("first line")),
+                    ContentBlock::Text(TextContent::new("second line")),
+                ],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(
+            ops.as_slice(),
+            &[
+                Op::UserInput {
+                    items: vec![
+                        UserInput::Text {
+                            text: "first line".into(),
+                            text_elements: vec![],
+                        },
+                        UserInput::Text {
+                            text: "second line".into(),
+                            text_elements: vec![],
+                        },
+                    ],
+                    final_output_json_schema: None,
+                },
+                Op::AddToHistory {
+                    text: "first line\nsecond line".into(),
+                },
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prompt_history_skips_image_only_prompt() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec![ContentBlock::Image(ImageContent::new("Zm9v", "image/png"))],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(
+            ops.as_slice(),
+            &[Op::UserInput {
+                items: vec![UserInput::Image {
+                    image_url: "data:image/png;base64,Zm9v".into(),
+                }],
+                final_output_json_schema: None,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prompt_history_skips_embedded_resource_only_prompt() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec![ContentBlock::Resource(EmbeddedResource::new(
+                    EmbeddedResourceResource::TextResourceContents(TextResourceContents::new(
+                        "secret file contents",
+                        "file:///tmp/secret.txt",
+                    )),
+                ))],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(
+            ops.as_slice(),
+            &[Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: "[@secret.txt](file:///tmp/secret.txt)\n<context ref=\"file:///tmp/secret.txt\">\nsecret file contents\n</context>".into(),
+                    text_elements: vec![],
+                }],
+                final_output_json_schema: None,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prompt_history_persists_literal_slash_input() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/tmp/foo".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(
+            ops.as_slice(),
+            &[
+                Op::UserInput {
+                    items: vec![UserInput::Text {
+                        text: "/tmp/foo".into(),
+                        text_elements: vec![]
+                    }],
+                    final_output_json_schema: None,
+                },
+                Op::AddToHistory {
+                    text: "/tmp/foo".into()
+                }
             ]
         );
 
@@ -4167,6 +4378,7 @@ mod tests {
                         .into_iter()
                         .map(|i| match i {
                             UserInput::Text { text, .. } => text,
+                            UserInput::Image { .. } => String::new(),
                             _ => unimplemented!(),
                         })
                         .join("\n");
