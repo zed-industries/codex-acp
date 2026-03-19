@@ -31,7 +31,7 @@ use codex_core::{
 };
 use codex_protocol::{
     approvals::{ElicitationRequest, ElicitationRequestEvent},
-    config_types::TrustLevel,
+    config_types::{CollaborationMode, CollaborationModeMask, ModeKind, Settings, TrustLevel},
     custom_prompts::CustomPrompt,
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     mcp::CallToolResult,
@@ -56,6 +56,10 @@ use codex_protocol::{
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionsEvent, RequestPermissionsResponse,
+    },
+    request_user_input::{
+        RequestUserInputAnswer, RequestUserInputEvent, RequestUserInputQuestion,
+        RequestUserInputResponse,
     },
     user_input::UserInput,
 };
@@ -98,6 +102,7 @@ impl CodexThreadImpl for CodexThread {
 pub trait ModelsManagerImpl {
     async fn get_model(&self, model_id: &Option<String>) -> String;
     async fn list_models(&self) -> Vec<ModelPreset>;
+    async fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask>;
 }
 
 #[async_trait::async_trait]
@@ -109,6 +114,10 @@ impl ModelsManagerImpl for ModelsManager {
 
     async fn list_models(&self) -> Vec<ModelPreset> {
         self.list_models(RefreshStrategy::OnlineIfUncached).await
+    }
+
+    async fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
+        self.list_collaboration_modes()
     }
 }
 
@@ -343,6 +352,14 @@ enum PendingPermissionRequest {
         call_id: String,
         permissions: PermissionProfile,
     },
+    UserInput {
+        turn_id: String,
+        call_id: String,
+        questions: Vec<RequestUserInputQuestion>,
+        question_index: usize,
+        answers: HashMap<String, RequestUserInputAnswer>,
+        option_map: HashMap<String, String>,
+    },
 }
 
 struct PendingPermissionInteraction {
@@ -360,6 +377,19 @@ fn patch_request_key(call_id: &str) -> String {
 
 fn permissions_request_key(call_id: &str) -> String {
     format!("permissions:{call_id}")
+}
+
+fn user_input_request_key(call_id: &str, question_index: usize) -> String {
+    format!("user-input:{call_id}:{question_index}")
+}
+
+fn mode_kind_as_id(mode: ModeKind) -> &'static str {
+    match mode {
+        ModeKind::Plan => "plan",
+        ModeKind::Default => "default",
+        ModeKind::PairProgramming => "pair_programming",
+        ModeKind::Execute => "execute",
+    }
 }
 
 enum SubmissionState {
@@ -537,9 +567,101 @@ impl PromptState {
         }
     }
 
+    async fn submit_user_input_answers(
+        &self,
+        turn_id: String,
+        answers: HashMap<String, RequestUserInputAnswer>,
+    ) -> Result<(), Error> {
+        self.thread
+            .submit(Op::UserInputAnswer {
+                id: turn_id,
+                response: RequestUserInputResponse { answers },
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        Ok(())
+    }
+
+    fn spawn_user_input_question_request(
+        &mut self,
+        client: &SessionClient,
+        turn_id: String,
+        call_id: String,
+        questions: Vec<RequestUserInputQuestion>,
+        question_index: usize,
+        answers: HashMap<String, RequestUserInputAnswer>,
+    ) {
+        let Some(question) = questions.get(question_index).cloned() else {
+            let thread = self.thread.clone();
+            tokio::task::spawn_local(async move {
+                if let Err(err) = thread
+                    .submit(Op::UserInputAnswer {
+                        id: turn_id,
+                        response: RequestUserInputResponse { answers },
+                    })
+                    .await
+                {
+                    warn!("Failed to submit UserInputAnswer fallback: {err}");
+                }
+            });
+            return;
+        };
+
+        let (options, option_map) = build_user_input_permission_options(&question);
+
+        let mut content_lines = vec![question.question.clone()];
+        if let Some(question_options) = question.options.as_ref() {
+            content_lines.extend(
+                question_options
+                    .iter()
+                    .map(|option| format!("- {}: {}", option.label, option.description)),
+            );
+        }
+        if question.is_other {
+            content_lines.push(
+                "- Other: custom answer will be available when the client UI supports structured input"
+                    .to_string(),
+            );
+        }
+
+        let title = if question.header.is_empty() {
+            "Need user input".to_string()
+        } else {
+            format!("Need user input: {}", question.header)
+        };
+
+        let request_key = user_input_request_key(&call_id, question_index);
+        self.spawn_permission_request(
+            client,
+            request_key,
+            PendingPermissionRequest::UserInput {
+                turn_id,
+                call_id: call_id.clone(),
+                questions,
+                question_index,
+                answers,
+                option_map,
+            },
+            ToolCallUpdate::new(
+                ToolCallId::new(call_id),
+                ToolCallUpdateFields::new()
+                    .kind(ToolKind::Think)
+                    .status(ToolCallStatus::Pending)
+                    .title(title)
+                    .raw_input(serde_json::json!({
+                        "request_type": "request_user_input",
+                        "question": question,
+                        "fallback": "session/request_permission",
+                    }))
+                    .content(vec![content_lines.join("\n").into()]),
+            ),
+            options,
+        );
+    }
+
     async fn handle_permission_request_resolved(
         &mut self,
-        _client: &SessionClient,
+        client: &SessionClient,
         request_key: String,
         response: Result<RequestPermissionResponse, Error>,
     ) -> Result<(), Error> {
@@ -635,6 +757,54 @@ impl PromptState {
                     .await
                     .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
             }
+            PendingPermissionRequest::UserInput {
+                turn_id,
+                call_id,
+                questions,
+                question_index,
+                mut answers,
+                option_map,
+            } => {
+                let Some(question) = questions.get(question_index) else {
+                    self.submit_user_input_answers(turn_id, answers).await?;
+                    return Ok(());
+                };
+
+                let selected_answer = match response.outcome {
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome {
+                        option_id,
+                        ..
+                    }) => option_map.get(option_id.0.as_ref()).cloned(),
+                    RequestPermissionOutcome::Cancelled | _ => None,
+                };
+
+                let Some(answer) = selected_answer else {
+                    self.submit_user_input_answers(turn_id, answers).await?;
+                    return Ok(());
+                };
+
+                answers.insert(
+                    question.id.clone(),
+                    RequestUserInputAnswer {
+                        answers: vec![answer],
+                    },
+                );
+
+                let next_question_index = question_index + 1;
+                if next_question_index >= questions.len() {
+                    self.submit_user_input_answers(turn_id, answers).await?;
+                    return Ok(());
+                }
+
+                self.spawn_user_input_question_request(
+                    client,
+                    turn_id,
+                    call_id,
+                    questions,
+                    next_question_index,
+                    answers,
+                );
+            }
         }
 
         Ok(())
@@ -665,6 +835,7 @@ impl PromptState {
             | EventMsg::TurnAborted(..)
             | EventMsg::EnteredReviewMode(..)
             | EventMsg::ExitedReviewMode(..)
+            | EventMsg::RequestUserInput(..)
             | EventMsg::ShutdownComplete => {
                 self.complete_web_search(client).await;
             }
@@ -1017,6 +1188,19 @@ impl PromptState {
                     drop(response_tx.send(Err(err)));
                 }
             }
+            EventMsg::RequestUserInput(event) => {
+                info!(
+                    "Request user input: call_id={}, turn_id={}, questions={}",
+                    event.call_id,
+                    event.turn_id,
+                    event.questions.len()
+                );
+                if let Err(err) = self.request_user_input(client, event).await
+                    && let Some(response_tx) = self.response_tx.take()
+                {
+                    drop(response_tx.send(Err(err)));
+                }
+            }
 
             // Ignore these events
             EventMsg::ImageGenerationBegin(..)
@@ -1058,7 +1242,6 @@ impl PromptState {
             // Used for returning a single history entry
             | EventMsg::GetHistoryEntryResponse(..)
             | EventMsg::DeprecationNotice(..)
-            | EventMsg::RequestUserInput(..)
             | EventMsg::ListRemoteSkillsResponse(..)
             | EventMsg::RemoteSkillDownloaded(..)) => {
                 warn!("Unexpected event: {:?}", e);
@@ -1754,6 +1937,35 @@ impl PromptState {
         }
     }
 
+    async fn request_user_input(
+        &mut self,
+        client: &SessionClient,
+        event: RequestUserInputEvent,
+    ) -> Result<(), Error> {
+        let RequestUserInputEvent {
+            call_id,
+            turn_id,
+            questions,
+        } = event;
+
+        if questions.is_empty() {
+            self.submit_user_input_answers(turn_id, HashMap::new())
+                .await?;
+            return Ok(());
+        }
+
+        self.spawn_user_input_question_request(
+            client,
+            turn_id,
+            call_id,
+            questions,
+            0,
+            HashMap::new(),
+        );
+
+        Ok(())
+    }
+
     async fn request_permissions(
         &mut self,
         client: &SessionClient,
@@ -1963,6 +2175,53 @@ fn build_exec_permission_options(
             },
         })
         .collect()
+}
+
+fn build_user_input_permission_options(
+    question: &RequestUserInputQuestion,
+) -> (Vec<PermissionOption>, HashMap<String, String>) {
+    let mut option_map = HashMap::new();
+    let mut options = Vec::new();
+
+    if let Some(question_options) = question.options.as_ref() {
+        for (index, option) in question_options.iter().enumerate() {
+            let option_id = format!("answer-{index}");
+            option_map.insert(option_id.clone(), option.label.clone());
+            options.push(PermissionOption::new(
+                option_id,
+                option.label.clone(),
+                PermissionOptionKind::AllowOnce,
+            ));
+        }
+    }
+
+    if question.is_other {
+        let option_id = "answer-other".to_string();
+        option_map.insert(option_id.clone(), "other".to_string());
+        options.push(PermissionOption::new(
+            option_id,
+            "Other",
+            PermissionOptionKind::AllowOnce,
+        ));
+    }
+
+    if options.is_empty() {
+        let option_id = "answer-continue".to_string();
+        option_map.insert(option_id.clone(), "continue".to_string());
+        options.push(PermissionOption::new(
+            option_id,
+            "Continue",
+            PermissionOptionKind::AllowOnce,
+        ));
+    }
+
+    options.push(PermissionOption::new(
+        "cancel",
+        "Cancel",
+        PermissionOptionKind::RejectOnce,
+    ));
+
+    (options, option_map)
 }
 
 struct ParseCommandToolCall {
@@ -2205,6 +2464,8 @@ struct ThreadActor<A> {
     resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     /// Last config options state we emitted to the client, used for deduping updates.
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
+    /// Current collaboration mode kind for this session.
+    current_collaboration_mode_kind: ModeKind,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -2231,6 +2492,7 @@ impl<A: Auth> ThreadActor<A> {
             message_rx,
             resolution_rx,
             last_sent_config_options: None,
+            current_collaboration_mode_kind: ModeKind::Default,
         }
     }
 
@@ -2518,6 +2780,37 @@ impl<A: Auth> ThreadActor<A> {
             );
         }
 
+        let collaboration_modes = self.models_manager.list_collaboration_modes().await;
+        let mut collaboration_mode_options = Vec::new();
+        for mask in collaboration_modes {
+            let Some(mode) = mask.mode else {
+                continue;
+            };
+            if !mode.is_tui_visible() {
+                continue;
+            }
+            let mode_id = mode_kind_as_id(mode);
+            if collaboration_mode_options
+                .iter()
+                .any(|opt: &SessionConfigSelectOption| opt.value.0.as_ref() == mode_id)
+            {
+                continue;
+            }
+            collaboration_mode_options.push(SessionConfigSelectOption::new(mode_id, mask.name));
+        }
+        if !collaboration_mode_options.is_empty() {
+            options.push(
+                SessionConfigOption::select(
+                    "collaboration_mode",
+                    "Collaboration Mode",
+                    mode_kind_as_id(self.current_collaboration_mode_kind),
+                    collaboration_mode_options,
+                )
+                .category(SessionConfigOptionCategory::Mode)
+                .description("Choose collaboration behavior (Default or Plan mode)"),
+            );
+        }
+
         let presets = self.models_manager.list_models().await;
 
         let current_model = self.get_current_model().await;
@@ -2621,10 +2914,60 @@ impl<A: Auth> ThreadActor<A> {
         };
         match config_id.0.as_ref() {
             "mode" => self.handle_set_mode(SessionModeId::new(value.0)).await,
+            "collaboration_mode" => self.handle_set_collaboration_mode(value).await,
             "model" => self.handle_set_config_model(value).await,
             "reasoning_effort" => self.handle_set_config_reasoning_effort(value).await,
             _ => Err(Error::invalid_params().data("Unsupported config option")),
         }
+    }
+
+    async fn handle_set_collaboration_mode(
+        &mut self,
+        value: SessionConfigValueId,
+    ) -> Result<(), Error> {
+        let mode: ModeKind = serde_json::from_value(value.0.as_ref().into())
+            .map_err(|_| Error::invalid_params().data("Unsupported collaboration mode"))?;
+        if !mode.is_tui_visible() {
+            return Err(Error::invalid_params().data("Unsupported collaboration mode"));
+        }
+
+        let masks = self.models_manager.list_collaboration_modes().await;
+        let Some(mask) = masks.iter().find(|mask| mask.mode == Some(mode)) else {
+            return Err(Error::invalid_params().data("Collaboration mode is unavailable"));
+        };
+
+        let current_mode = CollaborationMode {
+            mode: self.current_collaboration_mode_kind,
+            settings: Settings {
+                model: self.get_current_model().await,
+                reasoning_effort: self.config.model_reasoning_effort,
+                developer_instructions: self.config.developer_instructions.clone(),
+            },
+        };
+        let next_mode = current_mode.apply_mask(mask);
+
+        self.thread
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                model: None,
+                effort: None,
+                summary: None,
+                collaboration_mode: Some(next_mode.clone()),
+                personality: None,
+                windows_sandbox_level: None,
+                service_tier: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.current_collaboration_mode_kind = next_mode.mode;
+        self.config.model = Some(next_mode.settings.model.clone());
+        self.config.model_reasoning_effort = next_mode.settings.reasoning_effort;
+        self.config.developer_instructions = next_mode.settings.developer_instructions;
+
+        Ok(())
     }
 
     async fn handle_set_config_model(&mut self, value: SessionConfigValueId) -> Result<(), Error> {
@@ -3315,6 +3658,14 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_event(&mut self, Event { id, msg }: Event) {
+        if let EventMsg::TurnStarted(TurnStartedEvent {
+            collaboration_mode_kind,
+            ..
+        }) = &msg
+        {
+            self.current_collaboration_mode_kind = *collaboration_mode_kind;
+        }
+
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
         } else {
@@ -4031,6 +4382,25 @@ mod tests {
         async fn list_models(&self) -> Vec<ModelPreset> {
             all_model_presets().to_owned()
         }
+
+        async fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
+            vec![
+                CollaborationModeMask {
+                    name: "Default".to_string(),
+                    mode: Some(ModeKind::Default),
+                    model: None,
+                    reasoning_effort: None,
+                    developer_instructions: None,
+                },
+                CollaborationModeMask {
+                    name: "Plan".to_string(),
+                    mode: Some(ModeKind::Plan),
+                    model: None,
+                    reasoning_effort: None,
+                    developer_instructions: None,
+                },
+            ]
+        }
     }
 
     struct StubCodexThread {
@@ -4560,6 +4930,86 @@ mod tests {
                         turn_id,
                         decision: ReviewDecision::Denied,
                     }) if id == "approval-id" && turn_id.as_deref() == Some("turn-id")
+                ));
+
+                anyhow::Ok(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_request_user_input_submits_user_input_answer() -> anyhow::Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::with_permission_responses(vec![
+                    RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                        SelectedPermissionOutcome::new("answer-0"),
+                    )),
+                ]));
+                let session_client =
+                    SessionClient::with_client(session_id, client.clone(), Arc::default());
+                let thread = Arc::new(StubCodexThread::new());
+                let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+                let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut prompt_state = PromptState::new(
+                    "submission-id".to_string(),
+                    thread.clone(),
+                    message_tx,
+                    response_tx,
+                );
+
+                prompt_state
+                    .request_user_input(
+                        &session_client,
+                        RequestUserInputEvent {
+                            call_id: "call-id".to_string(),
+                            turn_id: "turn-id".to_string(),
+                            questions: vec![RequestUserInputQuestion {
+                                id: "confirm_path".to_string(),
+                                header: "Confirm".to_string(),
+                                question: "Continue?".to_string(),
+                                is_other: false,
+                                is_secret: false,
+                                options: Some(vec![
+                                    codex_protocol::request_user_input::RequestUserInputQuestionOption {
+                                        label: "yes".to_string(),
+                                        description: "Continue".to_string(),
+                                    },
+                                    codex_protocol::request_user_input::RequestUserInputQuestionOption {
+                                        label: "no".to_string(),
+                                        description: "Stop".to_string(),
+                                    },
+                                ]),
+                            }],
+                        },
+                    )
+                    .await?;
+
+                let ThreadMessage::PermissionRequestResolved {
+                    submission_id,
+                    request_key,
+                    response,
+                } = message_rx.recv().await.unwrap()
+                else {
+                    panic!("expected permission resolution message");
+                };
+                assert_eq!(submission_id, "submission-id");
+                prompt_state
+                    .handle_permission_request_resolved(&session_client, request_key, response)
+                    .await?;
+
+                let ops = thread.ops.lock().unwrap();
+                assert!(matches!(
+                    ops.last(),
+                    Some(Op::UserInputAnswer { id, response })
+                        if id == "turn-id"
+                            && response
+                                .answers
+                                .get("confirm_path")
+                                .is_some_and(|answer| answer.answers == vec!["yes".to_string()])
                 ));
 
                 anyhow::Ok(())
