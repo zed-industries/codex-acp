@@ -582,6 +582,27 @@ impl PromptState {
         Ok(())
     }
 
+    async fn complete_user_input_tool_call(&self, client: &SessionClient, call_id: String) {
+        client
+            .send_tool_call_update(ToolCallUpdate::new(
+                ToolCallId::new(call_id),
+                ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+            ))
+            .await;
+    }
+
+    async fn finalize_user_input_answers(
+        &self,
+        client: &SessionClient,
+        call_id: String,
+        turn_id: String,
+        answers: HashMap<String, RequestUserInputAnswer>,
+    ) -> Result<(), Error> {
+        self.submit_user_input_answers(turn_id, answers).await?;
+        self.complete_user_input_tool_call(client, call_id).await;
+        Ok(())
+    }
+
     fn spawn_user_input_question_request(
         &mut self,
         client: &SessionClient,
@@ -593,6 +614,7 @@ impl PromptState {
     ) {
         let Some(question) = questions.get(question_index).cloned() else {
             let thread = self.thread.clone();
+            let client = client.clone();
             tokio::task::spawn_local(async move {
                 if let Err(err) = thread
                     .submit(Op::UserInputAnswer {
@@ -602,7 +624,15 @@ impl PromptState {
                     .await
                 {
                     warn!("Failed to submit UserInputAnswer fallback: {err}");
+                    return;
                 }
+
+                client
+                    .send_tool_call_update(ToolCallUpdate::new(
+                        ToolCallId::new(call_id),
+                        ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+                    ))
+                    .await;
             });
             return;
         };
@@ -766,7 +796,8 @@ impl PromptState {
                 option_map,
             } => {
                 let Some(question) = questions.get(question_index) else {
-                    self.submit_user_input_answers(turn_id, answers).await?;
+                    self.finalize_user_input_answers(client, call_id, turn_id, answers)
+                        .await?;
                     return Ok(());
                 };
 
@@ -779,7 +810,8 @@ impl PromptState {
                 };
 
                 let Some(answer) = selected_answer else {
-                    self.submit_user_input_answers(turn_id, answers).await?;
+                    self.finalize_user_input_answers(client, call_id, turn_id, answers)
+                        .await?;
                     return Ok(());
                 };
 
@@ -792,7 +824,8 @@ impl PromptState {
 
                 let next_question_index = question_index + 1;
                 if next_question_index >= questions.len() {
-                    self.submit_user_input_answers(turn_id, answers).await?;
+                    self.finalize_user_input_answers(client, call_id, turn_id, answers)
+                        .await?;
                     return Ok(());
                 }
 
@@ -1949,7 +1982,7 @@ impl PromptState {
         } = event;
 
         if questions.is_empty() {
-            self.submit_user_input_answers(turn_id, HashMap::new())
+            self.finalize_user_input_answers(client, call_id, turn_id, HashMap::new())
                 .await?;
             return Ok(());
         }
