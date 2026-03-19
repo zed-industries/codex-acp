@@ -34,6 +34,7 @@ use codex_protocol::{
     config_types::{CollaborationMode, CollaborationModeMask, ModeKind, Settings, TrustLevel},
     custom_prompts::CustomPrompt,
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
+    items::TurnItem,
     mcp::CallToolResult,
     models::{MacOsSeatbeltProfileExtensions, PermissionProfile, ResponseItem, WebSearchAction},
     openai_models::{ModelPreset, ReasoningEffort},
@@ -1089,6 +1090,10 @@ impl PromptState {
                 item,
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
+                if let TurnItem::Plan(plan_item) = item {
+                    // Fallback for ACP clients that do not render plan items natively.
+                    client.send_agent_text(plan_item.text).await;
+                }
             }
             EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id }) => {
                 info!(
