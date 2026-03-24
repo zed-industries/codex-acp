@@ -1,14 +1,15 @@
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthEnvVar, AuthMethod, AuthMethodAgent, AuthMethodEnvVar,
     AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Error, Implementation,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, McpServerHttp,
-    McpServerStdio, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
-    PromptResponse, ProtocolVersion, SessionCapabilities, SessionCloseCapabilities, SessionId,
-    SessionInfo, SessionListCapabilities, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
-    SetSessionModelRequest, SetSessionModelResponse,
+    ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Error, ForkSessionRequest,
+    ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
+    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
+    SessionCapabilities, SessionCloseCapabilities, SessionForkCapabilities, SessionId, SessionInfo,
+    SessionListCapabilities, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest,
+    SetSessionModelResponse,
 };
 use codex_core::{
     CodexAuth, NewThread, RolloutRecorder, ThreadManager, ThreadSortKey,
@@ -241,7 +242,8 @@ impl Agent for CodexAgent {
 
         agent_capabilities.session_capabilities = SessionCapabilities::new()
             .close(SessionCloseCapabilities::new())
-            .list(SessionListCapabilities::new());
+            .list(SessionListCapabilities::new())
+            .fork(SessionForkCapabilities::new());
 
         let mut auth_methods = vec![
             CodexAuthMethod::ChatGpt.into(),
@@ -525,6 +527,81 @@ impl Agent for CodexAgent {
             .unwrap()
             .remove(&request.session_id);
         Ok(CloseSessionResponse::new())
+    }
+
+    async fn fork_session(
+        &self,
+        request: ForkSessionRequest,
+    ) -> Result<ForkSessionResponse, Error> {
+        info!(
+            "Forking session: {} into new session",
+            request.session_id
+        );
+        self.check_auth().await?;
+
+        let ForkSessionRequest {
+            session_id: source_session_id,
+            cwd,
+            mcp_servers,
+            ..
+        } = request;
+
+        // Find the source session's rollout path on disk
+        let rollout_path = find_thread_path_by_id_str(
+            &self.config.codex_home,
+            source_session_id.0.as_ref(),
+        )
+        .await
+        .map_err(|e| Error::internal_error().data(e.to_string()))?
+        .ok_or_else(|| {
+            Error::resource_not_found(Some(format!(
+                "Source session not found: {}",
+                source_session_id
+            )))
+        })?;
+
+        let config = self.build_session_config(&cwd, mcp_servers)?;
+
+        // Fork the thread — this creates a new thread with the source's full history
+        let NewThread {
+            thread_id,
+            thread,
+            session_configured: _,
+        } = Box::pin(self.thread_manager.fork_thread(
+            usize::MAX, // Include all user messages from source
+            config.clone(),
+            rollout_path,
+            false,
+        ))
+        .await
+        .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        let new_session_id = Self::session_id_from_thread_id(thread_id);
+        self.session_roots
+            .lock()
+            .unwrap()
+            .insert(new_session_id.clone(), config.cwd.clone());
+
+        let thread = Rc::new(Thread::new(
+            new_session_id.clone(),
+            thread,
+            self.auth_manager.clone(),
+            self.thread_manager.get_models_manager(),
+            self.client_capabilities.clone(),
+            config,
+        ));
+        let load = thread.load().await?;
+
+        self.sessions
+            .borrow_mut()
+            .insert(new_session_id.clone(), thread);
+
+        info!("Forked session {} -> {}", source_session_id, new_session_id);
+
+        Ok(ForkSessionResponse::new(new_session_id)
+            .modes(load.modes)
+            .models(load.models)
+            .config_options(load.config_options))
     }
 
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {

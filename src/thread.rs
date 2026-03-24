@@ -9,7 +9,7 @@ use std::{
 
 use agent_client_protocol::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, Client, ClientCapabilities,
-    ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
+    ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Cost, Diff, EmbeddedResource,
     EmbeddedResourceResource, Error, LoadSessionResponse, Meta, ModelId, ModelInfo,
     PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
     PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
@@ -471,6 +471,22 @@ struct ActiveCommand {
     file_extension: Option<String>,
 }
 
+/// Cumulative token usage tracked across a prompt's turn.
+#[derive(Debug, Default)]
+struct AccumulatedUsage {
+    input_tokens: i64,
+    output_tokens: i64,
+    cached_input_tokens: i64,
+    reasoning_output_tokens: i64,
+}
+
+impl AccumulatedUsage {
+    #[allow(dead_code)]
+    fn total_tokens(&self) -> i64 {
+        self.input_tokens + self.output_tokens + self.cached_input_tokens + self.reasoning_output_tokens
+    }
+}
+
 struct PromptState {
     submission_id: String,
     active_commands: HashMap<String, ActiveCommand>,
@@ -482,6 +498,7 @@ struct PromptState {
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
+    accumulated_usage: AccumulatedUsage,
 }
 
 impl PromptState {
@@ -502,6 +519,7 @@ impl PromptState {
             response_tx: Some(response_tx),
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
+            accumulated_usage: AccumulatedUsage::default(),
         }
     }
 
@@ -694,17 +712,34 @@ impl PromptState {
             }) => {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
             }
-            EventMsg::TokenCount(TokenCountEvent { info, .. }) => {
-                if let Some(info) = info
-                    && let Some(size) = info.model_context_window {
-                        let used = info.last_token_usage.tokens_in_context_window().max(0) as u64;
+            EventMsg::TokenCount(TokenCountEvent { info, rate_limits }) => {
+                if let Some(info) = info {
+                    // Accumulate token usage across the turn
+                    let last = &info.last_token_usage;
+                    self.accumulated_usage.input_tokens += last.input_tokens;
+                    self.accumulated_usage.output_tokens += last.output_tokens;
+                    self.accumulated_usage.cached_input_tokens += last.cached_input_tokens;
+                    self.accumulated_usage.reasoning_output_tokens += last.reasoning_output_tokens;
+
+                    if let Some(size) = info.model_context_window {
+                        let used = last.tokens_in_context_window().max(0) as u64;
+                        let mut update = UsageUpdate::new(used, size as u64);
+
+                        // Include cost if credits info is available from rate limits
+                        if let Some(rate_limits) = &rate_limits
+                            && let Some(credits) = &rate_limits.credits
+                            && let Some(balance) = &credits.balance
+                        {
+                            if let Ok(amount) = balance.parse::<f64>() {
+                                update = update.cost(Cost::new(amount, "USD"));
+                            }
+                        }
+
                         client
-                            .send_notification(SessionUpdate::UsageUpdate(UsageUpdate::new(
-                                used,
-                                size as u64,
-                            )))
+                            .send_notification(SessionUpdate::UsageUpdate(update))
                             .await;
                     }
+                }
             }
             EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
@@ -4682,6 +4717,73 @@ mod tests {
                             last_agent_message: None,
                             turn_id: id.to_string(),
                         }));
+                    } else if prompt == "emit-token-counts" {
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        use codex_protocol::protocol::{TokenUsage, TokenUsageInfo, RateLimitSnapshot, CreditsSnapshot};
+                        // Send two TokenCount events to test accumulation
+                        send(EventMsg::TokenCount(TokenCountEvent {
+                            info: Some(TokenUsageInfo {
+                                total_token_usage: TokenUsage {
+                                    input_tokens: 100,
+                                    cached_input_tokens: 20,
+                                    output_tokens: 50,
+                                    reasoning_output_tokens: 10,
+                                    total_tokens: 180,
+                                },
+                                last_token_usage: TokenUsage {
+                                    input_tokens: 100,
+                                    cached_input_tokens: 20,
+                                    output_tokens: 50,
+                                    reasoning_output_tokens: 10,
+                                    total_tokens: 180,
+                                },
+                                model_context_window: Some(128000),
+                            }),
+                            rate_limits: Some(RateLimitSnapshot {
+                                limit_id: None,
+                                limit_name: None,
+                                primary: None,
+                                secondary: None,
+                                credits: Some(CreditsSnapshot {
+                                    has_credits: true,
+                                    unlimited: false,
+                                    balance: Some("1.50".to_string()),
+                                }),
+                                plan_type: None,
+                            }),
+                        }));
+                        // Second event to verify accumulation
+                        send(EventMsg::TokenCount(TokenCountEvent {
+                            info: Some(TokenUsageInfo {
+                                total_token_usage: TokenUsage {
+                                    input_tokens: 200,
+                                    cached_input_tokens: 40,
+                                    output_tokens: 100,
+                                    reasoning_output_tokens: 20,
+                                    total_tokens: 360,
+                                },
+                                last_token_usage: TokenUsage {
+                                    input_tokens: 100,
+                                    cached_input_tokens: 20,
+                                    output_tokens: 50,
+                                    reasoning_output_tokens: 10,
+                                    total_tokens: 180,
+                                },
+                                model_context_window: Some(128000),
+                            }),
+                            rate_limits: None,
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id: id.to_string(),
+                        }));
                     } else if prompt == "emit-web-search-concurrent" {
                         let send = |msg| {
                             self.op_tx
@@ -6067,5 +6169,68 @@ mod tests {
         assert!(names.contains(&"mcp"), "missing /mcp");
         assert!(names.contains(&"skills"), "missing /skills");
         assert!(names.contains(&"debug-config"), "missing /debug-config");
+    }
+
+    #[tokio::test]
+    async fn test_usage_accumulation_with_cost() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["emit-token-counts".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+
+        // Collect all UsageUpdate notifications
+        let usage_updates: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::UsageUpdate(u) => Some(u.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // Should have 2 usage updates (one per TokenCount event)
+        assert_eq!(
+            usage_updates.len(),
+            2,
+            "expected 2 usage updates, got {usage_updates:?}"
+        );
+
+        // Both should have size = 128000
+        assert_eq!(usage_updates[0].size, 128000);
+        assert_eq!(usage_updates[1].size, 128000);
+
+        // First should include cost from credits balance
+        assert!(
+            usage_updates[0].cost.is_some(),
+            "first update should include cost from credits"
+        );
+        let cost = usage_updates[0].cost.as_ref().unwrap();
+        assert!((cost.amount - 1.50).abs() < f64::EPSILON, "cost should be 1.50, got {}", cost.amount);
+        assert_eq!(cost.currency, "USD");
+
+        // Second should NOT include cost (no rate_limits)
+        assert!(
+            usage_updates[1].cost.is_none(),
+            "second update should not include cost (no rate_limits)"
+        );
+
+        Ok(())
     }
 }
