@@ -147,6 +147,10 @@ impl AcpFs {
             ))
         }
     }
+
+    fn should_prefer_local_read(path: &std::path::Path) -> bool {
+        matches!(path.extension().and_then(std::ffi::OsStr::to_str), Some("svelte"))
+    }
 }
 
 impl codex_apply_patch::Fs for AcpFs {
@@ -155,6 +159,14 @@ impl codex_apply_patch::Fs for AcpFs {
             return StdFs.read_to_string(path);
         }
         let path = self.ensure_within_root(path)?;
+        // ACP stdio framing is newline-delimited JSON-RPC. If a client leaks raw
+        // Svelte buffer contents onto stdout, patch application can desynchronize.
+        // Prefer local reads for Svelte files as a targeted workaround.
+        if Self::should_prefer_local_read(&path)
+            && let Ok(contents) = StdFs.read_to_string(&path)
+        {
+            return Ok(contents);
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         self.local_spawner.spawn(FsTask::ReadFile {
             session_id: self.session_id.clone(),
@@ -203,6 +215,9 @@ impl codex_core::codex::Fs for AcpFs {
             Ok(path) => path,
             Err(e) => return Box::pin(async move { Err(e) }),
         };
+        if Self::should_prefer_local_read(&path) {
+            return StdFs.file_buffer(&path, limit);
+        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.local_spawner.spawn(FsTask::ReadFileLimit {
             session_id: self.session_id.clone(),
