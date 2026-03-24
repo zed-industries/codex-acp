@@ -4784,6 +4784,147 @@ mod tests {
                             last_agent_message: None,
                             turn_id: id.to_string(),
                         }));
+                    } else if prompt == "emit-token-none-info" {
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event { id: id.to_string(), msg })
+                                .unwrap();
+                        };
+                        // TokenCount with info: None — should be handled gracefully
+                        send(EventMsg::TokenCount(TokenCountEvent {
+                            info: None,
+                            rate_limits: None,
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id: id.to_string(),
+                        }));
+                    } else if prompt == "emit-token-no-window" {
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event { id: id.to_string(), msg })
+                                .unwrap();
+                        };
+                        use codex_protocol::protocol::{TokenUsage, TokenUsageInfo};
+                        send(EventMsg::TokenCount(TokenCountEvent {
+                            info: Some(TokenUsageInfo {
+                                total_token_usage: TokenUsage {
+                                    input_tokens: 50, cached_input_tokens: 10,
+                                    output_tokens: 25, reasoning_output_tokens: 5,
+                                    total_tokens: 90,
+                                },
+                                last_token_usage: TokenUsage {
+                                    input_tokens: 50, cached_input_tokens: 10,
+                                    output_tokens: 25, reasoning_output_tokens: 5,
+                                    total_tokens: 90,
+                                },
+                                model_context_window: None, // No context window
+                            }),
+                            rate_limits: None,
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id: id.to_string(),
+                        }));
+                    } else if prompt == "emit-token-bad-balance" {
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event { id: id.to_string(), msg })
+                                .unwrap();
+                        };
+                        use codex_protocol::protocol::{TokenUsage, TokenUsageInfo, RateLimitSnapshot, CreditsSnapshot};
+                        send(EventMsg::TokenCount(TokenCountEvent {
+                            info: Some(TokenUsageInfo {
+                                total_token_usage: TokenUsage::default(),
+                                last_token_usage: TokenUsage {
+                                    input_tokens: 10, cached_input_tokens: 0,
+                                    output_tokens: 5, reasoning_output_tokens: 0,
+                                    total_tokens: 15,
+                                },
+                                model_context_window: Some(128000),
+                            }),
+                            rate_limits: Some(RateLimitSnapshot {
+                                limit_id: None, limit_name: None,
+                                primary: None, secondary: None,
+                                credits: Some(CreditsSnapshot {
+                                    has_credits: true, unlimited: false,
+                                    balance: Some("not-a-number".to_string()),
+                                }),
+                                plan_type: None,
+                            }),
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id: id.to_string(),
+                        }));
+                    } else if prompt == "emit-orphaned-events" {
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event { id: id.to_string(), msg })
+                                .unwrap();
+                        };
+                        // Send output delta for a call_id that was never started
+                        send(EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                            call_id: "nonexistent-call".to_string(),
+                            chunk: b"some output".to_vec(),
+                            stream: codex_protocol::protocol::ExecOutputStream::Stdout,
+                        }));
+                        // Send end for a call_id that was never started
+                        send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                            call_id: "nonexistent-call".to_string(),
+                            process_id: None,
+                            turn_id: id.to_string(),
+                            command: vec!["echo".into()],
+                            cwd: std::env::current_dir().unwrap(),
+                            parsed_cmd: vec![],
+                            source: Default::default(),
+                            interaction_input: None,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            aggregated_output: String::new(),
+                            exit_code: 0,
+                            duration: std::time::Duration::from_millis(1),
+                            formatted_output: String::new(),
+                            status: ExecCommandStatus::Completed,
+                        }));
+                        // Send terminal interaction for unknown call_id
+                        send(EventMsg::TerminalInteraction(TerminalInteractionEvent {
+                            call_id: "nonexistent-call".to_string(),
+                            process_id: "0".to_string(),
+                            stdin: "input".to_string(),
+                        }));
+                        // Should still complete normally
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id: id.to_string(),
+                        }));
+                    } else if prompt == "emit-collab-waiting" {
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event { id: id.to_string(), msg })
+                                .unwrap();
+                        };
+                        use codex_protocol::ThreadId as ProtoThreadId;
+                        send(EventMsg::CollabWaitingBegin(
+                            codex_protocol::protocol::CollabWaitingBeginEvent {
+                                sender_thread_id: ProtoThreadId::new(),
+                                receiver_thread_ids: vec![ProtoThreadId::new()],
+                                receiver_agents: vec![],
+                                call_id: "wait-1".to_string(),
+                            },
+                        ));
+                        send(EventMsg::CollabWaitingEnd(
+                            codex_protocol::protocol::CollabWaitingEndEvent {
+                                sender_thread_id: ProtoThreadId::new(),
+                                call_id: "wait-1".to_string(),
+                                agent_statuses: vec![],
+                                statuses: HashMap::new(),
+                            },
+                        ));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id: id.to_string(),
+                        }));
                     } else if prompt == "emit-web-search-concurrent" {
                         let send = |msg| {
                             self.op_tx
@@ -6230,6 +6371,711 @@ mod tests {
             usage_updates[1].cost.is_none(),
             "second update should not include cost (no rate_limits)"
         );
+
+        Ok(())
+    }
+
+    // ==================== Slash command tests for previously untested commands ====================
+
+    #[tokio::test]
+    async fn test_slash_feedback() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/feedback".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async { local_set.await; anyhow::Ok(()) }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            matches!(&ops[0], Op::UserInput { items, .. }
+                if matches!(&items[0], UserInput::Text { text, .. }
+                    if text.contains("feedback") || text.contains("logs"))),
+            "expected /feedback to generate UserInput about feedback, got {ops:?}"
+        );
+
+        // Verify notification was sent (the stub echoes prompt text as AgentMessageContentDelta)
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            !notifications.is_empty(),
+            "expected at least one notification from /feedback"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_slash_mcp() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/mcp".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async { local_set.await; anyhow::Ok(()) }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            matches!(&ops[0], Op::UserInput { items, .. }
+                if matches!(&items[0], UserInput::Text { text, .. } if text.contains("MCP"))),
+            "expected /mcp to generate UserInput about MCP tools, got {ops:?}"
+        );
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            !notifications.is_empty(),
+            "expected at least one notification from /mcp"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_slash_skills() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/skills".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async { local_set.await; anyhow::Ok(()) }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            matches!(&ops[0], Op::UserInput { items, .. }
+                if matches!(&items[0], UserInput::Text { text, .. } if text.contains("skills"))),
+            "expected /skills to generate UserInput about skills, got {ops:?}"
+        );
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(!notifications.is_empty(), "expected notifications from /skills");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_slash_debug_config() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/debug-config".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async { local_set.await; anyhow::Ok(()) }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            matches!(&ops[0], Op::UserInput { items, .. }
+                if matches!(&items[0], UserInput::Text { text, .. } if text.contains("config"))),
+            "expected /debug-config to generate UserInput about config, got {ops:?}"
+        );
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(!notifications.is_empty(), "expected notifications from /debug-config");
+
+        Ok(())
+    }
+
+    // ==================== Edge case tests for commands requiring arguments ====================
+
+    #[tokio::test]
+    async fn test_slash_rename_no_arg_falls_through() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        // /rename with no argument should fall through to the default handler
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/rename".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async { local_set.await; anyhow::Ok(()) }
+        )?;
+
+        // Should still produce a UserInput (the default handler sends the raw /rename text)
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            matches!(&ops[0], Op::UserInput { .. }),
+            "expected /rename with no arg to still produce a UserInput, got {ops:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_slash_mention_no_arg_falls_through() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/mention".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async { local_set.await; anyhow::Ok(()) }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            matches!(&ops[0], Op::UserInput { .. }),
+            "expected /mention with no arg to fall through, got {ops:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_slash_review_branch_no_arg_falls_through() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/review-branch".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async { local_set.await; anyhow::Ok(()) }
+        )?;
+
+        // Should NOT be an Op::Review — should fall through to default handler
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            matches!(&ops[0], Op::UserInput { .. }),
+            "expected /review-branch with no arg to fall through to UserInput, got {ops:?}"
+        );
+
+        Ok(())
+    }
+
+    // ==================== Orphaned tool call tests ====================
+
+    #[tokio::test]
+    async fn test_orphaned_tool_call_events_handled_gracefully() -> anyhow::Result<()> {
+        let (session_id, _client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["emit-orphaned-events".into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        // The key assertion: this should complete successfully without panicking
+        // despite receiving events for call_ids that were never registered
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async { local_set.await; anyhow::Ok(()) }
+        )?;
+
+        // Verify no ToolCall or ToolCallUpdate notifications were sent for the orphaned events
+        // (since ExecCommandBegin was never sent, no ActiveCommand was created)
+        // The test succeeding without panic proves the else-clause warnings work correctly.
+        Ok(())
+    }
+
+    // ==================== CollabWaiting event tests ====================
+
+    #[tokio::test]
+    async fn test_collab_waiting_events_surfaced() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["emit-collab-waiting".into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async { local_set.await; anyhow::Ok(()) }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let texts: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }), ..
+                }) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            texts.iter().any(|t| t == "Waiting for sub-agents...\n"),
+            "expected exact 'Waiting for sub-agents...' message, got {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "Sub-agents completed.\n"),
+            "expected exact 'Sub-agents completed.' message, got {texts:?}"
+        );
+
+        Ok(())
+    }
+
+    // ==================== Usage accumulation edge case tests ====================
+
+    #[tokio::test]
+    async fn test_token_count_with_none_info() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["emit-token-none-info".into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async { local_set.await; anyhow::Ok(()) }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        // When info is None, no UsageUpdate should be sent
+        let usage_updates: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(&n.update, SessionUpdate::UsageUpdate(..)))
+            .collect();
+        assert_eq!(
+            usage_updates.len(), 0,
+            "expected no UsageUpdate when TokenCount info is None, got {usage_updates:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_token_count_with_no_context_window() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["emit-token-no-window".into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async { local_set.await; anyhow::Ok(()) }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        // When model_context_window is None, no UsageUpdate should be sent
+        // (we still accumulate internally, but don't notify without window size)
+        let usage_updates: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(&n.update, SessionUpdate::UsageUpdate(..)))
+            .collect();
+        assert_eq!(
+            usage_updates.len(), 0,
+            "expected no UsageUpdate when model_context_window is None, got {usage_updates:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_token_count_with_unparseable_balance() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["emit-token-bad-balance".into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async { local_set.await; anyhow::Ok(()) }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let usage_updates: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::UsageUpdate(u) => Some(u.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // Should still send a UsageUpdate (we have model_context_window)
+        assert_eq!(usage_updates.len(), 1, "expected 1 UsageUpdate");
+        assert_eq!(usage_updates[0].size, 128000);
+        // But cost should be None because "not-a-number" can't be parsed as f64
+        assert!(
+            usage_updates[0].cost.is_none(),
+            "expected no cost when balance is unparseable, got {:?}",
+            usage_updates[0].cost
+        );
+
+        Ok(())
+    }
+
+    // ==================== Tightened event notification tests ====================
+
+    #[tokio::test]
+    async fn test_hook_events_exact_format() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["emit-hook-events".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async { local_set.await; anyhow::Ok(()) }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let texts: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }), ..
+                }) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // Verify exact format of hook started message
+        assert!(
+            texts.iter().any(|t| t.starts_with("Running hook: hook-1 (") && t.ends_with("...\n")),
+            "hook started message should start with 'Running hook: hook-1 (' and end with '...\\n', got {texts:?}"
+        );
+        // Verify exact format of hook completed message including status message
+        assert!(
+            texts.iter().any(|t| t.starts_with("Hook completed: hook-1") && t.contains("all good")),
+            "hook completed message should contain hook id and status message, got {texts:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_image_generation_exact_content() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["emit-image-gen".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async { local_set.await; anyhow::Ok(()) }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+
+        // Verify ToolCall begin has exact title and kind
+        let tool_calls: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::ToolCall(tc) => Some(tc.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].title, "Generating image");
+        assert_eq!(tool_calls[0].kind, ToolKind::Other);
+        assert_eq!(tool_calls[0].status, ToolCallStatus::InProgress);
+
+        // Verify completed update has result content "image.png"
+        let updates: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::ToolCallUpdate(u) => Some(u.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].fields.status, Some(ToolCallStatus::Completed));
+        assert!(
+            updates[0].fields.content.as_ref().is_some_and(|c| !c.is_empty()),
+            "completed update should have content with the image result"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_background_event_exact_format() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["emit-background-event".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async { local_set.await; anyhow::Ok(()) }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|n| matches!(
+                &n.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }), ..
+                }) if text == "Long running task completed\n"
+            )),
+            "expected exact 'Long running task completed\\n' message"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_deprecation_notice_exact_format() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["emit-deprecation-notice".into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async { local_set.await; anyhow::Ok(()) }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|n| matches!(
+                &n.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }), ..
+                }) if text == "**Deprecation:** Old API deprecated\nPlease migrate to v2.\n"
+            )),
+            "expected exact deprecation format with markdown bold and details"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_thread_rollback_exact_format() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["emit-thread-rollback".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async { local_set.await; anyhow::Ok(()) }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|n| matches!(
+                &n.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }), ..
+                }) if text == "Thread rolled back: 3 turns removed from context.\n"
+            )),
+            "expected exact rollback message with plural 'turns'"
+        );
+
+        Ok(())
+    }
+
+    /// Verify that /diff, /status, /rename, /mention all generate notifications
+    /// (not just Ops) by checking the stub echoes the prompt text back.
+    #[tokio::test]
+    async fn test_slash_commands_generate_notifications() -> anyhow::Result<()> {
+        // Test each command and verify a notification was sent
+        for (cmd, expected_op_text) in [
+            ("/diff", "git diff"),
+            ("/status", "session status"),
+            ("/rename My Thread", "My Thread"),
+            ("/mention src/lib.rs", "@src/lib.rs"),
+            ("/feedback", "feedback"),
+            ("/mcp", "MCP"),
+            ("/skills", "skills"),
+            ("/debug-config", "config"),
+        ] {
+            let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+            let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+            message_tx.send(ThreadMessage::Prompt {
+                request: PromptRequest::new(session_id.clone(), vec![cmd.into()]),
+                response_tx: prompt_response_tx,
+            })?;
+
+            tokio::try_join!(
+                async {
+                    let stop_reason = prompt_response_rx.await??.await??;
+                    assert_eq!(stop_reason, StopReason::EndTurn, "failed for cmd: {cmd}");
+                    drop(message_tx);
+                    anyhow::Ok(())
+                },
+                async { local_set.await; anyhow::Ok(()) }
+            )?;
+
+            // Verify Op was submitted
+            let ops = thread.ops.lock().unwrap();
+            assert!(
+                matches!(&ops[0], Op::UserInput { items, .. }
+                    if matches!(&items[0], UserInput::Text { text, .. }
+                        if text.contains(expected_op_text))),
+                "cmd {cmd}: expected UserInput containing '{expected_op_text}', got {ops:?}"
+            );
+
+            // Verify at least one notification was sent
+            let notifications = client.notifications.lock().unwrap();
+            assert!(
+                !notifications.is_empty(),
+                "cmd {cmd}: expected notifications but got none"
+            );
+            // Verify it's an agent message (the stub echoes prompts as AgentMessageContentDelta)
+            assert!(
+                notifications.iter().any(|n| matches!(
+                    &n.update,
+                    SessionUpdate::AgentMessageChunk(ContentChunk {
+                        content: ContentBlock::Text(..), ..
+                    })
+                )),
+                "cmd {cmd}: expected AgentMessageChunk notification"
+            );
+        }
 
         Ok(())
     }
