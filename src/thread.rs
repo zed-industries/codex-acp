@@ -31,7 +31,7 @@ use codex_core::{
 };
 use codex_protocol::{
     approvals::{ElicitationRequest, ElicitationRequestEvent},
-    config_types::{CollaborationMode, ModeKind, Settings, TrustLevel},
+    config_types::{CollaborationMode, ModeKind, ServiceTier, Settings, TrustLevel},
     custom_prompts::CustomPrompt,
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     items::TurnItem,
@@ -2935,6 +2935,11 @@ impl<A: Auth> ThreadActor<A> {
             ),
             AvailableCommand::new("undo", "undo Codex’s most recent turn"),
             AvailableCommand::new("logout", "logout of Codex"),
+            AvailableCommand::new("fast", "toggle fast mode for this session").input(
+                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                    "optional: on|off|status",
+                )),
+            ),
             AvailableCommand::new("diff", "show git diff including untracked files"),
             AvailableCommand::new(
                 "status",
@@ -2969,6 +2974,10 @@ impl<A: Auth> ThreadActor<A> {
             .map(|p| p.label)
             .unwrap_or("unknown");
         status.push_str(&format!("**Mode:** {mode_name}\n"));
+        status.push_str(&format!(
+            "**Service Tier:** {}\n",
+            format_service_tier_name(self.config.service_tier)
+        ));
 
         // Working directory
         status.push_str(&format!(
@@ -2978,6 +2987,31 @@ impl<A: Auth> ThreadActor<A> {
 
         status.push('\n');
         status
+    }
+
+    async fn set_service_tier(
+        &mut self,
+        service_tier: Option<ServiceTier>,
+    ) -> Result<(), Error> {
+        self.thread
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                model: None,
+                effort: None,
+                summary: None,
+                collaboration_mode: None,
+                personality: None,
+                windows_sandbox_level: None,
+                service_tier: Some(service_tier),
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.config.service_tier = service_tier;
+
+        Ok(())
     }
 
     async fn load_custom_prompts(&mut self) -> oneshot::Receiver<Result<Vec<CustomPrompt>, Error>> {
@@ -3072,6 +3106,14 @@ impl<A: Auth> ThreadActor<A> {
         Some((model.to_owned(), reasoning))
     }
 
+    fn current_service_tier_id(&self) -> &'static str {
+        match self.config.service_tier {
+            Some(ServiceTier::Fast) => "fast",
+            Some(ServiceTier::Flex) => "flex",
+            None => "standard",
+        }
+    }
+
     async fn config_options(&self) -> Result<Vec<SessionConfigOption>, Error> {
         let mut options = Vec::new();
 
@@ -3123,6 +3165,24 @@ impl<A: Auth> ThreadActor<A> {
             SessionConfigOption::select("model", "Model", current_model, model_select_options)
                 .category(SessionConfigOptionCategory::Model)
                 .description("Choose which model Codex should use"),
+        );
+
+        options.push(
+            SessionConfigOption::select(
+                "service_tier",
+                "Service Tier",
+                self.current_service_tier_id(),
+                vec![
+                    SessionConfigSelectOption::new("standard", "Standard")
+                        .description("Use the default response tier"),
+                    SessionConfigSelectOption::new("fast", "Fast")
+                        .description("Prefer the fast response tier"),
+                    SessionConfigSelectOption::new("flex", "Flex")
+                        .description("Use the flex response tier when available"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::Model)
+            .description("Choose the response service tier for this session"),
         );
 
         // Reasoning effort selector (only if the current preset exists and has >1 supported effort)
@@ -3198,6 +3258,7 @@ impl<A: Auth> ThreadActor<A> {
         match config_id.0.as_ref() {
             "mode" => self.handle_set_mode(SessionModeId::new(value.0)).await,
             "model" => self.handle_set_config_model(value).await,
+            "service_tier" => self.handle_set_config_service_tier(value).await,
             "reasoning_effort" => self.handle_set_config_reasoning_effort(value).await,
             _ => Err(Error::invalid_params().data("Unsupported config option")),
         }
@@ -3254,6 +3315,20 @@ impl<A: Auth> ThreadActor<A> {
         self.config.model_reasoning_effort = effort_to_use;
 
         Ok(())
+    }
+
+    async fn handle_set_config_service_tier(
+        &mut self,
+        value: SessionConfigValueId,
+    ) -> Result<(), Error> {
+        let service_tier = match value.0.as_ref() {
+            "standard" => None,
+            "fast" => Some(ServiceTier::Fast),
+            "flex" => Some(ServiceTier::Flex),
+            _ => return Err(Error::invalid_params().data("Unsupported service tier")),
+        };
+
+        self.set_service_tier(service_tier).await
     }
 
     async fn handle_set_config_reasoning_effort(
@@ -3405,6 +3480,53 @@ impl<A: Auth> ThreadActor<A> {
                 "logout" => {
                     self.auth.logout()?;
                     return Err(Error::auth_required());
+                }
+                "fast" => {
+                    let tier = match rest.trim().to_ascii_lowercase().as_str() {
+                        "" => {
+                            if matches!(self.config.service_tier, Some(ServiceTier::Fast)) {
+                                None
+                            } else {
+                                Some(ServiceTier::Fast)
+                            }
+                        }
+                        "on" => Some(ServiceTier::Fast),
+                        "off" => None,
+                        "status" => {
+                            let client = self.client.clone();
+                            let status = if matches!(self.config.service_tier, Some(ServiceTier::Fast))
+                            {
+                                "on"
+                            } else {
+                                "off"
+                            };
+                            client
+                                .send_agent_text(format!("Fast mode is {status}.\n"))
+                                .await;
+                            response_tx.send(Ok(StopReason::EndTurn)).ok();
+                            return Ok(response_rx);
+                        }
+                        _ => {
+                            let client = self.client.clone();
+                            client
+                                .send_agent_text("Usage: /fast [on|off|status]\n".to_string())
+                                .await;
+                            response_tx.send(Ok(StopReason::EndTurn)).ok();
+                            return Ok(response_rx);
+                        }
+                    };
+                    self.set_service_tier(tier).await?;
+                    let client = self.client.clone();
+                    let status = if matches!(tier, Some(ServiceTier::Fast)) {
+                        "on"
+                    } else {
+                        "off"
+                    };
+                    client
+                        .send_agent_text(format!("Fast mode is {status}.\n"))
+                        .await;
+                    response_tx.send(Ok(StopReason::EndTurn)).ok();
+                    return Ok(response_rx);
                 }
                 "stop" => op = Op::CleanBackgroundTerminals,
                 "diff" => {
@@ -4271,6 +4393,14 @@ fn generate_fallback_id(prefix: &str) -> String {
     format!("{}_{}", prefix, Uuid::new_v4())
 }
 
+fn format_service_tier_name(service_tier: Option<ServiceTier>) -> &'static str {
+    match service_tier {
+        Some(ServiceTier::Fast) => "Fast",
+        Some(ServiceTier::Flex) => "Flex",
+        None => "Standard",
+    }
+}
+
 /// Runs `git diff`, `git diff --cached`, and `git ls-files --others` in the given directory
 /// and returns formatted output.
 async fn run_git_diff(cwd: &Path) -> String {
@@ -4351,7 +4481,7 @@ mod tests {
 
     use agent_client_protocol::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
-    use codex_protocol::config_types::ModeKind;
+    use codex_protocol::config_types::{ModeKind, ServiceTier};
     use tokio::{
         sync::{Mutex, Notify, mpsc::UnboundedSender},
         task::LocalSet,
@@ -6409,7 +6539,7 @@ mod tests {
                 ..
             }) = &n.update
             {
-                t.text.contains("Session Status")
+                t.text.contains("Session Status") && t.text.contains("**Service Tier:** Standard")
             } else {
                 false
             }
@@ -6463,6 +6593,206 @@ mod tests {
             }
         });
         assert!(has_confirm, "expected /rename to send confirmation text");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_slash_fast_toggle_on() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/fast".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            matches!(
+                ops.first(),
+                Some(Op::OverrideTurnContext {
+                    service_tier: Some(Some(ServiceTier::Fast)),
+                    ..
+                })
+            ),
+            "expected /fast to enable fast mode, got {ops:?}"
+        );
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(notifications.iter().any(|n| matches!(
+            &n.update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Fast mode is on.\n"
+        )));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_slash_fast_off() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/fast off".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            matches!(
+                ops.first(),
+                Some(Op::OverrideTurnContext {
+                    service_tier: Some(None),
+                    ..
+                })
+            ),
+            "expected /fast off to disable fast mode, got {ops:?}"
+        );
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(notifications.iter().any(|n| matches!(
+            &n.update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Fast mode is off.\n"
+        )));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_slash_fast_status() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/fast status".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            ops.is_empty(),
+            "expected /fast status to avoid submitting ops, got {ops:?}"
+        );
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(notifications.iter().any(|n| matches!(
+            &n.update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Fast mode is off.\n"
+        )));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_config_options_include_service_tier() -> anyhow::Result<()> {
+        let (_session_id, _client, _thread, message_tx, local_set) = setup(vec![]).await?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::GetConfigOptions { response_tx })?;
+        let (options, _) = tokio::try_join!(
+            async {
+                let options = response_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(options)
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        assert!(
+            options.iter().any(|option| option.id.0.as_ref() == "service_tier"),
+            "expected service_tier config option, got {options:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_set_config_service_tier_submits_override() -> anyhow::Result<()> {
+        let (_session_id, _client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::SetConfigOption {
+            config_id: SessionConfigId::new("service_tier"),
+            value: SessionConfigOptionValue::ValueId {
+                value: SessionConfigValueId::new("fast"),
+            },
+            response_tx,
+        })?;
+        tokio::try_join!(
+            async {
+                response_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                Op::OverrideTurnContext {
+                    service_tier: Some(Some(ServiceTier::Fast)),
+                    ..
+                }
+            )),
+            "expected service tier override op, got {ops:?}"
+        );
 
         Ok(())
     }
@@ -7096,6 +7426,7 @@ mod tests {
         assert!(names.contains(&"review-commit"), "missing /review-commit");
 
         // New commands
+        assert!(names.contains(&"fast"), "missing /fast");
         assert!(names.contains(&"diff"), "missing /diff");
         assert!(names.contains(&"status"), "missing /status");
         assert!(names.contains(&"stop"), "missing /stop");
