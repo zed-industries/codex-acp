@@ -151,7 +151,7 @@ impl AcpFs {
 
 impl codex_apply_patch::Fs for AcpFs {
     fn read_to_string(&self, path: &std::path::Path) -> std::io::Result<String> {
-        if !self.client_capabilities.lock().unwrap().fs.read_text_file {
+        if !self.client_capabilities.lock().unwrap_or_else(|e| e.into_inner()).fs.read_text_file {
             return StdFs.read_to_string(path);
         }
         let path = self.ensure_within_root(path)?;
@@ -167,7 +167,7 @@ impl codex_apply_patch::Fs for AcpFs {
     }
 
     fn write(&self, path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-        if !self.client_capabilities.lock().unwrap().fs.write_text_file {
+        if !self.client_capabilities.lock().unwrap_or_else(|e| e.into_inner()).fs.write_text_file {
             return StdFs.write(path, contents);
         }
         let path = self.ensure_within_root(path)?;
@@ -196,7 +196,7 @@ impl codex_core::codex::Fs for AcpFs {
                 + Send,
         >,
     > {
-        if !self.client_capabilities.lock().unwrap().fs.read_text_file {
+        if !self.client_capabilities.lock().unwrap_or_else(|e| e.into_inner()).fs.read_text_file {
             return StdFs.file_buffer(path, limit);
         }
         let path = match self.ensure_within_root(path) {

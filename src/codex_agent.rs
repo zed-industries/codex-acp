@@ -232,7 +232,7 @@ impl Agent for CodexAgent {
         debug!("Received initialize request with protocol version {protocol_version:?}",);
         let protocol_version = ProtocolVersion::V1;
 
-        *self.client_capabilities.lock().unwrap() = client_capabilities;
+        *self.client_capabilities.lock().unwrap_or_else(|e| e.into_inner()) = client_capabilities;
 
         let mut agent_capabilities = AgentCapabilities::new()
             .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))

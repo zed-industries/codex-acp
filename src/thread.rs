@@ -42,16 +42,20 @@ use codex_protocol::{
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
         AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent,
-        ApplyPatchApprovalRequestEvent, DynamicToolCallResponseEvent, ElicitationAction,
-        ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
-        ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
-        FileChange, ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent,
-        McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent,
+        ApplyPatchApprovalRequestEvent, BackgroundEventEvent, CollabAgentInteractionBeginEvent,
+        CollabAgentInteractionEndEvent, CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent,
+        DeprecationNoticeEvent, DynamicToolCallResponseEvent, ElicitationAction, ErrorEvent,
+        Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent,
+        ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent, FileChange,
+        HookCompletedEvent, HookStartedEvent, ImageGenerationBeginEvent, ImageGenerationEndEvent,
+        ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation,
+        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent,
         McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction,
-        Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
-        ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
-        ReviewTarget, RolloutItem, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent,
-        TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PlanDeltaEvent,
+        ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
+        ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SandboxPolicy,
+        StreamErrorEvent, TerminalInteractionEvent, ThreadRolledBackEvent, TokenCountEvent,
+        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
         ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
@@ -175,6 +179,13 @@ pub struct Thread {
 }
 
 impl Thread {
+    /// Send a message to the actor, logging if the channel is closed.
+    fn send_message(&self, message: ThreadMessage) {
+        if let Err(err) = self.message_tx.send(message) {
+            warn!("Thread actor channel closed, message dropped: {:?}", std::mem::discriminant(&err.0));
+        }
+    }
+
     pub fn new(
         session_id: SessionId,
         thread: Arc<dyn CodexThreadImpl>,
@@ -209,7 +220,7 @@ impl Thread {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ThreadMessage::Load { response_tx };
-        drop(self.message_tx.send(message));
+        self.send_message(message);
 
         response_rx
             .await
@@ -220,7 +231,7 @@ impl Thread {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ThreadMessage::GetConfigOptions { response_tx };
-        drop(self.message_tx.send(message));
+        self.send_message(message);
 
         response_rx
             .await
@@ -234,7 +245,7 @@ impl Thread {
             request,
             response_tx,
         };
-        drop(self.message_tx.send(message));
+        self.send_message(message);
 
         response_rx
             .await
@@ -247,7 +258,7 @@ impl Thread {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ThreadMessage::SetMode { mode, response_tx };
-        drop(self.message_tx.send(message));
+        self.send_message(message);
 
         response_rx
             .await
@@ -258,7 +269,7 @@ impl Thread {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ThreadMessage::SetModel { model, response_tx };
-        drop(self.message_tx.send(message));
+        self.send_message(message);
 
         response_rx
             .await
@@ -277,7 +288,7 @@ impl Thread {
             value,
             response_tx,
         };
-        drop(self.message_tx.send(message));
+        self.send_message(message);
 
         response_rx
             .await
@@ -288,7 +299,7 @@ impl Thread {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ThreadMessage::Cancel { response_tx };
-        drop(self.message_tx.send(message));
+        self.send_message(message);
 
         response_rx
             .await
@@ -302,7 +313,7 @@ impl Thread {
             history,
             response_tx,
         };
-        drop(self.message_tx.send(message));
+        self.send_message(message);
 
         response_rx
             .await
@@ -410,7 +421,9 @@ impl SubmissionState {
         if let Self::Prompt(state) = self
             && let Some(response_tx) = state.response_tx.take()
         {
-            drop(response_tx.send(Err(err)));
+            if response_tx.send(Err(err)).is_err() {
+                        warn!("Response channel closed, error dropped");
+                    }
         }
     }
 }
@@ -439,7 +452,9 @@ impl CustomPromptsState {
                 custom_prompts,
             }) => {
                 if let Some(tx) = self.response_tx.take() {
-                    drop(tx.send(Ok(custom_prompts)));
+                    if tx.send(Ok(custom_prompts)).is_err() {
+                        warn!("Custom prompts response channel closed");
+                    }
                 }
             }
             e => {
@@ -459,7 +474,7 @@ struct ActiveCommand {
 struct PromptState {
     submission_id: String,
     active_commands: HashMap<String, ActiveCommand>,
-    active_web_search: Option<String>,
+    active_web_searches: HashMap<String, ()>,
     thread: Arc<dyn CodexThreadImpl>,
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     pending_permission_interactions: HashMap<String, PendingPermissionInteraction>,
@@ -479,7 +494,7 @@ impl PromptState {
         Self {
             submission_id,
             active_commands: HashMap::new(),
-            active_web_search: None,
+            active_web_searches: HashMap::new(),
             thread,
             resolution_tx,
             pending_permission_interactions: HashMap::new(),
@@ -794,7 +809,9 @@ impl PromptState {
                 if let Err(err) = self.exec_approval(client, event).await
                     && let Some(response_tx) = self.response_tx.take()
                 {
-                    drop(response_tx.send(Err(err)));
+                    if response_tx.send(Err(err)).is_err() {
+                        warn!("Response channel closed, error dropped");
+                    }
                 }
             }
             EventMsg::ExecCommandBegin(event) => {
@@ -862,7 +879,9 @@ impl PromptState {
                 if let Err(err) = self.patch_approval(client, event).await
                     && let Some(response_tx) = self.response_tx.take()
                 {
-                    drop(response_tx.send(Err(err)));
+                    if response_tx.send(Err(err)).is_err() {
+                        warn!("Response channel closed, error dropped");
+                    }
                 }
             }
             EventMsg::PatchApplyBegin(event) => {
@@ -972,7 +991,9 @@ impl PromptState {
                 if let Err(err) = self.review_mode_exit(client, event).await
                     && let Some(response_tx) = self.response_tx.take()
                 {
-                    drop(response_tx.send(Err(err)));
+                    if response_tx.send(Err(err)).is_err() {
+                        warn!("Response channel closed, error dropped");
+                    }
                 }
             }
             EventMsg::Warning(WarningEvent { message }) => {
@@ -998,7 +1019,9 @@ impl PromptState {
                 if let Err(err) = self.mcp_elicitation(client, event).await
                     && let Some(response_tx) = self.response_tx.take()
                 {
-                    drop(response_tx.send(Err(err)));
+                    if response_tx.send(Err(err)).is_err() {
+                        warn!("Response channel closed, error dropped");
+                    }
                 }
             }
             EventMsg::ModelReroute(ModelRerouteEvent { from_model, to_model, reason }) => {
@@ -1014,50 +1037,217 @@ impl PromptState {
                 if let Err(err) = self.request_permissions(client, event).await
                     && let Some(response_tx) = self.response_tx.take()
                 {
-                    drop(response_tx.send(Err(err)));
+                    if response_tx.send(Err(err)).is_err() {
+                        warn!("Response channel closed, error dropped");
+                    }
                 }
             }
 
-            // Ignore these events
-            EventMsg::ImageGenerationBegin(..)
-            | EventMsg::ImageGenerationEnd(..)
-            | EventMsg::AgentReasoningRawContent(..)
-            | EventMsg::ThreadRolledBack(..)
-            | EventMsg::HookStarted(..)
-            | EventMsg::HookCompleted(..)
-            // we already have a way to diff the turn, so ignore
-            | EventMsg::TurnDiff(..)
-            // Revisit when we can emit status updates
-            | EventMsg::BackgroundEvent(..)
+            // Hook lifecycle — surface as agent status text so users know hooks are running
+            EventMsg::HookStarted(HookStartedEvent { turn_id: _, run }) => {
+                info!("Hook started: {} ({:?})", run.id, run.event_name);
+                client.send_agent_text(format!(
+                    "Running hook: {} ({:?})...\n",
+                    run.id, run.event_name
+                )).await;
+            }
+            EventMsg::HookCompleted(HookCompletedEvent { turn_id: _, run }) => {
+                let status_msg = run.status_message.as_deref().unwrap_or("");
+                info!("Hook completed: {} — {:?} {}", run.id, run.status, status_msg);
+                client.send_agent_text(format!(
+                    "Hook completed: {} — {:?}{}\n",
+                    run.id,
+                    run.status,
+                    if status_msg.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {status_msg}")
+                    }
+                )).await;
+            }
+
+            // Image generation — surface as tool calls so client UI can track progress
+            EventMsg::ImageGenerationBegin(ImageGenerationBeginEvent { call_id }) => {
+                info!("Image generation started: call_id={call_id}");
+                client
+                    .send_tool_call(
+                        ToolCall::new(call_id, "Generating image")
+                            .kind(ToolKind::Other)
+                            .status(ToolCallStatus::InProgress),
+                    )
+                    .await;
+            }
+            EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
+                call_id,
+                status,
+                revised_prompt: _,
+                result,
+                ..
+            }) => {
+                info!("Image generation ended: call_id={call_id}, status={status}");
+                let tc_status = if status == "success" {
+                    ToolCallStatus::Completed
+                } else {
+                    ToolCallStatus::Failed
+                };
+                client
+                    .send_tool_call_update(ToolCallUpdate::new(
+                        call_id,
+                        ToolCallUpdateFields::new()
+                            .status(tc_status)
+                            .content(vec![result.into()]),
+                    ))
+                    .await;
+            }
+
+            // Agent reasoning raw content (non-delta, full text)
+            EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text }) => {
+                info!("Agent reasoning raw content received");
+                client.send_agent_thought(text).await;
+            }
+
+            // Thread rollback notification
+            EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns }) => {
+                info!("Thread rolled back: {num_turns} turns removed");
+                client
+                    .send_agent_text(format!(
+                        "Thread rolled back: {num_turns} turn{} removed from context.\n",
+                        if num_turns == 1 { "" } else { "s" }
+                    ))
+                    .await;
+            }
+
+            // Background events — surface as agent text
+            EventMsg::BackgroundEvent(BackgroundEventEvent { message }) => {
+                info!("Background event: {message}");
+                client.send_agent_text(format!("{message}\n")).await;
+            }
+
+            // Deprecation notices — forward to client as warnings
+            EventMsg::DeprecationNotice(DeprecationNoticeEvent { summary, details }) => {
+                warn!("Deprecation notice: {summary}");
+                let msg = if let Some(details) = details {
+                    format!("**Deprecation:** {summary}\n{details}\n")
+                } else {
+                    format!("**Deprecation:** {summary}\n")
+                };
+                client.send_agent_text(msg).await;
+            }
+
+            // Plan delta — forward incremental plan text as agent thought
+            EventMsg::PlanDelta(PlanDeltaEvent {
+                thread_id: _,
+                turn_id: _,
+                item_id: _,
+                delta,
+            }) => {
+                client.send_agent_thought(delta).await;
+            }
+
+            // Collaboration events — surface as tool calls so the client can track sub-agent activity
+            EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
+                call_id,
+                sender_thread_id: _,
+                prompt,
+                model,
+                reasoning_effort: _,
+            }) => {
+                info!("Collab agent spawn begin: call_id={call_id}, model={model}");
+                let title = if prompt.is_empty() {
+                    format!("Spawning sub-agent ({model})")
+                } else {
+                    let truncated = if prompt.len() > 80 {
+                        format!("{}...", &prompt[..77])
+                    } else {
+                        prompt
+                    };
+                    format!("Spawning sub-agent: {truncated}")
+                };
+                client
+                    .send_tool_call(
+                        ToolCall::new(call_id, title)
+                            .kind(ToolKind::Other)
+                            .status(ToolCallStatus::InProgress),
+                    )
+                    .await;
+            }
+            EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                call_id,
+                sender_thread_id: _,
+                new_thread_id,
+                ..
+            }) => {
+                info!("Collab agent spawn end: call_id={call_id}, new_thread={new_thread_id:?}");
+                client
+                    .send_tool_call_update(ToolCallUpdate::new(
+                        call_id,
+                        ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+                    ))
+                    .await;
+            }
+            EventMsg::CollabAgentInteractionBegin(CollabAgentInteractionBeginEvent {
+                call_id,
+                sender_thread_id: _,
+                receiver_thread_id,
+                ..
+            }) => {
+                info!("Collab interaction begin: call_id={call_id}, receiver={receiver_thread_id}");
+                client
+                    .send_tool_call(
+                        ToolCall::new(
+                            call_id,
+                            format!("Sub-agent interaction ({receiver_thread_id})"),
+                        )
+                        .kind(ToolKind::Other)
+                        .status(ToolCallStatus::InProgress),
+                    )
+                    .await;
+            }
+            EventMsg::CollabAgentInteractionEnd(CollabAgentInteractionEndEvent {
+                call_id,
+                sender_thread_id: _,
+                receiver_thread_id,
+                ..
+            }) => {
+                info!("Collab interaction end: call_id={call_id}, receiver={receiver_thread_id}");
+                client
+                    .send_tool_call_update(ToolCallUpdate::new(
+                        call_id,
+                        ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+                    ))
+                    .await;
+            }
+
+            // Collab waiting/resume/close — log for now, surface as text when meaningful
+            EventMsg::CollabWaitingBegin(..) => {
+                info!("Collab waiting begin");
+                client.send_agent_text("Waiting for sub-agents...\n".to_string()).await;
+            }
+            EventMsg::CollabWaitingEnd(..) => {
+                info!("Collab waiting end");
+                client.send_agent_text("Sub-agents completed.\n".to_string()).await;
+            }
+            EventMsg::CollabResumeBegin(..) | EventMsg::CollabResumeEnd(..)
+            | EventMsg::CollabCloseBegin(..) | EventMsg::CollabCloseEnd(..) => {
+                info!("Collab lifecycle event (resume/close)");
+            }
+
+            // Events that are truly ignorable (old/superseded or not applicable to ACP)
+            EventMsg::TurnDiff(..)
             | EventMsg::SkillsUpdateAvailable
-            // Old events
             | EventMsg::AgentMessageDelta(..)
             | EventMsg::AgentReasoningDelta(..)
             | EventMsg::AgentReasoningRawContentDelta(..)
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..)
-            // TODO: Subagent UI?
-            | EventMsg::CollabAgentSpawnBegin(..)
-            | EventMsg::CollabAgentSpawnEnd(..)
-            | EventMsg::CollabAgentInteractionBegin(..)
-            | EventMsg::CollabAgentInteractionEnd(..)
             | EventMsg::RealtimeConversationStarted(..)
             | EventMsg::RealtimeConversationRealtime(..)
-            | EventMsg::RealtimeConversationClosed(..)
-            | EventMsg::CollabWaitingBegin(..)
-            | EventMsg::CollabWaitingEnd(..)
-            | EventMsg::CollabResumeBegin(..)
-            | EventMsg::CollabResumeEnd(..)
-            | EventMsg::CollabCloseBegin(..)
-            | EventMsg::CollabCloseEnd(..)
-            | EventMsg::PlanDelta(..) => {}
+            | EventMsg::RealtimeConversationClosed(..) => {}
+
             e @ (EventMsg::McpListToolsResponse(..)
-            // returned from Op::ListCustomPrompts, ignore
             | EventMsg::ListCustomPromptsResponse(..)
             | EventMsg::ListSkillsResponse(..)
-            // Used for returning a single history entry
             | EventMsg::GetHistoryEntryResponse(..)
-            | EventMsg::DeprecationNotice(..)
             | EventMsg::RequestUserInput(..)
             | EventMsg::ListRemoteSkillsResponse(..)
             | EventMsg::RemoteSkillDownloaded(..)) => {
@@ -1591,6 +1781,8 @@ impl PromptState {
             };
 
             client.send_tool_call_update(update).await;
+        } else {
+            warn!("Received ExecCommandOutputDelta for unknown call_id: {call_id}");
         }
     }
 
@@ -1644,6 +1836,8 @@ impl PromptState {
                     ),
                 )
                 .await;
+        } else {
+            warn!("Received ExecCommandEnd for unknown call_id: {call_id} (exit_code={exit_code})");
         }
     }
 
@@ -1693,11 +1887,13 @@ impl PromptState {
             };
 
             client.send_tool_call_update(update).await;
+        } else {
+            warn!("Received TerminalInteraction for unknown call_id: {call_id}");
         }
     }
 
     async fn start_web_search(&mut self, client: &SessionClient, call_id: String) {
-        self.active_web_search = Some(call_id.clone());
+        self.active_web_searches.insert(call_id.clone(), ());
         client
             .send_tool_call(ToolCall::new(call_id, "Searching the Web").kind(ToolKind::Fetch))
             .await;
@@ -1744,7 +1940,8 @@ impl PromptState {
     }
 
     async fn complete_web_search(&mut self, client: &SessionClient) {
-        if let Some(call_id) = self.active_web_search.take() {
+        let completed: Vec<String> = self.active_web_searches.drain().map(|(id, _)| id).collect();
+        for call_id in completed {
             client
                 .send_tool_call_update(ToolCallUpdate::new(
                     call_id,
@@ -2044,7 +2241,9 @@ impl SessionClient {
     fn new(session_id: SessionId, client_capabilities: Arc<Mutex<ClientCapabilities>>) -> Self {
         Self {
             session_id,
-            client: ACP_CLIENT.get().expect("Client should be set").clone(),
+            client: ACP_CLIENT.get().unwrap_or_else(|| {
+                panic!("ACP_CLIENT must be initialized before creating SessionClient");
+            }).clone(),
             client_capabilities,
         }
     }
@@ -2067,7 +2266,10 @@ impl SessionClient {
             && self
                 .client_capabilities
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| {
+                    warn!("client_capabilities mutex poisoned, assuming no terminal output support");
+                    e.into_inner()
+                })
                 .meta
                 .as_ref()
                 .is_some_and(|v| {
@@ -2268,7 +2470,9 @@ impl<A: Auth> ThreadActor<A> {
         match message {
             ThreadMessage::Load { response_tx } => {
                 let result = self.handle_load().await;
-                drop(response_tx.send(result));
+                if response_tx.send(result).is_err() {
+                        warn!("Response channel closed, result dropped");
+                    }
                 let client = self.client.clone();
                 let mut available_commands = Self::builtin_commands();
                 let load_custom_prompts = self.load_custom_prompts().await;
@@ -2313,23 +2517,31 @@ impl<A: Auth> ThreadActor<A> {
             }
             ThreadMessage::GetConfigOptions { response_tx } => {
                 let result = self.config_options().await;
-                drop(response_tx.send(result));
+                if response_tx.send(result).is_err() {
+                        warn!("Response channel closed, result dropped");
+                    }
             }
             ThreadMessage::Prompt {
                 request,
                 response_tx,
             } => {
                 let result = self.handle_prompt(request).await;
-                drop(response_tx.send(result));
+                if response_tx.send(result).is_err() {
+                        warn!("Response channel closed, result dropped");
+                    }
             }
             ThreadMessage::SetMode { mode, response_tx } => {
                 let result = self.handle_set_mode(mode).await;
-                drop(response_tx.send(result));
+                if response_tx.send(result).is_err() {
+                        warn!("Response channel closed, result dropped");
+                    }
                 self.maybe_emit_config_options_update().await;
             }
             ThreadMessage::SetModel { model, response_tx } => {
                 let result = self.handle_set_model(model).await;
-                drop(response_tx.send(result));
+                if response_tx.send(result).is_err() {
+                        warn!("Response channel closed, result dropped");
+                    }
                 self.maybe_emit_config_options_update().await;
             }
             ThreadMessage::SetConfigOption {
@@ -2338,22 +2550,30 @@ impl<A: Auth> ThreadActor<A> {
                 response_tx,
             } => {
                 let result = self.handle_set_config_option(config_id, value).await;
-                drop(response_tx.send(result));
+                if response_tx.send(result).is_err() {
+                        warn!("Response channel closed, result dropped");
+                    }
             }
             ThreadMessage::Cancel { response_tx } => {
                 let result = self.handle_cancel().await;
-                drop(response_tx.send(result));
+                if response_tx.send(result).is_err() {
+                        warn!("Response channel closed, result dropped");
+                    }
             }
             ThreadMessage::Shutdown { response_tx } => {
                 let result = self.handle_shutdown().await;
-                drop(response_tx.send(result));
+                if response_tx.send(result).is_err() {
+                        warn!("Response channel closed, result dropped");
+                    }
             }
             ThreadMessage::ReplayHistory {
                 history,
                 response_tx,
             } => {
                 let result = self.handle_replay_history(history).await;
-                drop(response_tx.send(result));
+                if response_tx.send(result).is_err() {
+                        warn!("Response channel closed, result dropped");
+                    }
             }
             ThreadMessage::PermissionRequestResolved {
                 submission_id,
@@ -2409,6 +2629,19 @@ impl<A: Auth> ThreadActor<A> {
             ),
             AvailableCommand::new("undo", "undo Codex’s most recent turn"),
             AvailableCommand::new("logout", "logout of Codex"),
+            AvailableCommand::new("diff", "show git diff including untracked files"),
+            AvailableCommand::new("status", "show current session configuration and token usage"),
+            AvailableCommand::new("stop", "stop all background terminals"),
+            AvailableCommand::new("rename", "rename the current thread").input(
+                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("new name")),
+            ),
+            AvailableCommand::new("mention", "mention a file for context").input(
+                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("file path")),
+            ),
+            AvailableCommand::new("feedback", "send logs to maintainers"),
+            AvailableCommand::new("mcp", "list configured MCP tools"),
+            AvailableCommand::new("skills", "list and manage skills"),
+            AvailableCommand::new("debug-config", "show config layers and requirement sources for debugging"),
         ]
     }
 
@@ -2417,7 +2650,9 @@ impl<A: Auth> ThreadActor<A> {
         let submission_id = match self.thread.submit(Op::ListCustomPrompts).await {
             Ok(id) => id,
             Err(e) => {
-                drop(response_tx.send(Err(Error::internal_error().data(e.to_string()))));
+                if response_tx.send(Err(Error::internal_error().data(e.to_string()))).is_err() {
+                    warn!("Response channel closed while sending ListCustomPrompts error");
+                }
                 return response_rx;
             }
         };
@@ -2829,6 +3064,79 @@ impl<A: Auth> ThreadActor<A> {
                 "logout" => {
                     self.auth.logout()?;
                     return Err(Error::auth_required());
+                }
+                "stop" => op = Op::CleanBackgroundTerminals,
+                "diff" => {
+                    op = Op::UserInput {
+                        items: vec![UserInput::Text {
+                            text: "Show me the full git diff of all current changes, including untracked files. Use `git diff` and `git diff --cached` and `git ls-files --others --exclude-standard` to show everything.".into(),
+                            text_elements: vec![],
+                        }],
+                        final_output_json_schema: None,
+                    }
+                }
+                "status" => {
+                    op = Op::UserInput {
+                        items: vec![UserInput::Text {
+                            text: "Show the current session status including: what model is being used, the current approval mode, and a summary of token usage so far.".into(),
+                            text_elements: vec![],
+                        }],
+                        final_output_json_schema: None,
+                    }
+                }
+                "rename" if !rest.is_empty() => {
+                    op = Op::UserInput {
+                        items: vec![UserInput::Text {
+                            text: format!("Rename this conversation thread to: {}", rest.trim()),
+                            text_elements: vec![],
+                        }],
+                        final_output_json_schema: None,
+                    }
+                }
+                "mention" if !rest.is_empty() => {
+                    op = Op::UserInput {
+                        items: vec![UserInput::Text {
+                            text: format!("@{}", rest.trim()),
+                            text_elements: vec![],
+                        }],
+                        final_output_json_schema: None,
+                    }
+                }
+                "feedback" => {
+                    op = Op::UserInput {
+                        items: vec![UserInput::Text {
+                            text: "Please collect and send diagnostic logs and feedback to the maintainers.".into(),
+                            text_elements: vec![],
+                        }],
+                        final_output_json_schema: None,
+                    }
+                }
+                "mcp" => {
+                    op = Op::UserInput {
+                        items: vec![UserInput::Text {
+                            text: "List all configured MCP tools and their status.".into(),
+                            text_elements: vec![],
+                        }],
+                        final_output_json_schema: None,
+                    }
+                }
+                "skills" => {
+                    op = Op::UserInput {
+                        items: vec![UserInput::Text {
+                            text: "List available skills and their descriptions.".into(),
+                            text_elements: vec![],
+                        }],
+                        final_output_json_schema: None,
+                    }
+                }
+                "debug-config" => {
+                    op = Op::UserInput {
+                        items: vec![UserInput::Text {
+                            text: "Show the current configuration layers and requirement sources for debugging.".into(),
+                            text_elements: vec![],
+                        }],
+                        final_output_json_schema: None,
+                    }
                 }
                 _ => {
                     if let Some(prompt) =
@@ -4148,6 +4456,282 @@ mod tests {
                             last_agent_message: None,
                             turn_id,
                         }));
+                    } else if prompt == "emit-hook-events" {
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        send(EventMsg::HookStarted(HookStartedEvent {
+                            turn_id: Some(id.to_string()),
+                            run: codex_protocol::protocol::HookRunSummary {
+                                id: "hook-1".to_string(),
+                                event_name: codex_protocol::protocol::HookEventName::SessionStart,
+                                handler_type: codex_protocol::protocol::HookHandlerType::Command,
+                                execution_mode: codex_protocol::protocol::HookExecutionMode::Sync,
+                                scope: codex_protocol::protocol::HookScope::Thread,
+                                source_path: std::path::PathBuf::from("/test/hook.sh"),
+                                display_order: 0,
+                                status: codex_protocol::protocol::HookRunStatus::Running,
+                                status_message: None,
+                                started_at: 0,
+                                completed_at: None,
+                                duration_ms: None,
+                                entries: vec![],
+                            },
+                        }));
+                        send(EventMsg::HookCompleted(HookCompletedEvent {
+                            turn_id: Some(id.to_string()),
+                            run: codex_protocol::protocol::HookRunSummary {
+                                id: "hook-1".to_string(),
+                                event_name: codex_protocol::protocol::HookEventName::SessionStart,
+                                handler_type: codex_protocol::protocol::HookHandlerType::Command,
+                                execution_mode: codex_protocol::protocol::HookExecutionMode::Sync,
+                                scope: codex_protocol::protocol::HookScope::Thread,
+                                source_path: std::path::PathBuf::from("/test/hook.sh"),
+                                display_order: 0,
+                                status: codex_protocol::protocol::HookRunStatus::Completed,
+                                status_message: Some("all good".to_string()),
+                                started_at: 0,
+                                completed_at: Some(100),
+                                duration_ms: Some(100),
+                                entries: vec![],
+                            },
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id: id.to_string(),
+                        }));
+                    } else if prompt == "emit-image-gen" {
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        send(EventMsg::ImageGenerationBegin(ImageGenerationBeginEvent {
+                            call_id: "img-1".to_string(),
+                        }));
+                        send(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
+                            call_id: "img-1".to_string(),
+                            status: "success".to_string(),
+                            revised_prompt: None,
+                            result: "image.png".to_string(),
+                            saved_path: None,
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id: id.to_string(),
+                        }));
+                    } else if prompt == "emit-background-event" {
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        send(EventMsg::BackgroundEvent(BackgroundEventEvent {
+                            message: "Long running task completed".to_string(),
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id: id.to_string(),
+                        }));
+                    } else if prompt == "emit-deprecation-notice" {
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        send(EventMsg::DeprecationNotice(DeprecationNoticeEvent {
+                            summary: "Old API deprecated".to_string(),
+                            details: Some("Please migrate to v2.".to_string()),
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id: id.to_string(),
+                        }));
+                    } else if prompt == "emit-thread-rollback" {
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        send(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+                            num_turns: 3,
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id: id.to_string(),
+                        }));
+                    } else if prompt == "emit-reasoning-raw" {
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        send(EventMsg::AgentReasoningRawContent(
+                            AgentReasoningRawContentEvent {
+                                text: "Thinking about the problem...".to_string(),
+                            },
+                        ));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id: id.to_string(),
+                        }));
+                    } else if prompt == "emit-plan-delta" {
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        send(EventMsg::PlanDelta(PlanDeltaEvent {
+                            thread_id: id.to_string(),
+                            turn_id: id.to_string(),
+                            item_id: "plan-item-1".to_string(),
+                            delta: "Step 1: Analyze the code".to_string(),
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id: id.to_string(),
+                        }));
+                    } else if prompt == "emit-collab-spawn" {
+                        use codex_protocol::ThreadId as ProtoThreadId;
+                        use codex_protocol::protocol::AgentStatus;
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        send(EventMsg::CollabAgentSpawnBegin(
+                            CollabAgentSpawnBeginEvent {
+                                call_id: "collab-1".to_string(),
+                                sender_thread_id: ProtoThreadId::new(),
+                                prompt: "Review this file".to_string(),
+                                model: "gpt-4".to_string(),
+                                reasoning_effort: ReasoningEffort::Medium,
+                            },
+                        ));
+                        send(EventMsg::CollabAgentSpawnEnd(
+                            CollabAgentSpawnEndEvent {
+                                call_id: "collab-1".to_string(),
+                                sender_thread_id: ProtoThreadId::new(),
+                                new_thread_id: Some(ProtoThreadId::new()),
+                                new_agent_nickname: Some("reviewer".to_string()),
+                                new_agent_role: None,
+                                prompt: String::new(),
+                                status: AgentStatus::Completed(None),
+                            },
+                        ));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id: id.to_string(),
+                        }));
+                    } else if prompt == "emit-collab-interaction" {
+                        use codex_protocol::ThreadId as ProtoThreadId;
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        send(EventMsg::CollabAgentInteractionBegin(
+                            CollabAgentInteractionBeginEvent {
+                                call_id: "interact-1".to_string(),
+                                sender_thread_id: ProtoThreadId::new(),
+                                receiver_thread_id: ProtoThreadId::new(),
+                                prompt: "Help with this".to_string(),
+                            },
+                        ));
+                        send(EventMsg::CollabAgentInteractionEnd(
+                            CollabAgentInteractionEndEvent {
+                                call_id: "interact-1".to_string(),
+                                sender_thread_id: ProtoThreadId::new(),
+                                receiver_thread_id: ProtoThreadId::new(),
+                                receiver_agent_nickname: Some("reviewer".to_string()),
+                                receiver_agent_role: None,
+                                prompt: String::new(),
+                                status: codex_protocol::protocol::AgentStatus::Completed(None),
+                            },
+                        ));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id: id.to_string(),
+                        }));
+                    } else if prompt == "emit-web-search-concurrent" {
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        // Start two concurrent web searches
+                        send(EventMsg::WebSearchBegin(WebSearchBeginEvent {
+                            call_id: "ws-1".to_string(),
+                        }));
+                        send(EventMsg::WebSearchBegin(WebSearchBeginEvent {
+                            call_id: "ws-2".to_string(),
+                        }));
+                        // Trigger completion of all searches via ExecCommandBegin
+                        send(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                            call_id: "exec-after-search".to_string(),
+                            process_id: None,
+                            turn_id: id.to_string(),
+                            command: vec!["echo".into(), "done".into()],
+                            cwd: std::env::current_dir().unwrap(),
+                            parsed_cmd: vec![ParsedCommand::Unknown {
+                                cmd: "echo done".into(),
+                            }],
+                            source: Default::default(),
+                            interaction_input: None,
+                        }));
+                        send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                            call_id: "exec-after-search".to_string(),
+                            process_id: None,
+                            turn_id: id.to_string(),
+                            command: vec!["echo".into(), "done".into()],
+                            cwd: std::env::current_dir().unwrap(),
+                            parsed_cmd: vec![],
+                            source: Default::default(),
+                            interaction_input: None,
+                            stdout: "done\n".into(),
+                            stderr: String::new(),
+                            aggregated_output: "done\n".into(),
+                            exit_code: 0,
+                            duration: std::time::Duration::from_millis(5),
+                            formatted_output: "done\n".into(),
+                            status: ExecCommandStatus::Completed,
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id: id.to_string(),
+                        }));
                     } else if prompt == "approval-block" {
                         self.op_tx
                             .send(Event {
@@ -4291,6 +4875,26 @@ mod tests {
                                         .unwrap_or_default(),
                                     overall_confidence_score: 1.,
                                 }),
+                            }),
+                        })
+                        .unwrap();
+                    self.op_tx
+                        .send(Event {
+                            id: id.to_string(),
+                            msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                                last_agent_message: None,
+                                turn_id: id.to_string(),
+                            }),
+                        })
+                        .unwrap();
+                }
+                Op::CleanBackgroundTerminals => {
+                    self.op_tx
+                        .send(Event {
+                            id: id.to_string(),
+                            msg: EventMsg::AgentMessage(AgentMessageEvent {
+                                message: "Background terminals stopped.".to_string(),
+                                phase: None,
                             }),
                         })
                         .unwrap();
@@ -4782,5 +5386,686 @@ mod tests {
         assert!(matches!(ops.last(), Some(Op::Shutdown)));
 
         Ok(())
+    }
+
+    // ==================== New tests for P0/P2/P3 changes ====================
+
+    #[tokio::test]
+    async fn test_slash_stop() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/stop".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(ops.as_slice(), &[Op::CleanBackgroundTerminals]);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|n| matches!(
+                &n.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text == "Background terminals stopped."
+            )),
+            "expected background terminals stopped message, got {notifications:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_slash_diff() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/diff".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            matches!(
+                &ops[0],
+                Op::UserInput { items, .. } if matches!(&items[0], UserInput::Text { text, .. } if text.contains("git diff"))
+            ),
+            "expected /diff to generate a UserInput with git diff, got {ops:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_slash_status() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/status".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            matches!(
+                &ops[0],
+                Op::UserInput { items, .. } if matches!(&items[0], UserInput::Text { text, .. } if text.contains("session status"))
+            ),
+            "expected /status to generate a UserInput, got {ops:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_slash_rename() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/rename My New Thread".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            matches!(
+                &ops[0],
+                Op::UserInput { items, .. } if matches!(&items[0], UserInput::Text { text, .. } if text.contains("My New Thread"))
+            ),
+            "expected /rename to pass through name, got {ops:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_slash_mention() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["/mention src/main.rs".into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            matches!(
+                &ops[0],
+                Op::UserInput { items, .. } if matches!(&items[0], UserInput::Text { text, .. } if text == "@src/main.rs")
+            ),
+            "expected /mention to create @path, got {ops:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hook_events_surfaced() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["emit-hook-events".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let texts: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            texts.iter().any(|t| t.contains("Running hook")),
+            "expected hook started message, got {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Hook completed") && t.contains("all good")),
+            "expected hook completed message with status, got {texts:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_image_generation_events_surfaced() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["emit-image-gen".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+
+        // Should have a ToolCall begin for image generation
+        let tool_calls: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::ToolCall(tc) => Some(tc.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_calls.len(), 1, "expected 1 image gen ToolCall, got {tool_calls:?}");
+        assert!(tool_calls[0].title.contains("Generating image"));
+
+        // Should have a completed ToolCallUpdate
+        let updates: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::ToolCallUpdate(u) if u.fields.status == Some(ToolCallStatus::Completed) => {
+                    Some(u.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(updates.len(), 1, "expected 1 completed update, got {updates:?}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_background_event_surfaced() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["emit-background-event".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|n| matches!(
+                &n.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text.contains("Long running task completed")
+            )),
+            "expected background event message, got {notifications:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_deprecation_notice_surfaced() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["emit-deprecation-notice".into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|n| matches!(
+                &n.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text.contains("Deprecation") && text.contains("Old API deprecated") && text.contains("migrate to v2")
+            )),
+            "expected deprecation notice message, got {notifications:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_thread_rollback_surfaced() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["emit-thread-rollback".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|n| matches!(
+                &n.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text.contains("rolled back") && text.contains("3 turns")
+            )),
+            "expected rollback message, got {notifications:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reasoning_raw_content_surfaced() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["emit-reasoning-raw".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|n| matches!(
+                &n.update,
+                SessionUpdate::AgentThoughtChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text == "Thinking about the problem..."
+            )),
+            "expected reasoning raw content as thought chunk, got {notifications:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_delta_surfaced() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["emit-plan-delta".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|n| matches!(
+                &n.update,
+                SessionUpdate::AgentThoughtChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text == "Step 1: Analyze the code"
+            )),
+            "expected plan delta as thought chunk, got {notifications:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_collab_spawn_events_surfaced() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["emit-collab-spawn".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+
+        // Should have a ToolCall for spawn begin
+        let tool_calls: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::ToolCall(tc) => Some(tc.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_calls.len(), 1, "expected 1 collab spawn ToolCall, got {tool_calls:?}");
+        assert!(
+            tool_calls[0].title.contains("sub-agent") || tool_calls[0].title.contains("Spawning"),
+            "expected spawn title, got {:?}",
+            tool_calls[0].title
+        );
+
+        // Should have a completed update
+        let completed: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::ToolCallUpdate(u) if u.fields.status == Some(ToolCallStatus::Completed) => {
+                    Some(u.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completed.len(), 1, "expected 1 completed collab update, got {completed:?}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_collab_interaction_events_surfaced() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["emit-collab-interaction".into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+
+        // Should have a ToolCall for interaction begin
+        let tool_calls: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::ToolCall(tc) => Some(tc.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_calls.len(), 1, "expected 1 interaction ToolCall, got {tool_calls:?}");
+        assert!(
+            tool_calls[0].title.contains("Sub-agent interaction"),
+            "expected interaction title, got {:?}",
+            tool_calls[0].title
+        );
+
+        // Should have a completed update
+        let completed: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::ToolCallUpdate(u) if u.fields.status == Some(ToolCallStatus::Completed) => {
+                    Some(u.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completed.len(), 1, "expected 1 completed interaction update, got {completed:?}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_web_searches() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["emit-web-search-concurrent".into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+
+        // Should have ToolCall begins for both web searches
+        let web_search_begins: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::ToolCall(tc) if tc.title.contains("Searching") => Some(tc.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            web_search_begins.len(),
+            2,
+            "expected 2 web search ToolCall begins, got {web_search_begins:?}"
+        );
+
+        // Both searches should have completed (via complete_web_search when ExecCommandBegin fires)
+        let web_search_completes: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::ToolCallUpdate(u)
+                    if u.fields.status == Some(ToolCallStatus::Completed)
+                        && (u.tool_call_id.0.as_ref() == "ws-1"
+                            || u.tool_call_id.0.as_ref() == "ws-2") =>
+                {
+                    Some(u.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            web_search_completes.len(),
+            2,
+            "expected 2 web search completions (both concurrent searches should complete), got {web_search_completes:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_builtin_commands_includes_new_commands() {
+        let commands = ThreadActor::<StubAuth>::builtin_commands();
+        let names: Vec<_> = commands.iter().map(|c| c.name.as_str()).collect();
+
+        // Original commands
+        assert!(names.contains(&"review"), "missing /review");
+        assert!(names.contains(&"compact"), "missing /compact");
+        assert!(names.contains(&"undo"), "missing /undo");
+        assert!(names.contains(&"init"), "missing /init");
+        assert!(names.contains(&"logout"), "missing /logout");
+        assert!(names.contains(&"review-branch"), "missing /review-branch");
+        assert!(names.contains(&"review-commit"), "missing /review-commit");
+
+        // New commands
+        assert!(names.contains(&"diff"), "missing /diff");
+        assert!(names.contains(&"status"), "missing /status");
+        assert!(names.contains(&"stop"), "missing /stop");
+        assert!(names.contains(&"rename"), "missing /rename");
+        assert!(names.contains(&"mention"), "missing /mention");
+        assert!(names.contains(&"feedback"), "missing /feedback");
+        assert!(names.contains(&"mcp"), "missing /mcp");
+        assert!(names.contains(&"skills"), "missing /skills");
+        assert!(names.contains(&"debug-config"), "missing /debug-config");
     }
 }
