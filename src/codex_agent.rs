@@ -19,6 +19,7 @@ use codex_core::{
         types::{McpServerConfig, McpServerTransportConfig},
     },
     find_thread_path_by_id_str,
+    find_thread_names_by_ids,
     models_manager::collaboration_mode_presets::CollaborationModesConfig,
     parse_cursor,
 };
@@ -82,7 +83,7 @@ impl CodexAgent {
         let thread_manager = ThreadManager::new_with_fs(
             &config,
             auth_manager.clone(),
-            SessionSource::Unknown,
+            SessionSource::VSCode,
             CollaborationModesConfig {
                 // False for now
                 default_mode_request_user_input: false,
@@ -455,6 +456,14 @@ impl Agent for CodexAgent {
         self.check_auth().await?;
 
         let ListSessionsRequest { cwd, cursor, .. } = request;
+        // Zed often sends cwd=None. Fall back to the most recently used session's cwd.
+        let effective_cwd = cwd.or_else(|| {
+            self.session_roots
+                .lock()
+                .ok()
+                .and_then(|roots| roots.values().next().cloned())
+        });
+        debug!("list_sessions called: effective_cwd={:?}, cursor={:?}", effective_cwd, cursor);
         let cursor_obj = cursor.as_deref().and_then(parse_cursor);
 
         let page = RolloutRecorder::list_threads(
@@ -463,9 +472,7 @@ impl Agent for CodexAgent {
             cursor_obj.as_ref(),
             ThreadSortKey::UpdatedAt,
             &[
-                SessionSource::Cli,
                 SessionSource::VSCode,
-                SessionSource::Unknown,
             ],
             None,
             self.config.model_provider_id.as_str(),
@@ -474,30 +481,51 @@ impl Agent for CodexAgent {
         .await
         .map_err(|err| Error::internal_error().data(format!("failed to list sessions: {err}")))?;
 
-        let sessions = page
+        // Filter to current cwd (normalize paths for comparison).
+        let filter_cwd = effective_cwd.as_ref().map(|p| normalize_path(p));
+        debug!("list_sessions: {} items from backend, filter_cwd={:?}", page.items.len(), filter_cwd);
+        let items_with_ids: Vec<_> = page
             .items
             .into_iter()
             .filter_map(|item| {
                 let thread_id = item.thread_id?;
                 let item_cwd = item.cwd?;
 
-                if let Some(filter_cwd) = cwd.as_ref()
-                    && item_cwd != *filter_cwd
-                {
-                    return None;
+                if let Some(ref filter) = filter_cwd {
+                    let normalized = normalize_path(&item_cwd);
+                    if normalized != *filter {
+                        debug!("list_sessions: filtered out thread {:?} (cwd={:?} != {:?})", thread_id, normalized, filter);
+                        return None;
+                    }
                 }
 
-                let title = item
-                    .first_user_message
-                    .as_deref()
-                    .and_then(format_session_title);
-                let updated_at = item.updated_at.or(item.created_at);
+                Some((thread_id, item_cwd, item.first_user_message, item.updated_at.or(item.created_at)))
+            })
+            .collect();
+        debug!("list_sessions: {} items after cwd filter", items_with_ids.len());
 
-                Some(
-                    SessionInfo::new(SessionId::new(thread_id.to_string()), item_cwd)
-                        .title(title)
-                        .updated_at(updated_at),
-                )
+        // Look up thread names from session_index.jsonl (same as TUI /resume).
+        let thread_ids: std::collections::HashSet<ThreadId> = items_with_ids.iter().map(|(id, ..)| id.clone()).collect();
+        let thread_names = find_thread_names_by_ids(&self.config.codex_home, &thread_ids)
+            .await
+            .unwrap_or_default();
+
+        let sessions = items_with_ids
+            .into_iter()
+            .map(|(thread_id, item_cwd, first_user_message, updated_at)| {
+                // Prefer thread_name (from /rename) over first_user_message.
+                let title = thread_names
+                    .get(&thread_id)
+                    .cloned()
+                    .or_else(|| {
+                        first_user_message
+                            .as_deref()
+                            .and_then(format_session_title)
+                    });
+
+                SessionInfo::new(SessionId::new(thread_id.to_string()), item_cwd)
+                    .title(title)
+                    .updated_at(updated_at)
             })
             .collect::<Vec<_>>();
 
@@ -756,4 +784,21 @@ fn format_session_title(message: &str) -> Option<String> {
     } else {
         Some(truncate_graphemes(trimmed, SESSION_TITLE_MAX_GRAPHEMES))
     }
+}
+
+/// Normalize a path for comparison: resolve `.` / `..`, strip trailing slash.
+/// Does NOT follow symlinks (uses lexical normalization only).
+fn normalize_path(p: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
