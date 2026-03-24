@@ -551,6 +551,7 @@ struct PromptState {
     active_commands: HashMap<String, ActiveCommand>,
     active_web_searches: HashMap<String, ()>,
     active_context_compactions: HashSet<String>,
+    active_patch_applies: HashSet<String>,
     /// Tracks the most recently spawned sub-agent tool call ID so that
     /// waiting/resume/close events can update its status instead of emitting
     /// standalone text messages.
@@ -577,6 +578,7 @@ impl PromptState {
             active_commands: HashMap::new(),
             active_web_searches: HashMap::new(),
             active_context_compactions: HashSet::new(),
+            active_patch_applies: HashSet::new(),
             active_subagent_call_id: None,
             thread,
             resolution_tx,
@@ -665,6 +667,29 @@ impl PromptState {
                     ToolCallUpdateFields::new().status(status).content(vec![
                         context_compaction_status_text(status).to_string().into(),
                     ]),
+                ))
+                .await;
+        }
+    }
+
+    async fn settle_all_patch_applies(&mut self, client: &SessionClient, status: ToolCallStatus) {
+        let pending: Vec<_> = self.active_patch_applies.drain().collect();
+        let content = match status {
+            ToolCallStatus::Completed => "Edit completed.",
+            ToolCallStatus::Failed => "Edit interrupted before completion.",
+            ToolCallStatus::Pending => "Edit pending.",
+            ToolCallStatus::InProgress => "Edit still running.",
+            _ => "Edit status unknown.",
+        }
+        .to_string();
+
+        for call_id in pending {
+            client
+                .send_tool_call_update(ToolCallUpdate::new(
+                    call_id,
+                    ToolCallUpdateFields::new()
+                        .status(status)
+                        .content(vec![content.clone().into()]),
                 ))
                 .await;
         }
@@ -858,7 +883,7 @@ impl PromptState {
                     self.accumulated_usage.reasoning_output_tokens += last.reasoning_output_tokens;
 
                     if let Some(size) = info.model_context_window {
-                        let used = last.tokens_in_context_window().max(0) as u64;
+                        let used = info.total_token_usage.tokens_in_context_window().max(0) as u64;
                         let mut update = UsageUpdate::new(used, size as u64);
 
                         // Include cost if credits info is available from rate limits
@@ -1174,6 +1199,8 @@ impl PromptState {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
                 self.settle_all_context_compactions(client, ToolCallStatus::Failed)
                     .await;
+                self.settle_all_patch_applies(client, ToolCallStatus::Failed)
+                    .await;
                 self.abort_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx
@@ -1187,6 +1214,8 @@ impl PromptState {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
                 self.settle_all_context_compactions(client, ToolCallStatus::Failed)
                     .await;
+                self.settle_all_patch_applies(client, ToolCallStatus::Failed)
+                    .await;
                 self.abort_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
@@ -1195,6 +1224,8 @@ impl PromptState {
             EventMsg::ShutdownComplete => {
                 info!("Agent shutting down");
                 self.settle_all_context_compactions(client, ToolCallStatus::Failed)
+                    .await;
+                self.settle_all_patch_applies(client, ToolCallStatus::Failed)
                     .await;
                 self.abort_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
@@ -1663,7 +1694,7 @@ impl PromptState {
         Ok(())
     }
 
-    async fn start_patch_apply(&self, client: &SessionClient, event: PatchApplyBeginEvent) {
+    async fn start_patch_apply(&mut self, client: &SessionClient, event: PatchApplyBeginEvent) {
         let raw_input = serde_json::json!(&event);
         let PatchApplyBeginEvent {
             call_id,
@@ -1671,6 +1702,7 @@ impl PromptState {
             changes,
             turn_id: _,
         } = event;
+        self.active_patch_applies.insert(call_id.clone());
 
         let (title, locations, content) = extract_tool_call_content_from_changes(changes);
 
@@ -1686,7 +1718,7 @@ impl PromptState {
             .await;
     }
 
-    async fn end_patch_apply(&self, client: &SessionClient, event: PatchApplyEndEvent) {
+    async fn end_patch_apply(&mut self, client: &SessionClient, event: PatchApplyEndEvent) {
         let raw_output = serde_json::json!(&event);
         let PatchApplyEndEvent {
             call_id,
@@ -1697,6 +1729,7 @@ impl PromptState {
             turn_id: _,
             status,
         } = event;
+        self.active_patch_applies.remove(&call_id);
 
         let (title, locations, content) = if !changes.is_empty() {
             let (title, locations, content) = extract_tool_call_content_from_changes(changes);
@@ -2989,10 +3022,7 @@ impl<A: Auth> ThreadActor<A> {
         status
     }
 
-    async fn set_service_tier(
-        &mut self,
-        service_tier: Option<ServiceTier>,
-    ) -> Result<(), Error> {
+    async fn set_service_tier(&mut self, service_tier: Option<ServiceTier>) -> Result<(), Error> {
         self.thread
             .submit(Op::OverrideTurnContext {
                 cwd: None,
@@ -3494,12 +3524,12 @@ impl<A: Auth> ThreadActor<A> {
                         "off" => None,
                         "status" => {
                             let client = self.client.clone();
-                            let status = if matches!(self.config.service_tier, Some(ServiceTier::Fast))
-                            {
-                                "on"
-                            } else {
-                                "off"
-                            };
+                            let status =
+                                if matches!(self.config.service_tier, Some(ServiceTier::Fast)) {
+                                    "on"
+                                } else {
+                                    "off"
+                                };
                             client
                                 .send_agent_text(format!("Fast mode is {status}.\n"))
                                 .await;
@@ -5628,6 +5658,35 @@ mod tests {
                             last_agent_message: None,
                             turn_id: id.to_string(),
                         }));
+                    } else if prompt == "emit-patch-abort" {
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        // Emit a PatchApplyBegin with one fake file change, then
+                        // abort without ever emitting PatchApplyEnd.
+                        let mut changes = HashMap::new();
+                        changes.insert(
+                            PathBuf::from("/tmp/fake-file.txt"),
+                            FileChange::Add {
+                                content: "new content".to_string(),
+                            },
+                        );
+                        send(EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
+                            call_id: "patch-call-1".to_string(),
+                            auto_approved: true,
+                            changes,
+                            turn_id: id.to_string(),
+                        }));
+                        // Abort without PatchApplyEnd
+                        send(EventMsg::TurnAborted(TurnAbortedEvent {
+                            turn_id: Some(id.to_string()),
+                            reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                        }));
                     } else if prompt == "emit-collab-waiting" {
                         let send = |msg| {
                             self.op_tx
@@ -6751,7 +6810,9 @@ mod tests {
         )?;
 
         assert!(
-            options.iter().any(|option| option.id.0.as_ref() == "service_tier"),
+            options
+                .iter()
+                .any(|option| option.id.0.as_ref() == "service_tier"),
             "expected service_tier config option, got {options:?}"
         );
 
@@ -7486,7 +7547,9 @@ mod tests {
 
         // Both should have size = 128000
         assert_eq!(usage_updates[0].size, 128000);
+        assert_eq!(usage_updates[0].used, 180);
         assert_eq!(usage_updates[1].size, 128000);
+        assert_eq!(usage_updates[1].used, 360);
 
         // First should include cost from credits balance
         assert!(
@@ -7756,6 +7819,71 @@ mod tests {
         // Verify no ToolCall or ToolCallUpdate notifications were sent for the orphaned events
         // (since ExecCommandBegin was never sent, no ActiveCommand was created)
         // The test succeeding without panic proves the else-clause warnings work correctly.
+        Ok(())
+    }
+
+    // ==================== Patch apply abort tests ====================
+
+    #[tokio::test]
+    async fn test_patch_apply_abort_marks_edit_failed() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["emit-patch-abort".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::Cancelled);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+
+        // There should be a ToolCall for the patch with InProgress status
+        assert!(
+            notifications.iter().any(|n| matches!(
+                &n.update,
+                SessionUpdate::ToolCall(tool_call)
+                    if tool_call.tool_call_id.0.as_ref() == "patch-call-1"
+                        && tool_call.status == ToolCallStatus::InProgress
+            )),
+            "expected InProgress ToolCall for patch-call-1, got {notifications:?}"
+        );
+
+        // There should be a ToolCallUpdate for the same call id with Failed status
+        assert!(
+            notifications.iter().any(|n| matches!(
+                &n.update,
+                SessionUpdate::ToolCallUpdate(update)
+                    if update.tool_call_id.0.as_ref() == "patch-call-1"
+                        && update.fields.status == Some(ToolCallStatus::Failed)
+                        && update
+                            .fields
+                            .content
+                            .as_ref()
+                            .is_some_and(|content| content.iter().any(|item| {
+                                matches!(
+                                    item,
+                                    ToolCallContent::Content(Content {
+                                        content: ContentBlock::Text(TextContent { text, .. }),
+                                        ..
+                                    }) if text == "Edit interrupted before completion."
+                                )
+                            }))
+            )),
+            "expected Failed ToolCallUpdate for patch-call-1 with interruption message, got {notifications:?}"
+        );
+
         Ok(())
     }
 
