@@ -407,6 +407,24 @@ fn context_compaction_status_text(status: ToolCallStatus) -> &'static str {
     }
 }
 
+fn response_tool_status(status: Option<&str>) -> Option<ToolCallStatus> {
+    match status {
+        Some("pending") => Some(ToolCallStatus::Pending),
+        Some("in_progress") => Some(ToolCallStatus::InProgress),
+        Some("completed") => Some(ToolCallStatus::Completed),
+        Some("failed") => Some(ToolCallStatus::Failed),
+        _ => None,
+    }
+}
+
+fn patch_apply_tool_status(status: &PatchApplyStatus, success: bool) -> ToolCallStatus {
+    match status {
+        PatchApplyStatus::Completed => ToolCallStatus::Completed,
+        _ if success => ToolCallStatus::Completed,
+        PatchApplyStatus::Failed | PatchApplyStatus::Declined => ToolCallStatus::Failed,
+    }
+}
+
 fn is_auto_compact_submission_id(id: &str) -> bool {
     id.starts_with("auto-compact-")
 }
@@ -1743,11 +1761,7 @@ impl PromptState {
             (None, None, None)
         };
 
-        let status = match status {
-            PatchApplyStatus::Completed => ToolCallStatus::Completed,
-            _ if success => ToolCallStatus::Completed,
-            PatchApplyStatus::Failed | PatchApplyStatus::Declined => ToolCallStatus::Failed,
-        };
+        let status = patch_apply_tool_status(&status, success);
 
         client
             .send_tool_call_update(ToolCallUpdate::new(
@@ -3954,13 +3968,16 @@ impl<A: Auth> ThreadActor<A> {
     /// - `EventMsg` for user/agent messages and reasoning (like the TUI does)
     /// - `ResponseItem` for tool calls only (not persisted as EventMsg)
     async fn handle_replay_history(&mut self, history: Vec<RolloutItem>) -> Result<(), Error> {
+        let apply_patch_statuses = self.derive_apply_patch_replay_statuses(&history);
+
         for item in history {
             match item {
                 RolloutItem::EventMsg(event_msg) => {
                     self.replay_event_msg(&event_msg).await;
                 }
                 RolloutItem::ResponseItem(response_item) => {
-                    self.replay_response_item(&response_item).await;
+                    self.replay_response_item(&response_item, &apply_patch_statuses)
+                        .await;
                 }
                 // Skip SessionMeta, TurnContext, Compacted
                 _ => {}
@@ -4067,6 +4084,19 @@ impl<A: Auth> ThreadActor<A> {
         Some((title, locations, content))
     }
 
+    fn parse_apply_patch_function_call(
+        &self,
+        arguments: &str,
+    ) -> Option<(String, Vec<ToolCallLocation>, Vec<ToolCallContent>)> {
+        #[derive(serde::Deserialize)]
+        struct ApplyPatchArgs {
+            input: String,
+        }
+
+        let args: ApplyPatchArgs = serde_json::from_str(arguments).ok()?;
+        self.parse_apply_patch_call(&args.input)
+    }
+
     /// Parse shell function call arguments to extract command info for rich display.
     /// Returns (title, kind, locations) if successful.
     ///
@@ -4121,9 +4151,107 @@ impl<A: Auth> ThreadActor<A> {
         Some((title, kind, locations))
     }
 
+    fn derive_apply_patch_replay_statuses(
+        &self,
+        history: &[RolloutItem],
+    ) -> HashMap<String, ToolCallStatus> {
+        let mut statuses = HashMap::new();
+        let mut active = HashSet::new();
+
+        for item in history {
+            match item {
+                RolloutItem::ResponseItem(ResponseItem::CustomToolCall {
+                    name,
+                    status,
+                    call_id,
+                    ..
+                }) if name == "apply_patch" => {
+                    let tool_status = response_tool_status(status.as_deref())
+                        .unwrap_or(ToolCallStatus::InProgress);
+
+                    if matches!(
+                        tool_status,
+                        ToolCallStatus::Completed | ToolCallStatus::Failed
+                    ) {
+                        active.remove(call_id);
+                    } else {
+                        active.insert(call_id.clone());
+                    }
+
+                    statuses.insert(call_id.clone(), tool_status);
+                }
+                RolloutItem::ResponseItem(ResponseItem::FunctionCall { name, call_id, .. })
+                    if name == "apply_patch" =>
+                {
+                    active.insert(call_id.clone());
+                    statuses
+                        .entry(call_id.clone())
+                        .or_insert(ToolCallStatus::InProgress);
+                }
+                RolloutItem::ResponseItem(
+                    ResponseItem::FunctionCallOutput { call_id, .. }
+                    | ResponseItem::CustomToolCallOutput { call_id, .. },
+                ) => {
+                    if active.remove(call_id) || statuses.contains_key(call_id) {
+                        statuses.insert(call_id.clone(), ToolCallStatus::Completed);
+                    }
+                }
+                RolloutItem::EventMsg(EventMsg::PatchApplyEnd(PatchApplyEndEvent {
+                    call_id,
+                    success,
+                    status,
+                    ..
+                })) => {
+                    active.remove(call_id);
+                    statuses.insert(call_id.clone(), patch_apply_tool_status(status, *success));
+                }
+                RolloutItem::EventMsg(EventMsg::TurnAborted(_))
+                | RolloutItem::EventMsg(EventMsg::Error(_))
+                | RolloutItem::EventMsg(EventMsg::ShutdownComplete) => {
+                    for call_id in active.drain() {
+                        statuses.insert(call_id, ToolCallStatus::Failed);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        statuses
+    }
+
+    async fn replay_apply_patch_tool_call(
+        &self,
+        call_id: &str,
+        raw_input: Option<serde_json::Value>,
+        parsed: Option<(String, Vec<ToolCallLocation>, Vec<ToolCallContent>)>,
+        status: ToolCallStatus,
+    ) {
+        let mut tool_call = if let Some((title, locations, content)) = parsed {
+            ToolCall::new(call_id.to_string(), title)
+                .kind(ToolKind::Edit)
+                .status(status)
+                .locations(locations)
+                .content(content)
+        } else {
+            ToolCall::new(call_id.to_string(), "Apply patch")
+                .kind(ToolKind::Edit)
+                .status(status)
+        };
+
+        if let Some(raw_input) = raw_input {
+            tool_call = tool_call.raw_input(raw_input);
+        }
+
+        self.client.send_tool_call(tool_call).await;
+    }
+
     /// Convert and send a single ResponseItem as ACP notification(s) during replay.
     /// Only handles tool calls - messages/reasoning are handled via EventMsg.
-    async fn replay_response_item(&self, item: &ResponseItem) {
+    async fn replay_response_item(
+        &self,
+        item: &ResponseItem,
+        apply_patch_statuses: &HashMap<String, ToolCallStatus>,
+    ) {
         match item {
             // Skip Message and Reasoning - these are handled via EventMsg
             ResponseItem::Message { .. } | ResponseItem::Reasoning { .. } => {}
@@ -4149,6 +4277,22 @@ impl<A: Auth> ThreadActor<A> {
                                 ),
                         )
                         .await;
+                    return;
+                }
+
+                if name == "apply_patch" {
+                    let status = apply_patch_statuses
+                        .get(call_id)
+                        .copied()
+                        .unwrap_or(ToolCallStatus::InProgress);
+
+                    self.replay_apply_patch_tool_call(
+                        call_id,
+                        serde_json::from_str(arguments).ok(),
+                        self.parse_apply_patch_function_call(arguments),
+                        status,
+                    )
+                    .await;
                     return;
                 }
 
@@ -4214,20 +4358,19 @@ impl<A: Auth> ThreadActor<A> {
                 call_id,
                 ..
             } => {
-                // Check if this is an apply_patch call - show the patch content
-                if name == "apply_patch"
-                    && let Some((title, locations, content)) = self.parse_apply_patch_call(input)
-                {
-                    self.client
-                        .send_tool_call(
-                            ToolCall::new(call_id.clone(), title)
-                                .kind(ToolKind::Edit)
-                                .status(ToolCallStatus::Completed)
-                                .locations(locations)
-                                .content(content)
-                                .raw_input(serde_json::from_str::<serde_json::Value>(input).ok()),
-                        )
-                        .await;
+                if name == "apply_patch" {
+                    let status = apply_patch_statuses
+                        .get(call_id)
+                        .copied()
+                        .unwrap_or(ToolCallStatus::InProgress);
+
+                    self.replay_apply_patch_tool_call(
+                        call_id,
+                        serde_json::from_str::<serde_json::Value>(input).ok(),
+                        self.parse_apply_patch_call(input),
+                        status,
+                    )
+                    .await;
                     return;
                 }
 
@@ -8152,6 +8295,82 @@ mod tests {
                             }))
             )),
             "expected Failed ToolCallUpdate for patch-call-1 with interruption message, got {notifications:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_interrupted_apply_patch_marks_edit_failed() -> anyhow::Result<()> {
+        let (_session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        let patch = "*** Begin Patch\n*** Add File: replay_patch.txt\n+hello\n*** End Patch\n";
+        let function_arguments = serde_json::to_string(&serde_json::json!({
+            "input": patch,
+        }))?;
+
+        message_tx.send(ThreadMessage::ReplayHistory {
+            history: vec![
+                RolloutItem::ResponseItem(ResponseItem::CustomToolCall {
+                    id: None,
+                    status: Some("in_progress".to_string()),
+                    call_id: "replay-patch-custom".to_string(),
+                    name: "apply_patch".to_string(),
+                    input: patch.to_string(),
+                }),
+                RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                    id: None,
+                    name: "apply_patch".to_string(),
+                    arguments: function_arguments,
+                    call_id: "replay-patch-function".to_string(),
+                }),
+                RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
+                    turn_id: Some("turn-1".to_string()),
+                    reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                })),
+            ],
+            response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                response_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let tool_calls: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::ToolCall(tool_call) => Some(tool_call.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            tool_calls.iter().any(|tool_call| {
+                tool_call.tool_call_id.0.as_ref() == "replay-patch-custom"
+                    && tool_call.kind == ToolKind::Edit
+                    && tool_call.status == ToolCallStatus::Failed
+                    && tool_call.title.contains("replay_patch.txt")
+            }),
+            "expected replayed custom apply_patch to be a failed edit tool call, got {tool_calls:?}"
+        );
+        assert!(
+            tool_calls.iter().any(|tool_call| {
+                tool_call.tool_call_id.0.as_ref() == "replay-patch-function"
+                    && tool_call.kind == ToolKind::Edit
+                    && tool_call.status == ToolCallStatus::Failed
+                    && tool_call.title.contains("replay_patch.txt")
+            }),
+            "expected replayed function apply_patch to be a failed edit tool call, got {tool_calls:?}"
         );
 
         Ok(())
