@@ -47,10 +47,11 @@ use codex_protocol::{
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
         AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent,
-        ApplyPatchApprovalRequestEvent, BackgroundEventEvent, CollabAgentInteractionBeginEvent,
-        CollabAgentInteractionEndEvent, CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent,
-        DeprecationNoticeEvent, DynamicToolCallResponseEvent, ElicitationAction, ErrorEvent, Event,
-        EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent,
+        ApplyPatchApprovalRequestEvent, AskForApproval, BackgroundEventEvent,
+        CollabAgentInteractionBeginEvent, CollabAgentInteractionEndEvent,
+        CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent, DeprecationNoticeEvent,
+        DynamicToolCallResponseEvent, ElicitationAction, ErrorEvent, Event, EventMsg,
+        ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent,
         ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent, FileChange,
         HookCompletedEvent, HookStartedEvent, ImageGenerationBeginEvent, ImageGenerationEndEvent,
         ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent,
@@ -3020,8 +3021,11 @@ impl<A: Auth> ThreadActor<A> {
         let mode_name = APPROVAL_PRESETS
             .iter()
             .find(|preset| {
-                &preset.approval == self.config.permissions.approval_policy.get()
-                    && &preset.sandbox == self.config.permissions.sandbox_policy.get()
+                Self::preset_matches_current(
+                    self.config.permissions.approval_policy.value(),
+                    self.config.permissions.sandbox_policy.get(),
+                    preset,
+                )
             })
             .map(|p| p.label)
             .unwrap_or("unknown");
@@ -3109,6 +3113,30 @@ impl<A: Auth> ThreadActor<A> {
         }
     }
 
+    fn preset_matches_current(
+        current_approval: AskForApproval,
+        current_sandbox: &SandboxPolicy,
+        preset: &ApprovalPreset,
+    ) -> bool {
+        if current_approval != preset.approval {
+            return false;
+        }
+
+        matches!(
+            (&preset.sandbox, current_sandbox),
+            (
+                SandboxPolicy::ReadOnly { .. },
+                SandboxPolicy::ReadOnly { .. }
+            ) | (
+                SandboxPolicy::DangerFullAccess,
+                SandboxPolicy::DangerFullAccess
+            ) | (
+                SandboxPolicy::WorkspaceWrite { .. },
+                SandboxPolicy::WorkspaceWrite { .. }
+            )
+        )
+    }
+
     async fn persist_mode_default(&self, preset: &ApprovalPreset) -> Result<(), Error> {
         self.persist_default_edits(vec![
             self.string_config_edit(&["approval_policy"], preset.approval),
@@ -3178,8 +3206,11 @@ impl<A: Auth> ThreadActor<A> {
             APPROVAL_PRESETS
                 .iter()
                 .find(|preset| {
-                    &preset.approval == self.config.permissions.approval_policy.get()
-                        && &preset.sandbox == self.config.permissions.sandbox_policy.get()
+                    Self::preset_matches_current(
+                        self.config.permissions.approval_policy.value(),
+                        self.config.permissions.sandbox_policy.get(),
+                        preset,
+                    )
                 })
                 .or_else(|| {
                     // When the project is untrusted, the above code won't match
@@ -6877,7 +6908,10 @@ mod tests {
                 ..
             }) = &n.update
             {
-                t.text.contains("Session Status") && t.text.contains("**Service Tier:** Standard")
+                t.text.contains("Session Status")
+                    && t.text.contains("**Mode:**")
+                    && !t.text.contains("**Mode:** unknown")
+                    && t.text.contains("**Service Tier:** Standard")
             } else {
                 false
             }
@@ -7152,6 +7186,32 @@ mod tests {
                 .iter()
                 .any(|option| option.id.0.as_ref() == "service_tier"),
             "expected service_tier config option, got {options:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_config_options_include_mode() -> anyhow::Result<()> {
+        let (_session_id, _client, _thread, message_tx, local_set) = setup(vec![]).await?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::GetConfigOptions { response_tx })?;
+        let (options, _) = tokio::try_join!(
+            async {
+                let options = response_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(options)
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        assert!(
+            options.iter().any(|option| option.id.0.as_ref() == "mode"),
+            "expected mode config option, got {options:?}"
         );
 
         Ok(())
