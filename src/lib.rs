@@ -50,18 +50,24 @@ pub async fn run_main(
         ..ConfigOverrides::default()
     };
 
-    let config =
-        Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, config_overrides)
-            .await
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("error loading config: {e}"),
-                )
-            })?;
+    let config = Config::load_with_cli_overrides_and_harness_overrides(
+        cli_kv_overrides.clone(),
+        config_overrides.clone(),
+    )
+    .await
+    .map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("error loading config: {e}"),
+        )
+    })?;
 
     // Create our Agent implementation with notification channel
-    let agent = Rc::new(codex_agent::CodexAgent::new(config));
+    let agent = Rc::new(codex_agent::CodexAgent::new(
+        config,
+        cli_kv_overrides,
+        config_overrides,
+    ));
 
     let stdin = tokio::io::stdin().compat();
     let stdout = tokio::io::stdout().compat_write();

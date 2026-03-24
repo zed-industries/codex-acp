@@ -85,8 +85,7 @@ dependencies = [
 [[package]]
 name = "agent-client-protocol"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c56a59cf6315e99f874d2c1f96c69d2da5ffe0087d211297fc4a41f849770a2"
+source = "git+https://github.com/agentclientprotocol/rust-sdk?branch=main#06ca772108909542e764eb80b8a058a2ca7d939d"
 dependencies = [
  "agent-client-protocol-schema",
  "anyhow",
@@ -101,9 +100,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-schema"
-version = "0.11.2"
+version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0497b9a95a404e35799904835c57c6f8c69b9d08ccfd3cb5b7d746425cd6789"
+checksum = "96daddd0d00f2eab88f8099d38190881bf8d6c5e46b6fa21751f482775d0dba7"
 dependencies = [
  "anyhow",
  "derive_more 2.1.1",
@@ -1030,6 +1029,8 @@ dependencies = [
  "shlex",
  "tokio",
  "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
+ "toml_edit 0.24.1+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "unicode-segmentation",

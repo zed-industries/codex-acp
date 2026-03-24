@@ -18,7 +18,7 @@ name = "codex_acp"
 path = "src/lib.rs"
 
 [dependencies]
-agent-client-protocol = { version = "=0.10.2", features = ["unstable"] }
+agent-client-protocol = { git = "https://github.com/agentclientprotocol/rust-sdk", branch = "main", features = ["unstable"] }
 anyhow = "1"
 async-trait = "0.1"
 clap = "4"
@@ -40,6 +40,8 @@ serde_json = { version = "1", features = ["preserve_order"] }
 shlex = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
 tokio-util = { version = "0.7", features = ["compat"] }
+toml = "0.9.12"
+toml_edit = "0.24.1"
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 heck = "0.5.0"
