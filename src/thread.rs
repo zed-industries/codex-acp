@@ -23,7 +23,11 @@ use agent_client_protocol::{
 use codex_apply_patch::parse_patch;
 use codex_core::{
     AuthManager, CodexThread,
-    config::{Config, set_project_trust_level},
+    config::{
+        Config,
+        edit::{ConfigEdit, ConfigEditsBuilder},
+        set_project_trust_level,
+    },
     error::CodexErr,
     models_manager::manager::{ModelsManager, RefreshStrategy},
     review_format::format_review_findings_block,
@@ -71,6 +75,7 @@ use heck::ToTitleCase;
 use itertools::Itertools;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
+use toml_edit::value;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -3040,8 +3045,93 @@ impl<A: Auth> ThreadActor<A> {
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
         self.config.service_tier = service_tier;
+        self.persist_service_tier_default(service_tier).await?;
 
         Ok(())
+    }
+
+    fn scoped_config_segments(&self, segments: &[&str]) -> Vec<String> {
+        let mut scoped = Vec::with_capacity(segments.len() + 2);
+        if let Some(profile) = self.config.active_profile.as_ref() {
+            scoped.push("profiles".to_string());
+            scoped.push(profile.clone());
+        }
+        scoped.extend(segments.iter().map(|segment| (*segment).to_string()));
+        scoped
+    }
+
+    fn string_config_edit(&self, segments: &[&str], value_str: impl ToString) -> ConfigEdit {
+        ConfigEdit::SetPath {
+            segments: self.scoped_config_segments(segments),
+            value: value(value_str.to_string()),
+        }
+    }
+
+    fn clear_config_edit(&self, segments: &[&str]) -> ConfigEdit {
+        ConfigEdit::ClearPath {
+            segments: self.scoped_config_segments(segments),
+        }
+    }
+
+    async fn persist_default_edits(&self, edits: Vec<ConfigEdit>) -> Result<(), Error> {
+        ConfigEditsBuilder::new(&self.config.codex_home)
+            .with_edits(edits)
+            .apply()
+            .await
+            .map_err(|e| {
+                Error::internal_error().data(format!(
+                    "Updated session, but failed to persist defaults: {e}"
+                ))
+            })
+    }
+
+    fn sandbox_mode_tag(sandbox: &SandboxPolicy) -> &'static str {
+        match sandbox {
+            SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
+                "danger-full-access"
+            }
+            SandboxPolicy::ReadOnly { .. } => "read-only",
+            SandboxPolicy::WorkspaceWrite { .. } => "workspace-write",
+        }
+    }
+
+    async fn persist_mode_default(&self, preset: &ApprovalPreset) -> Result<(), Error> {
+        self.persist_default_edits(vec![
+            self.string_config_edit(&["approval_policy"], preset.approval),
+            self.string_config_edit(&["sandbox_mode"], Self::sandbox_mode_tag(&preset.sandbox)),
+        ])
+        .await
+    }
+
+    async fn persist_model_default(
+        &self,
+        model: &str,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<(), Error> {
+        let mut edits = vec![self.string_config_edit(&["model"], model)];
+        edits.push(match effort {
+            Some(effort) => self.string_config_edit(&["model_reasoning_effort"], effort),
+            None => self.clear_config_edit(&["model_reasoning_effort"]),
+        });
+        self.persist_default_edits(edits).await
+    }
+
+    async fn persist_reasoning_effort_default(&self, effort: ReasoningEffort) -> Result<(), Error> {
+        self.persist_default_edits(vec![
+            self.string_config_edit(&["model_reasoning_effort"], effort),
+        ])
+        .await
+    }
+
+    async fn persist_service_tier_default(
+        &self,
+        service_tier: Option<ServiceTier>,
+    ) -> Result<(), Error> {
+        self.persist_default_edits(vec![match service_tier {
+            Some(service_tier) => self.string_config_edit(&["service_tier"], service_tier),
+            None => self.clear_config_edit(&["service_tier"]),
+        }])
+        .await
     }
 
     async fn load_custom_prompts(&mut self) -> oneshot::Receiver<Result<Vec<CustomPrompt>, Error>> {
@@ -3343,6 +3433,11 @@ impl<A: Auth> ThreadActor<A> {
 
         self.config.model = Some(model_to_use);
         self.config.model_reasoning_effort = effort_to_use;
+        self.persist_model_default(
+            self.config.model.as_deref().unwrap_or_default(),
+            self.config.model_reasoning_effort,
+        )
+        .await?;
 
         Ok(())
     }
@@ -3402,6 +3497,7 @@ impl<A: Auth> ThreadActor<A> {
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
         self.config.model_reasoning_effort = Some(effort);
+        self.persist_reasoning_effort_default(effort).await?;
 
         Ok(())
     }
@@ -3546,6 +3642,7 @@ impl<A: Auth> ThreadActor<A> {
                         }
                     };
                     self.set_service_tier(tier).await?;
+                    self.maybe_emit_config_options_update().await;
                     let client = self.client.clone();
                     let status = if matches!(tier, Some(ServiceTier::Fast)) {
                         "on"
@@ -3772,6 +3869,8 @@ impl<A: Auth> ThreadActor<A> {
             SandboxPolicy::ReadOnly { .. } => {}
         }
 
+        self.persist_mode_default(preset).await?;
+
         Ok(())
     }
 
@@ -3815,6 +3914,11 @@ impl<A: Auth> ThreadActor<A> {
 
         self.config.model = Some(model_to_use);
         self.config.model_reasoning_effort = effort_to_use;
+        self.persist_model_default(
+            self.config.model.as_deref().unwrap_or_default(),
+            self.config.model_reasoning_effort,
+        )
+        .await?;
 
         Ok(())
     }
@@ -4509,8 +4613,13 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
-    use agent_client_protocol::{RequestPermissionResponse, TextContent};
-    use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
+    use agent_client_protocol::{
+        RequestPermissionResponse, SessionConfigKind, SessionConfigSelect, TextContent,
+    };
+    use codex_core::{
+        config::{ConfigBuilder, ConfigOverrides},
+        test_support::all_model_presets,
+    };
     use codex_protocol::config_types::{ModeKind, ServiceTier};
     use tokio::{
         sync::{Mutex, Notify, mpsc::UnboundedSender},
@@ -5015,7 +5124,27 @@ mod tests {
         Ok(())
     }
 
-    async fn setup(
+    fn make_test_codex_home() -> anyhow::Result<PathBuf> {
+        let codex_home = std::env::temp_dir().join(format!("codex-acp-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&codex_home)?;
+        Ok(codex_home)
+    }
+
+    async fn default_test_config() -> anyhow::Result<Config> {
+        let codex_home = make_test_codex_home()?;
+        let cwd = std::env::current_dir()?;
+        Ok(ConfigBuilder::default()
+            .codex_home(codex_home)
+            .harness_overrides(ConfigOverrides {
+                cwd: Some(cwd),
+                ..ConfigOverrides::default()
+            })
+            .build()
+            .await?)
+    }
+
+    async fn setup_with_config(
+        config: Config,
         custom_prompts: Vec<CustomPrompt>,
     ) -> anyhow::Result<(
         SessionId,
@@ -5030,11 +5159,6 @@ mod tests {
             SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
         let conversation = Arc::new(StubCodexThread::new());
         let models_manager = Arc::new(StubModelsManager);
-        let config = Config::load_with_cli_overrides_and_harness_overrides(
-            vec![],
-            ConfigOverrides::default(),
-        )
-        .await?;
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -5053,6 +5177,18 @@ mod tests {
         let local_set = LocalSet::new();
         local_set.spawn_local(actor.spawn());
         Ok((session_id, client, conversation, message_tx, local_set))
+    }
+
+    async fn setup(
+        custom_prompts: Vec<CustomPrompt>,
+    ) -> anyhow::Result<(
+        SessionId,
+        Arc<StubClient>,
+        Arc<StubCodexThread>,
+        UnboundedSender<ThreadMessage>,
+        LocalSet,
+    )> {
+        setup_with_config(default_test_config().await?, custom_prompts).await
     }
 
     struct StubAuth;
@@ -6699,6 +6835,18 @@ mod tests {
                 ..
             }) if text == "Fast mode is on.\n"
         )));
+        assert!(notifications.iter().any(|n| matches!(
+            &n.update,
+            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate { config_options, .. })
+                if config_options.iter().any(|option| {
+                    option.id.0.as_ref() == "service_tier"
+                        && matches!(
+                            option.kind,
+                            SessionConfigKind::Select(SessionConfigSelect { ref current_value, .. })
+                                if current_value.0.as_ref() == "fast"
+                        )
+                })
+        )));
 
         Ok(())
     }
@@ -6746,6 +6894,53 @@ mod tests {
                 ..
             }) if text == "Fast mode is off.\n"
         )));
+        assert!(notifications.iter().any(|n| matches!(
+            &n.update,
+            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate { config_options, .. })
+                if config_options.iter().any(|option| {
+                    option.id.0.as_ref() == "service_tier"
+                        && matches!(
+                            option.kind,
+                            SessionConfigKind::Select(SessionConfigSelect { ref current_value, .. })
+                                if current_value.0.as_ref() == "standard"
+                        )
+                })
+        )));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_slash_fast_persists_service_tier_default() -> anyhow::Result<()> {
+        let config = default_test_config().await?;
+        let codex_home = config.codex_home.clone();
+        let (session_id, _client, _thread, message_tx, local_set) =
+            setup_with_config(config, vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id, vec!["/fast on".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let contents = std::fs::read_to_string(codex_home.join("config.toml"))?;
+        assert!(
+            contents.contains("service_tier = \"fast\""),
+            "expected persisted fast service tier, got {contents:?}"
+        );
 
         Ok(())
     }
@@ -6853,6 +7048,81 @@ mod tests {
                 }
             )),
             "expected service tier override op, got {ops:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_set_mode_persists_defaults() -> anyhow::Result<()> {
+        let config = default_test_config().await?;
+        let codex_home = config.codex_home.clone();
+        let (_session_id, _client, _thread, message_tx, local_set) =
+            setup_with_config(config, vec![]).await?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::SetMode {
+            mode: SessionModeId::new("full-access"),
+            response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                response_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let contents = std::fs::read_to_string(codex_home.join("config.toml"))?;
+        assert!(
+            contents.contains("approval_policy = \"never\""),
+            "expected persisted approval policy, got {contents:?}"
+        );
+        assert!(
+            contents.contains("sandbox_mode = \"danger-full-access\""),
+            "expected persisted sandbox mode, got {contents:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_set_reasoning_effort_persists_default() -> anyhow::Result<()> {
+        let config = default_test_config().await?;
+        let codex_home = config.codex_home.clone();
+        let (_session_id, _client, _thread, message_tx, local_set) =
+            setup_with_config(config, vec![]).await?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::SetConfigOption {
+            config_id: SessionConfigId::new("reasoning_effort"),
+            value: SessionConfigOptionValue::ValueId {
+                value: SessionConfigValueId::new("high"),
+            },
+            response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                response_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let contents = std::fs::read_to_string(codex_home.join("config.toml"))?;
+        assert!(
+            contents.contains("model_reasoning_effort = \"high\""),
+            "expected persisted reasoning effort, got {contents:?}"
         );
 
         Ok(())

@@ -8,18 +8,16 @@ use agent_client_protocol::{
     NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
     SessionCapabilities, SessionCloseCapabilities, SessionForkCapabilities, SessionId, SessionInfo,
     SessionListCapabilities, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-    SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest,
-    SetSessionModelResponse,
+    SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
 use codex_core::{
     CodexAuth, NewThread, RolloutRecorder, ThreadManager, ThreadSortKey,
     auth::{AuthManager, read_codex_api_key_from_env, read_openai_api_key_from_env},
     config::{
-        Config,
+        Config, ConfigBuilder, ConfigOverrides,
         types::{McpServerConfig, McpServerTransportConfig},
     },
-    find_thread_path_by_id_str,
-    find_thread_names_by_ids,
+    find_thread_names_by_ids, find_thread_path_by_id_str,
     models_manager::collaboration_mode_presets::CollaborationModesConfig,
     parse_cursor,
 };
@@ -35,6 +33,7 @@ use std::{
     rc::Rc,
     sync::{Arc, Mutex},
 };
+use toml::Value as TomlValue;
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -54,6 +53,10 @@ pub struct CodexAgent {
     client_capabilities: Arc<Mutex<ClientCapabilities>>,
     /// The underlying codex configuration
     config: Config,
+    /// CLI config overrides captured at startup and reapplied when building sessions.
+    cli_config_overrides: Vec<(String, TomlValue)>,
+    /// Non-TOML harness overrides captured at startup and reapplied when building sessions.
+    config_overrides: ConfigOverrides,
     /// Thread manager for handling sessions
     thread_manager: ThreadManager,
     /// Active sessions mapped by `SessionId`
@@ -67,7 +70,11 @@ const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
-    pub fn new(config: Config) -> Self {
+    pub fn new(
+        config: Config,
+        cli_config_overrides: Vec<(String, TomlValue)>,
+        config_overrides: ConfigOverrides,
+    ) -> Self {
         let auth_manager = AuthManager::shared(
             config.codex_home.clone(),
             false,
@@ -101,6 +108,8 @@ impl CodexAgent {
             auth_manager,
             client_capabilities,
             config,
+            cli_config_overrides,
+            config_overrides,
             thread_manager,
             sessions: Rc::default(),
             session_roots,
@@ -129,14 +138,22 @@ impl CodexAgent {
 
     /// Build a session config from base config, working directory, and MCP servers.
     /// This is shared between `new_session` and `load_session`.
-    fn build_session_config(
+    async fn build_session_config(
         &self,
         cwd: &PathBuf,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Config, Error> {
-        let mut config = self.config.clone();
+        let mut config_overrides = self.config_overrides.clone();
+        config_overrides.cwd = Some(cwd.clone());
+
+        let mut config = ConfigBuilder::default()
+            .codex_home(self.config.codex_home.clone())
+            .cli_overrides(self.cli_config_overrides.clone())
+            .harness_overrides(config_overrides)
+            .build()
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
         config.include_apply_patch_tool = true;
-        config.cwd.clone_from(cwd);
 
         // Propagate any client-provided MCP servers that codex-rs supports.
         let mut new_mcp_servers = config.mcp_servers.get().clone();
@@ -234,7 +251,10 @@ impl Agent for CodexAgent {
         debug!("Received initialize request with protocol version {protocol_version:?}",);
         let protocol_version = ProtocolVersion::V1;
 
-        *self.client_capabilities.lock().unwrap_or_else(|e| e.into_inner()) = client_capabilities;
+        *self
+            .client_capabilities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = client_capabilities;
 
         let mut agent_capabilities = AgentCapabilities::new()
             .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
@@ -340,7 +360,7 @@ impl Agent for CodexAgent {
         } = request;
         info!("Creating new session with cwd: {}", cwd.display());
 
-        let config = self.build_session_config(&cwd, mcp_servers)?;
+        let config = self.build_session_config(&cwd, mcp_servers).await?;
         let num_mcp_servers = config.mcp_servers.len();
 
         let NewThread {
@@ -410,7 +430,7 @@ impl Agent for CodexAgent {
             InitialHistory::New => Vec::new(),
         };
 
-        let config = self.build_session_config(&cwd, mcp_servers)?;
+        let config = self.build_session_config(&cwd, mcp_servers).await?;
 
         let NewThread {
             thread_id: _,
@@ -463,7 +483,10 @@ impl Agent for CodexAgent {
                 .ok()
                 .and_then(|roots| roots.values().next().cloned())
         });
-        debug!("list_sessions called: effective_cwd={:?}, cursor={:?}", effective_cwd, cursor);
+        debug!(
+            "list_sessions called: effective_cwd={:?}, cursor={:?}",
+            effective_cwd, cursor
+        );
         let cursor_obj = cursor.as_deref().and_then(parse_cursor);
 
         let page = RolloutRecorder::list_threads(
@@ -471,9 +494,7 @@ impl Agent for CodexAgent {
             SESSION_LIST_PAGE_SIZE,
             cursor_obj.as_ref(),
             ThreadSortKey::UpdatedAt,
-            &[
-                SessionSource::VSCode,
-            ],
+            &[SessionSource::VSCode],
             None,
             self.config.model_provider_id.as_str(),
             None,
@@ -483,7 +504,11 @@ impl Agent for CodexAgent {
 
         // Filter to current cwd (normalize paths for comparison).
         let filter_cwd = effective_cwd.as_ref().map(|p| normalize_path(p));
-        debug!("list_sessions: {} items from backend, filter_cwd={:?}", page.items.len(), filter_cwd);
+        debug!(
+            "list_sessions: {} items from backend, filter_cwd={:?}",
+            page.items.len(),
+            filter_cwd
+        );
         let items_with_ids: Vec<_> = page
             .items
             .into_iter()
@@ -494,18 +519,30 @@ impl Agent for CodexAgent {
                 if let Some(ref filter) = filter_cwd {
                     let normalized = normalize_path(&item_cwd);
                     if normalized != *filter {
-                        debug!("list_sessions: filtered out thread {:?} (cwd={:?} != {:?})", thread_id, normalized, filter);
+                        debug!(
+                            "list_sessions: filtered out thread {:?} (cwd={:?} != {:?})",
+                            thread_id, normalized, filter
+                        );
                         return None;
                     }
                 }
 
-                Some((thread_id, item_cwd, item.first_user_message, item.updated_at.or(item.created_at)))
+                Some((
+                    thread_id,
+                    item_cwd,
+                    item.first_user_message,
+                    item.updated_at.or(item.created_at),
+                ))
             })
             .collect();
-        debug!("list_sessions: {} items after cwd filter", items_with_ids.len());
+        debug!(
+            "list_sessions: {} items after cwd filter",
+            items_with_ids.len()
+        );
 
         // Look up thread names from session_index.jsonl (same as TUI /resume).
-        let thread_ids: std::collections::HashSet<ThreadId> = items_with_ids.iter().map(|(id, ..)| id.clone()).collect();
+        let thread_ids: std::collections::HashSet<ThreadId> =
+            items_with_ids.iter().map(|(id, ..)| id.clone()).collect();
         let thread_names = find_thread_names_by_ids(&self.config.codex_home, &thread_ids)
             .await
             .unwrap_or_default();
@@ -517,11 +554,7 @@ impl Agent for CodexAgent {
                 let title = thread_names
                     .get(&thread_id)
                     .cloned()
-                    .or_else(|| {
-                        first_user_message
-                            .as_deref()
-                            .and_then(format_session_title)
-                    });
+                    .or_else(|| first_user_message.as_deref().and_then(format_session_title));
 
                 SessionInfo::new(SessionId::new(thread_id.to_string()), item_cwd)
                     .title(title)
@@ -561,10 +594,7 @@ impl Agent for CodexAgent {
         &self,
         request: ForkSessionRequest,
     ) -> Result<ForkSessionResponse, Error> {
-        info!(
-            "Forking session: {} into new session",
-            request.session_id
-        );
+        info!("Forking session: {} into new session", request.session_id);
         self.check_auth().await?;
 
         let ForkSessionRequest {
@@ -575,20 +605,18 @@ impl Agent for CodexAgent {
         } = request;
 
         // Find the source session's rollout path on disk
-        let rollout_path = find_thread_path_by_id_str(
-            &self.config.codex_home,
-            source_session_id.0.as_ref(),
-        )
-        .await
-        .map_err(|e| Error::internal_error().data(e.to_string()))?
-        .ok_or_else(|| {
-            Error::resource_not_found(Some(format!(
-                "Source session not found: {}",
-                source_session_id
-            )))
-        })?;
+        let rollout_path =
+            find_thread_path_by_id_str(&self.config.codex_home, source_session_id.0.as_ref())
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))?
+                .ok_or_else(|| {
+                    Error::resource_not_found(Some(format!(
+                        "Source session not found: {}",
+                        source_session_id
+                    )))
+                })?;
 
-        let config = self.build_session_config(&cwd, mcp_servers)?;
+        let config = self.build_session_config(&cwd, mcp_servers).await?;
 
         // Fork the thread — this creates a new thread with the source's full history
         let NewThread {
@@ -801,4 +829,42 @@ fn normalize_path(p: &std::path::Path) -> PathBuf {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::config_types::ServiceTier;
+
+    fn make_test_codex_home() -> anyhow::Result<PathBuf> {
+        let codex_home =
+            std::env::temp_dir().join(format!("codex-acp-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&codex_home)?;
+        Ok(codex_home)
+    }
+
+    #[tokio::test]
+    async fn build_session_config_reloads_latest_user_defaults() -> anyhow::Result<()> {
+        let codex_home = make_test_codex_home()?;
+        let cwd = codex_home.join("workspace");
+        std::fs::create_dir_all(&cwd)?;
+
+        let initial_config = ConfigBuilder::default()
+            .codex_home(codex_home.clone())
+            .harness_overrides(ConfigOverrides {
+                cwd: Some(cwd.clone()),
+                ..ConfigOverrides::default()
+            })
+            .build()
+            .await?;
+
+        let agent = CodexAgent::new(initial_config, vec![], ConfigOverrides::default());
+
+        std::fs::write(codex_home.join("config.toml"), "service_tier = \"fast\"\n")?;
+
+        let config = agent.build_session_config(&cwd, vec![]).await?;
+        assert_eq!(config.service_tier, Some(ServiceTier::Fast));
+
+        Ok(())
+    }
 }
