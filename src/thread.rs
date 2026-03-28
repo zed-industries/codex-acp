@@ -42,8 +42,9 @@ use codex_protocol::{
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
         AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent,
-        ApplyPatchApprovalRequestEvent, DynamicToolCallResponseEvent, ElicitationAction,
-        ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
+        ApplyPatchApprovalRequestEvent, AskForApproval, DynamicToolCallResponseEvent,
+        ElicitationAction, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent,
+        ExecCommandBeginEvent,
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
         FileChange, ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent,
         McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent,
@@ -75,6 +76,27 @@ use crate::{
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
+
+fn preset_matches_current_permissions(
+    current_approval: AskForApproval,
+    current_sandbox: &SandboxPolicy,
+    preset: &ApprovalPreset,
+) -> bool {
+    current_approval == preset.approval
+        && match (current_sandbox, &preset.sandbox) {
+            (
+                SandboxPolicy::ReadOnly {
+                    network_access: current_network_access,
+                    ..
+                },
+                SandboxPolicy::ReadOnly {
+                    network_access: preset_network_access,
+                    ..
+                },
+            ) => current_network_access == preset_network_access,
+            _ => current_sandbox == &preset.sandbox,
+        }
+}
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
 #[async_trait::async_trait]
@@ -2434,8 +2456,11 @@ impl<A: Auth> ThreadActor<A> {
         let current_mode_id = APPROVAL_PRESETS
             .iter()
             .find(|preset| {
-                &preset.approval == self.config.permissions.approval_policy.get()
-                    && &preset.sandbox == self.config.permissions.sandbox_policy.get()
+                preset_matches_current_permissions(
+                    *self.config.permissions.approval_policy.get(),
+                    self.config.permissions.sandbox_policy.get(),
+                    preset,
+                )
             })
             .or_else(|| {
                 // When the project is untrusted, the above code won't match
@@ -3469,6 +3494,8 @@ mod tests {
     use agent_client_protocol::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
     use codex_protocol::config_types::ModeKind;
+    use codex_protocol::protocol::ReadOnlyAccess;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use tokio::{
         sync::{Mutex, Notify, mpsc::UnboundedSender},
         task::LocalSet,
@@ -3646,6 +3673,59 @@ mod tests {
             }],
             "ops don't match {ops:?}"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_load_keeps_modes_for_trusted_read_only_policy() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id, client, Arc::default());
+        let conversation = Arc::new(StubCodexThread::new());
+        let models_manager = Arc::new(StubModelsManager);
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        set_project_trust_level(&config.codex_home, &config.cwd, TrustLevel::Trusted)?;
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config
+            .permissions
+            .sandbox_policy
+            .set(SandboxPolicy::ReadOnly {
+                access: ReadOnlyAccess::Restricted {
+                    include_platform_defaults: true,
+                    readable_roots: vec![AbsolutePathBuf::from_absolute_path("/tmp")
+                        .expect("/tmp is absolute")],
+                },
+                network_access: false,
+            })
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let (_message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            conversation,
+            models_manager,
+            config,
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+        );
+
+        let load = actor.handle_load().await?;
+        let modes = load.modes.expect("trusted read-only sessions should expose modes");
+        assert_eq!(modes.current_mode_id.0.as_ref(), "read-only");
 
         Ok(())
     }
