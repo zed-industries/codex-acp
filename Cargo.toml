@@ -29,6 +29,7 @@ codex-mcp-server = { git = "https://github.com/zed-industries/codex", branch = "
 codex-protocol = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-login = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-shell-command = { git = "https://github.com/zed-industries/codex", branch = "acp" }
+codex-utils-absolute-path = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-utils-approval-presets = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-utils-cli = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 itertools = "0.14.0"

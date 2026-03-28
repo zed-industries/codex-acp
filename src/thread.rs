@@ -3509,6 +3509,7 @@ mod tests {
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::protocol::ReadOnlyAccess;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use tokio::{
         sync::{Mutex, Notify, mpsc::UnboundedSender},
         task::LocalSet,
@@ -3744,7 +3745,7 @@ mod tests {
         )
         .await?;
         set_project_trust_level(&config.codex_home, &config.cwd, TrustLevel::Trusted)?;
-        let config = Config::load_with_cli_overrides_and_harness_overrides(
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
             vec![],
             ConfigOverrides::default(),
         )

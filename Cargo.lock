@@ -1020,6 +1020,7 @@ dependencies = [
  "codex-mcp-server",
  "codex-protocol",
  "codex-shell-command",
+ "codex-utils-absolute-path",
  "codex-utils-approval-presets",
  "codex-utils-cli",
  "heck",
