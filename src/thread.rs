@@ -4498,6 +4498,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_replay_exec_command_function_call_is_structured() -> anyhow::Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::new());
+                let session_client =
+                    SessionClient::with_client(session_id, client.clone(), Arc::default());
+                let thread = Arc::new(StubCodexThread::new());
+                let models_manager = Arc::new(StubModelsManager);
+                let config = Config::load_with_cli_overrides_and_harness_overrides(
+                    vec![],
+                    ConfigOverrides::default(),
+                )
+                .await?;
+                let (_message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+
+                let actor = ThreadActor::new(
+                    StubAuth,
+                    session_client,
+                    thread,
+                    models_manager,
+                    config,
+                    message_rx,
+                    resolution_tx,
+                    resolution_rx,
+                );
+
+                actor
+                    .replay_response_item(&ResponseItem::FunctionCall {
+                        id: None,
+                        call_id: "call-id".to_string(),
+                        name: "exec_command".to_string(),
+                        arguments: serde_json::json!({
+                            "cmd": "cat README.md",
+                            "workdir": "/tmp/project"
+                        })
+                        .to_string(),
+                    })
+                    .await;
+
+                let notifications = client.notifications.lock().unwrap();
+                assert_eq!(notifications.len(), 1, "{notifications:?}");
+                assert!(matches!(
+                    &notifications[0].update,
+                    SessionUpdate::ToolCall(tool_call)
+                        if tool_call.title == "Read README.md"
+                            && tool_call.kind == ToolKind::Read
+                            && tool_call.status == ToolCallStatus::Completed
+                            && tool_call.raw_input.is_some()
+                ));
+
+                anyhow::Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
     async fn test_exec_approval_uses_available_decisions() -> anyhow::Result<()> {
         LocalSet::new()
             .run_until(async {
