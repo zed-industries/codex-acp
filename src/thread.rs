@@ -3116,12 +3116,13 @@ impl<A: Auth> ThreadActor<A> {
         Some((title, locations, content))
     }
 
-    /// Parse shell function call arguments to extract command info for rich display.
+    /// Parse shell-like function call arguments to extract command info for rich display.
     /// Returns (title, kind, locations) if successful.
     ///
-    /// Handles both:
+    /// Handles:
     /// - `shell` / `container.exec`: `command` is `Vec<String>`
     /// - `shell_command`: `command` is a `String` (shell script)
+    /// - `exec_command`: `cmd` is a `String`
     fn parse_shell_function_call(
         &self,
         name: &str,
@@ -3140,6 +3141,18 @@ impl<A: Auth> ThreadActor<A> {
             // Wrap in bash -lc for parsing
             (
                 vec!["bash".to_string(), "-lc".to_string(), args.command],
+                args.workdir,
+            )
+        } else if name == "exec_command" {
+            #[derive(serde::Deserialize)]
+            struct ExecCommandArgs {
+                cmd: String,
+                #[serde(default)]
+                workdir: Option<String>,
+            }
+            let args: ExecCommandArgs = serde_json::from_str(arguments).ok()?;
+            (
+                vec!["bash".to_string(), "-lc".to_string(), args.cmd],
                 args.workdir,
             )
         } else {
@@ -3182,10 +3195,12 @@ impl<A: Auth> ThreadActor<A> {
                 call_id,
                 ..
             } => {
-                // Check if this is a shell command - parse it like we do for LocalShellCall
-                if matches!(name.as_str(), "shell" | "container.exec" | "shell_command")
-                    && let Some((title, kind, locations)) =
-                        self.parse_shell_function_call(name, arguments)
+                // Check if this is a shell-like command - parse it like we do for LocalShellCall
+                if matches!(
+                    name.as_str(),
+                    "shell" | "container.exec" | "shell_command" | "exec_command"
+                ) && let Some((title, kind, locations)) =
+                    self.parse_shell_function_call(name, arguments)
                 {
                     self.client
                         .send_tool_call(
