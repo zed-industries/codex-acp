@@ -3003,13 +3003,16 @@ impl<A: Auth> ThreadActor<A> {
     /// - `EventMsg` for user/agent messages and reasoning (like the TUI does)
     /// - `ResponseItem` for tool calls only (not persisted as EventMsg)
     async fn handle_replay_history(&mut self, history: Vec<RolloutItem>) -> Result<(), Error> {
+        let mut plan_call_ids = std::collections::HashSet::new();
+
         for item in history {
             match item {
                 RolloutItem::EventMsg(event_msg) => {
                     self.replay_event_msg(&event_msg).await;
                 }
                 RolloutItem::ResponseItem(response_item) => {
-                    self.replay_response_item(&response_item).await;
+                    self.replay_response_item(&response_item, &mut plan_call_ids)
+                        .await;
                 }
                 // Skip SessionMeta, TurnContext, Compacted
                 _ => {}
@@ -3185,7 +3188,11 @@ impl<A: Auth> ThreadActor<A> {
 
     /// Convert and send a single ResponseItem as ACP notification(s) during replay.
     /// Only handles tool calls - messages/reasoning are handled via EventMsg.
-    async fn replay_response_item(&self, item: &ResponseItem) {
+    async fn replay_response_item(
+        &self,
+        item: &ResponseItem,
+        plan_call_ids: &mut std::collections::HashSet<String>,
+    ) {
         match item {
             // Skip Message and Reasoning - these are handled via EventMsg
             ResponseItem::Message { .. } | ResponseItem::Reasoning { .. } => {}
@@ -3195,6 +3202,18 @@ impl<A: Auth> ThreadActor<A> {
                 call_id,
                 ..
             } => {
+                if name == "update_plan" {
+                    if let Ok(UpdatePlanArgs {
+                        explanation: _,
+                        plan,
+                    }) = serde_json::from_str::<UpdatePlanArgs>(arguments)
+                    {
+                        self.client.update_plan(plan).await;
+                        plan_call_ids.insert(call_id.clone());
+                        return;
+                    }
+                }
+
                 // Check if this is a shell-like command - parse it like we do for LocalShellCall
                 if matches!(
                     name.as_str(),
@@ -3227,6 +3246,10 @@ impl<A: Auth> ThreadActor<A> {
                     .await;
             }
             ResponseItem::FunctionCallOutput { call_id, output } => {
+                if plan_call_ids.contains(call_id) {
+                    return;
+                }
+
                 self.client
                     .send_tool_call_completed(call_id.clone(), serde_json::to_value(output).ok())
                     .await;
@@ -3484,6 +3507,7 @@ mod tests {
     use agent_client_protocol::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
     use codex_protocol::config_types::ModeKind;
+    use codex_protocol::models::FunctionCallOutputPayload;
     use tokio::{
         sync::{Mutex, Notify, mpsc::UnboundedSender},
         task::LocalSet,
@@ -4526,17 +4550,22 @@ mod tests {
                     resolution_rx,
                 );
 
+                let mut plan_call_ids = std::collections::HashSet::new();
+
                 actor
-                    .replay_response_item(&ResponseItem::FunctionCall {
-                        id: None,
-                        call_id: "call-id".to_string(),
-                        name: "exec_command".to_string(),
-                        arguments: serde_json::json!({
-                            "cmd": "cat README.md",
-                            "workdir": "/tmp/project"
-                        })
-                        .to_string(),
-                    })
+                    .replay_response_item(
+                        &ResponseItem::FunctionCall {
+                            id: None,
+                            call_id: "call-id".to_string(),
+                            name: "exec_command".to_string(),
+                            arguments: serde_json::json!({
+                                "cmd": "cat README.md",
+                                "workdir": "/tmp/project"
+                            })
+                            .to_string(),
+                        },
+                        &mut plan_call_ids,
+                    )
                     .await;
 
                 let notifications = client.notifications.lock().unwrap();
