@@ -4585,6 +4585,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_replay_update_plan_function_call_emits_plan_update() -> anyhow::Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::new());
+                let session_client =
+                    SessionClient::with_client(session_id, client.clone(), Arc::default());
+                let thread = Arc::new(StubCodexThread::new());
+                let models_manager = Arc::new(StubModelsManager);
+                let config = Config::load_with_cli_overrides_and_harness_overrides(
+                    vec![],
+                    ConfigOverrides::default(),
+                )
+                .await?;
+                let (_message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+
+                let actor = ThreadActor::new(
+                    StubAuth,
+                    session_client,
+                    thread,
+                    models_manager,
+                    config,
+                    message_rx,
+                    resolution_tx,
+                    resolution_rx,
+                );
+
+                let mut plan_call_ids = std::collections::HashSet::new();
+
+                actor
+                    .replay_response_item(
+                        &ResponseItem::FunctionCall {
+                            id: None,
+                            call_id: "plan-call-id".to_string(),
+                            name: "update_plan".to_string(),
+                            arguments: serde_json::json!({
+                                "explanation": "testing replay",
+                                "plan": [
+                                    {
+                                        "step": "Read files",
+                                        "status": "in_progress"
+                                    },
+                                    {
+                                        "step": "Write summary",
+                                        "status": "pending"
+                                    }
+                                ]
+                            })
+                            .to_string(),
+                        },
+                        &mut plan_call_ids,
+                    )
+                    .await;
+
+                actor
+                    .replay_response_item(
+                        &ResponseItem::FunctionCallOutput {
+                            call_id: "plan-call-id".to_string(),
+                            output: FunctionCallOutputPayload::from_text("ok".to_string()),
+                        },
+                        &mut plan_call_ids,
+                    )
+                    .await;
+
+                let notifications = client.notifications.lock().unwrap();
+                assert_eq!(notifications.len(), 1, "{notifications:?}");
+                assert!(matches!(
+                    &notifications[0].update,
+                    SessionUpdate::Plan(plan)
+                        if plan.entries.len() == 2
+                            && plan.entries[0].content == "Read files"
+                            && plan.entries[0].status == PlanEntryStatus::InProgress
+                            && plan.entries[1].content == "Write summary"
+                            && plan.entries[1].status == PlanEntryStatus::Pending
+                ));
+                assert!(plan_call_ids.contains("plan-call-id"));
+
+                anyhow::Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
     async fn test_exec_approval_uses_available_decisions() -> anyhow::Result<()> {
         LocalSet::new()
             .run_until(async {
