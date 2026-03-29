@@ -4,6 +4,7 @@
 use agent_client_protocol::AgentSideConnection;
 use codex_core::config::{Config, ConfigOverrides};
 use codex_utils_cli::CliConfigOverrides;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::{io::Result as IoResult, rc::Rc};
@@ -17,6 +18,35 @@ mod prompt_args;
 mod thread;
 
 pub static ACP_CLIENT: OnceLock<Arc<AgentSideConnection>> = OnceLock::new();
+
+pub(crate) fn spawn_acp_io_task<F>(
+    thread_name: &str,
+    io_task: F,
+) -> IoResult<tokio::sync::oneshot::Receiver<IoResult<()>>>
+where
+    F: Future<Output = agent_client_protocol::Result<()>> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let thread_name = thread_name.to_string();
+
+    std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(std::io::Error::other)
+                .and_then(|runtime| {
+                    runtime
+                        .block_on(io_task)
+                        .map_err(|e| std::io::Error::other(format!("ACP I/O error: {e}")))
+                });
+            let _send_result = tx.send(result);
+        })
+        .map_err(std::io::Error::other)?;
+
+    Ok(rx)
+}
 
 /// Run the Codex ACP agent.
 ///
@@ -78,9 +108,10 @@ pub async fn run_main(
                 return Err(std::io::Error::other("ACP client already set"));
             }
 
-            io_task
-                .await
-                .map_err(|e| std::io::Error::other(format!("ACP I/O error: {e}")))
+            let io_task = spawn_acp_io_task("codex-acp-io", io_task)?;
+            io_task.await.map_err(|_| {
+                std::io::Error::other("ACP I/O thread shut down before reporting a result")
+            })?
         })
         .await?;
 

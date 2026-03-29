@@ -260,3 +260,311 @@ impl LocalSpawner {
             .expect("Thread with LocalSet has shut down.");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::PathBuf,
+        process::Command,
+        sync::Arc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use agent_client_protocol::{
+        Agent, AgentSideConnection, AuthenticateRequest, AuthenticateResponse,
+        ClientSideConnection, FileSystemCapabilities, Implementation, InitializeRequest,
+        InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+        NewSessionResponse, PromptRequest, PromptResponse, ReadTextFileResponse,
+        SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+        SetSessionModeResponse, StopReason,
+    };
+
+    use super::*;
+
+    const DEADLOCK_CHILD_ENV: &str = "CODEX_ACP_APPLY_PATCH_DEADLOCK_CHILD";
+    const DEADLOCK_CHILD_TEST: &str = "local_spawner::tests::apply_patch_verification_child";
+
+    #[test]
+    fn apply_patch_verification_does_not_deadlock_over_acp_fs() {
+        if std::env::var_os(DEADLOCK_CHILD_ENV).is_some() {
+            return;
+        }
+
+        let current_exe = std::env::current_exe().expect("resolve current test binary");
+        let mut child = Command::new(current_exe)
+            .arg("--exact")
+            .arg(DEADLOCK_CHILD_TEST)
+            .arg("--nocapture")
+            .env(DEADLOCK_CHILD_ENV, "1")
+            .spawn()
+            .expect("spawn deadlock child");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll deadlock child") {
+                assert!(status.success(), "child exited with {status}");
+                return;
+            }
+
+            if Instant::now() >= deadline {
+                drop(child.kill());
+                drop(child.wait());
+                panic!("child timed out; apply_patch ACP fs roundtrip deadlocked");
+            }
+
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn apply_patch_verification_child() {
+        if std::env::var_os(DEADLOCK_CHILD_ENV).is_none() {
+            return;
+        }
+
+        reproduce_apply_patch_roundtrip();
+    }
+
+    fn reproduce_apply_patch_roundtrip() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let local_set = tokio::task::LocalSet::new();
+
+        runtime.block_on(local_set.run_until(async move {
+            let client = TestClient::new();
+            let agent = TestAgent;
+            let root = std::env::temp_dir().join(format!("codex-acp-deadlock-{}", std::process::id()));
+            let session_id = SessionId::new("test-session");
+            let file_path = root.join("src/client.rs");
+            let (client_to_agent_rx, client_to_agent_tx) = piper::pipe(1024);
+            let (agent_to_client_rx, agent_to_client_tx) = piper::pipe(1024);
+            let (client_ready_tx, client_ready_rx) = std::sync::mpsc::channel();
+
+            std::fs::create_dir_all(file_path.parent().expect("parent dir"))
+                .expect("create test dirs");
+            client.add_file_content(file_path.clone(), "fn old() {}\n".to_string());
+
+            let _client_thread = thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build remote client runtime");
+                let local_set = tokio::task::LocalSet::new();
+
+                runtime.block_on(local_set.run_until(async move {
+                    let (_client_side, client_io_task) = ClientSideConnection::new(
+                        client,
+                        client_to_agent_tx,
+                        agent_to_client_rx,
+                        |fut| {
+                            tokio::task::spawn_local(fut);
+                        },
+                    );
+                    client_ready_tx.send(()).expect("signal remote client ready");
+                    client_io_task.await.expect("run remote client io task");
+                }));
+            });
+
+            client_ready_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("wait for remote client bootstrap");
+
+            let (agent_side, agent_io_task) = AgentSideConnection::new(
+                agent,
+                agent_to_client_tx,
+                client_to_agent_rx,
+                |fut| {
+                    tokio::task::spawn_local(fut);
+                },
+            );
+
+            ACP_CLIENT
+                .set(Arc::new(agent_side))
+                .expect("install ACP client for child");
+
+            let _agent_io = crate::spawn_acp_io_task("local-spawner-test-agent-io", agent_io_task)
+                .expect("spawn agent io thread");
+
+            tokio::task::yield_now().await;
+
+            let capabilities = Arc::new(Mutex::new(
+                ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)),
+            ));
+            let session_roots = Arc::new(Mutex::new(HashMap::from([(
+                session_id.clone(),
+                root.clone(),
+            )])));
+            let fs = AcpFs::new(
+                session_id,
+                capabilities,
+                LocalSpawner::new(),
+                session_roots,
+            );
+
+            let patch = "*** Begin Patch\n*** Update File: src/client.rs\n@@\n-fn old() {}\n+fn new() {}\n*** End Patch";
+            let argv = vec!["apply_patch".to_string(), patch.to_string()];
+            let result = codex_apply_patch::maybe_parse_apply_patch_verified(&argv, &root, &fs);
+
+            assert!(
+                matches!(result, codex_apply_patch::MaybeApplyPatchVerified::Body(_)),
+                "expected verified patch body, got {result:?}"
+            );
+        }));
+    }
+
+    #[derive(Clone)]
+    struct TestClient {
+        file_contents: Arc<Mutex<HashMap<PathBuf, String>>>,
+    }
+
+    impl TestClient {
+        fn new() -> Self {
+            Self {
+                file_contents: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
+
+        fn add_file_content(&self, path: PathBuf, content: String) {
+            self.file_contents.lock().unwrap().insert(path, content);
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Client for TestClient {
+        async fn request_permission(
+            &self,
+            _arguments: agent_client_protocol::RequestPermissionRequest,
+        ) -> agent_client_protocol::Result<agent_client_protocol::RequestPermissionResponse>
+        {
+            unimplemented!()
+        }
+
+        async fn write_text_file(
+            &self,
+            _arguments: WriteTextFileRequest,
+        ) -> agent_client_protocol::Result<agent_client_protocol::WriteTextFileResponse> {
+            unimplemented!()
+        }
+
+        async fn read_text_file(
+            &self,
+            arguments: ReadTextFileRequest,
+        ) -> agent_client_protocol::Result<ReadTextFileResponse> {
+            let contents = self.file_contents.lock().unwrap();
+            let content = contents
+                .get(&arguments.path)
+                .cloned()
+                .unwrap_or_else(|| "default content".to_string());
+            Ok(ReadTextFileResponse::new(content))
+        }
+
+        async fn session_notification(
+            &self,
+            _args: agent_client_protocol::SessionNotification,
+        ) -> agent_client_protocol::Result<()> {
+            Ok(())
+        }
+
+        async fn create_terminal(
+            &self,
+            _args: agent_client_protocol::CreateTerminalRequest,
+        ) -> agent_client_protocol::Result<agent_client_protocol::CreateTerminalResponse> {
+            unimplemented!()
+        }
+
+        async fn terminal_output(
+            &self,
+            _args: agent_client_protocol::TerminalOutputRequest,
+        ) -> agent_client_protocol::Result<agent_client_protocol::TerminalOutputResponse> {
+            unimplemented!()
+        }
+
+        async fn kill_terminal(
+            &self,
+            _args: agent_client_protocol::KillTerminalRequest,
+        ) -> agent_client_protocol::Result<agent_client_protocol::KillTerminalResponse> {
+            unimplemented!()
+        }
+
+        async fn release_terminal(
+            &self,
+            _args: agent_client_protocol::ReleaseTerminalRequest,
+        ) -> agent_client_protocol::Result<agent_client_protocol::ReleaseTerminalResponse> {
+            unimplemented!()
+        }
+
+        async fn wait_for_terminal_exit(
+            &self,
+            _args: agent_client_protocol::WaitForTerminalExitRequest,
+        ) -> agent_client_protocol::Result<agent_client_protocol::WaitForTerminalExitResponse>
+        {
+            unimplemented!()
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestAgent;
+
+    #[async_trait::async_trait(?Send)]
+    impl Agent for TestAgent {
+        async fn initialize(
+            &self,
+            arguments: InitializeRequest,
+        ) -> agent_client_protocol::Result<InitializeResponse> {
+            Ok(InitializeResponse::new(arguments.protocol_version)
+                .agent_info(Implementation::new("test-agent", "0.0.0").title("Test Agent")))
+        }
+
+        async fn authenticate(
+            &self,
+            _arguments: AuthenticateRequest,
+        ) -> agent_client_protocol::Result<AuthenticateResponse> {
+            Ok(AuthenticateResponse::default())
+        }
+
+        async fn new_session(
+            &self,
+            _arguments: NewSessionRequest,
+        ) -> agent_client_protocol::Result<NewSessionResponse> {
+            Ok(NewSessionResponse::new(SessionId::new("unused")))
+        }
+
+        async fn load_session(
+            &self,
+            _arguments: LoadSessionRequest,
+        ) -> agent_client_protocol::Result<LoadSessionResponse> {
+            Ok(LoadSessionResponse::new())
+        }
+
+        async fn set_session_mode(
+            &self,
+            _arguments: SetSessionModeRequest,
+        ) -> agent_client_protocol::Result<SetSessionModeResponse> {
+            Ok(SetSessionModeResponse::new())
+        }
+
+        async fn prompt(
+            &self,
+            _arguments: PromptRequest,
+        ) -> agent_client_protocol::Result<PromptResponse> {
+            Ok(PromptResponse::new(StopReason::EndTurn))
+        }
+
+        async fn cancel(
+            &self,
+            _arguments: agent_client_protocol::CancelNotification,
+        ) -> agent_client_protocol::Result<()> {
+            Ok(())
+        }
+
+        async fn set_session_config_option(
+            &self,
+            _args: SetSessionConfigOptionRequest,
+        ) -> agent_client_protocol::Result<SetSessionConfigOptionResponse> {
+            Ok(SetSessionConfigOptionResponse::new(vec![]))
+        }
+    }
+}
