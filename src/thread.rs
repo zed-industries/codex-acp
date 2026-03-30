@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     ops::DerefMut,
     path::{Path, PathBuf},
@@ -18,7 +18,7 @@ use agent_client_protocol::{
     SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
     SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal,
     TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, UsageUpdate,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, Cost, UsageUpdate,
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
@@ -467,6 +467,10 @@ struct PromptState {
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
+    /// Shared cumulative cost accumulator (persists across prompts in the session).
+    cumulative_cost: Rc<Cell<f64>>,
+    /// Current model slug, updated on `ModelReroute` events.
+    current_model: String,
 }
 
 impl PromptState {
@@ -475,6 +479,8 @@ impl PromptState {
         thread: Arc<dyn CodexThreadImpl>,
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
         response_tx: oneshot::Sender<Result<StopReason, Error>>,
+        cumulative_cost: Rc<Cell<f64>>,
+        current_model: String,
     ) -> Self {
         Self {
             submission_id,
@@ -487,6 +493,8 @@ impl PromptState {
             response_tx: Some(response_tx),
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
+            cumulative_cost,
+            current_model,
         }
     }
 
@@ -683,11 +691,22 @@ impl PromptState {
                 if let Some(info) = info
                     && let Some(size) = info.model_context_window {
                         let used = info.last_token_usage.tokens_in_context_window().max(0) as u64;
+
+                        let mut update = UsageUpdate::new(used, size as u64);
+
+                        // Estimate incremental cost from per-turn token counts.
+                        let last = &info.last_token_usage;
+                        if let Some(pricing) = crate::pricing::lookup_pricing(&self.current_model) {
+                            let input = last.input_tokens.max(0) as u64;
+                            let cached = last.cached_input_tokens.max(0) as u64;
+                            let output = last.output_tokens.max(0) as u64;
+                            let increment = pricing.estimate_cost(input, cached, output);
+                            self.cumulative_cost.set(self.cumulative_cost.get() + increment);
+                            update = update.cost(Cost::new(self.cumulative_cost.get(), "USD"));
+                        }
+
                         client
-                            .send_notification(SessionUpdate::UsageUpdate(UsageUpdate::new(
-                                used,
-                                size as u64,
-                            )))
+                            .send_notification(SessionUpdate::UsageUpdate(update))
                             .await;
                     }
             }
@@ -1003,6 +1022,7 @@ impl PromptState {
             }
             EventMsg::ModelReroute(ModelRerouteEvent { from_model, to_model, reason }) => {
                 info!("Model reroute: from={from_model}, to={to_model}, reason={reason:?}");
+                self.current_model = to_model;
             }
 
             EventMsg::ContextCompacted(..) => {
@@ -2205,6 +2225,8 @@ struct ThreadActor<A> {
     resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     /// Last config options state we emitted to the client, used for deduping updates.
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
+    /// Cumulative estimated session cost in USD, shared with active `PromptState`.
+    cumulative_cost: Rc<Cell<f64>>,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -2231,6 +2253,7 @@ impl<A: Auth> ThreadActor<A> {
             message_rx,
             resolution_rx,
             last_sent_config_options: None,
+            cumulative_cost: Rc::new(Cell::new(0.0)),
         }
     }
 
@@ -2866,11 +2889,14 @@ impl<A: Auth> ThreadActor<A> {
         info!("Submitted prompt with submission_id: {submission_id}");
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
 
+        let current_model = self.get_current_model().await;
         let state = SubmissionState::Prompt(PromptState::new(
             submission_id.clone(),
             self.thread.clone(),
             self.resolution_tx.clone(),
             response_tx,
+            self.cumulative_cost.clone(),
+            current_model,
         ));
 
         self.submissions.insert(submission_id, state);
@@ -4502,6 +4528,8 @@ mod tests {
                     thread.clone(),
                     message_tx,
                     response_tx,
+                    Rc::new(Cell::new(0.0)),
+                    String::new(),
                 );
 
                 prompt_state
@@ -4589,6 +4617,8 @@ mod tests {
                     thread.clone(),
                     message_tx,
                     response_tx,
+                    Rc::new(Cell::new(0.0)),
+                    String::new(),
                 );
 
                 prompt_state
@@ -4652,7 +4682,7 @@ mod tests {
                 let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
                 let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
                 let mut prompt_state =
-                    PromptState::new("submission-id".to_string(), thread, message_tx, response_tx);
+                    PromptState::new("submission-id".to_string(), thread, message_tx, response_tx, Rc::new(Cell::new(0.0)), String::new());
 
                 prompt_state
                     .handle_event(
