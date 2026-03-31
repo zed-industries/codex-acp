@@ -1,14 +1,14 @@
 use agent_client_protocol::{
-    Agent, AgentCapabilities, AuthEnvVar, AuthMethod, AuthMethodAgent, AuthMethodEnvVar,
-    AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification,
+    Agent, AgentAuthCapabilities, AgentCapabilities, AuthEnvVar, AuthMethod, AuthMethodAgent,
+    AuthMethodEnvVar, AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Error, Implementation,
     InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, McpServerHttp,
-    McpServerStdio, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
-    PromptResponse, ProtocolVersion, SessionCapabilities, SessionCloseCapabilities, SessionId,
-    SessionInfo, SessionListCapabilities, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
-    SetSessionModelRequest, SetSessionModelResponse,
+    LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
+    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
+    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
+    SessionCapabilities, SessionCloseCapabilities, SessionId, SessionInfo, SessionListCapabilities,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
 use codex_core::{
     CodexAuth, NewThread, RolloutRecorder, ThreadManager, ThreadSortKey,
@@ -230,7 +230,8 @@ impl Agent for CodexAgent {
         let mut agent_capabilities = AgentCapabilities::new()
             .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
             .mcp_capabilities(McpCapabilities::new().http(true))
-            .load_session(true);
+            .load_session(true)
+            .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()));
 
         agent_capabilities.session_capabilities = SessionCapabilities::new()
             .close(SessionCloseCapabilities::new())
@@ -319,6 +320,13 @@ impl Agent for CodexAgent {
         self.auth_manager.reload();
 
         Ok(AuthenticateResponse::new())
+    }
+
+    async fn logout(&self, _request: LogoutRequest) -> Result<LogoutResponse, Error> {
+        self.auth_manager
+            .logout()
+            .map_err(Error::into_internal_error)?;
+        Ok(LogoutResponse::new())
     }
 
     async fn new_session(&self, request: NewSessionRequest) -> Result<NewSessionResponse, Error> {
