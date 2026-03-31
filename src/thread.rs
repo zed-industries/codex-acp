@@ -2487,8 +2487,10 @@ impl<A: Auth> ThreadActor<A> {
         let current_mode_id = APPROVAL_PRESETS
             .iter()
             .find(|preset| {
-                &preset.approval == self.config.permissions.approval_policy.get()
-                    && &preset.sandbox == self.config.permissions.sandbox_policy.get()
+                std::mem::discriminant(&preset.approval)
+                    == std::mem::discriminant(self.config.permissions.approval_policy.get())
+                    && std::mem::discriminant(&preset.sandbox)
+                        == std::mem::discriminant(self.config.permissions.sandbox_policy.get())
             })
             .or_else(|| {
                 // When the project is untrusted, the above code won't match
