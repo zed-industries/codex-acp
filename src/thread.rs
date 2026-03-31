@@ -346,11 +346,49 @@ enum PendingPermissionRequest {
         call_id: String,
         permissions: PermissionProfile,
     },
+    McpElicitation {
+        server_name: String,
+        request_id: codex_protocol::mcp::RequestId,
+        option_map: HashMap<String, ResolvedMcpElicitation>,
+    },
 }
 
 struct PendingPermissionInteraction {
     request: PendingPermissionRequest,
     task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+struct ResolvedMcpElicitation {
+    action: ElicitationAction,
+    content: Option<serde_json::Value>,
+    meta: Option<serde_json::Value>,
+}
+
+impl ResolvedMcpElicitation {
+    fn accept() -> Self {
+        Self {
+            action: ElicitationAction::Accept,
+            content: None,
+            meta: None,
+        }
+    }
+
+    fn accept_with_persist(persist: &'static str) -> Self {
+        Self {
+            action: ElicitationAction::Accept,
+            content: None,
+            meta: Some(serde_json::json!({ "persist": persist })),
+        }
+    }
+
+    fn cancel() -> Self {
+        Self {
+            action: ElicitationAction::Cancel,
+            content: None,
+            meta: None,
+        }
+    }
 }
 
 fn exec_request_key(call_id: &str) -> String {
@@ -363,6 +401,238 @@ fn patch_request_key(call_id: &str) -> String {
 
 fn permissions_request_key(call_id: &str) -> String {
     format!("permissions:{call_id}")
+}
+
+fn mcp_elicitation_request_key(
+    server_name: &str,
+    request_id: &codex_protocol::mcp::RequestId,
+) -> String {
+    format!("mcp-elicitation:{server_name}:{request_id}")
+}
+
+const MCP_TOOL_APPROVAL_KIND_KEY: &str = "codex_approval_kind";
+const MCP_TOOL_APPROVAL_KIND_MCP_TOOL_CALL: &str = "mcp_tool_call";
+const MCP_TOOL_APPROVAL_PERSIST_KEY: &str = "persist";
+const MCP_TOOL_APPROVAL_PERSIST_SESSION: &str = "session";
+const MCP_TOOL_APPROVAL_PERSIST_ALWAYS: &str = "always";
+const MCP_TOOL_APPROVAL_TOOL_TITLE_KEY: &str = "tool_title";
+const MCP_TOOL_APPROVAL_TOOL_DESCRIPTION_KEY: &str = "tool_description";
+const MCP_TOOL_APPROVAL_CONNECTOR_NAME_KEY: &str = "connector_name";
+const MCP_TOOL_APPROVAL_CONNECTOR_DESCRIPTION_KEY: &str = "connector_description";
+const MCP_TOOL_APPROVAL_TOOL_PARAMS_KEY: &str = "tool_params";
+const MCP_TOOL_APPROVAL_TOOL_PARAMS_DISPLAY_KEY: &str = "tool_params_display";
+const MCP_TOOL_APPROVAL_REQUEST_ID_PREFIX: &str = "mcp_tool_call_approval_";
+const MCP_TOOL_APPROVAL_ALLOW_OPTION_ID: &str = "approved";
+const MCP_TOOL_APPROVAL_ALLOW_SESSION_OPTION_ID: &str = "approved-for-session";
+const MCP_TOOL_APPROVAL_ALLOW_ALWAYS_OPTION_ID: &str = "approved-always";
+const MCP_TOOL_APPROVAL_CANCEL_OPTION_ID: &str = "cancel";
+
+struct SupportedMcpElicitationPermissionRequest {
+    request_key: String,
+    tool_call: ToolCallUpdate,
+    options: Vec<PermissionOption>,
+    option_map: HashMap<String, ResolvedMcpElicitation>,
+}
+
+fn build_supported_mcp_elicitation_permission_request(
+    server_name: &str,
+    request_id: &codex_protocol::mcp::RequestId,
+    request: &ElicitationRequest,
+    raw_input: serde_json::Value,
+) -> Option<SupportedMcpElicitationPermissionRequest> {
+    let ElicitationRequest::Form {
+        meta: Some(meta),
+        message,
+        requested_schema: _,
+    } = request
+    else {
+        return None;
+    };
+    let meta = meta.as_object()?;
+    if meta
+        .get(MCP_TOOL_APPROVAL_KIND_KEY)
+        .and_then(serde_json::Value::as_str)
+        != Some(MCP_TOOL_APPROVAL_KIND_MCP_TOOL_CALL)
+    {
+        return None;
+    }
+
+    let (allow_session_remember, allow_persistent_approval) = mcp_tool_approval_persist_modes(meta);
+    let mut options = vec![PermissionOption::new(
+        MCP_TOOL_APPROVAL_ALLOW_OPTION_ID,
+        "Allow",
+        PermissionOptionKind::AllowOnce,
+    )];
+    let mut option_map = HashMap::from([(
+        MCP_TOOL_APPROVAL_ALLOW_OPTION_ID.to_string(),
+        ResolvedMcpElicitation::accept(),
+    )]);
+
+    if allow_session_remember {
+        options.push(PermissionOption::new(
+            MCP_TOOL_APPROVAL_ALLOW_SESSION_OPTION_ID,
+            "Allow for this session",
+            PermissionOptionKind::AllowAlways,
+        ));
+        option_map.insert(
+            MCP_TOOL_APPROVAL_ALLOW_SESSION_OPTION_ID.to_string(),
+            ResolvedMcpElicitation::accept_with_persist(MCP_TOOL_APPROVAL_PERSIST_SESSION),
+        );
+    }
+
+    if allow_persistent_approval {
+        options.push(PermissionOption::new(
+            MCP_TOOL_APPROVAL_ALLOW_ALWAYS_OPTION_ID,
+            "Allow and don't ask again",
+            PermissionOptionKind::AllowAlways,
+        ));
+        option_map.insert(
+            MCP_TOOL_APPROVAL_ALLOW_ALWAYS_OPTION_ID.to_string(),
+            ResolvedMcpElicitation::accept_with_persist(MCP_TOOL_APPROVAL_PERSIST_ALWAYS),
+        );
+    }
+
+    options.push(PermissionOption::new(
+        MCP_TOOL_APPROVAL_CANCEL_OPTION_ID,
+        "Cancel",
+        PermissionOptionKind::RejectOnce,
+    ));
+    option_map.insert(
+        MCP_TOOL_APPROVAL_CANCEL_OPTION_ID.to_string(),
+        ResolvedMcpElicitation::cancel(),
+    );
+
+    let tool_call_id = mcp_tool_approval_call_id(request_id)
+        .unwrap_or_else(|| format!("mcp-elicitation:{request_id}"));
+    let title = meta
+        .get(MCP_TOOL_APPROVAL_TOOL_TITLE_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+        .map(|title| format!("Approve {title}"))
+        .unwrap_or_else(|| "Approve MCP tool call".to_string());
+    let content = format_mcp_tool_approval_content(server_name, message, meta);
+
+    Some(SupportedMcpElicitationPermissionRequest {
+        request_key: mcp_elicitation_request_key(server_name, request_id),
+        tool_call: ToolCallUpdate::new(
+            ToolCallId::new(tool_call_id),
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Pending)
+                .title(title)
+                .content(vec![ToolCallContent::Content(Content::new(
+                    ContentBlock::Text(TextContent::new(content)),
+                ))])
+                .raw_input(raw_input),
+        ),
+        options,
+        option_map,
+    })
+}
+
+fn mcp_tool_approval_persist_modes(
+    meta: &serde_json::Map<String, serde_json::Value>,
+) -> (bool, bool) {
+    match meta.get(MCP_TOOL_APPROVAL_PERSIST_KEY) {
+        Some(serde_json::Value::String(persist)) => (
+            persist == MCP_TOOL_APPROVAL_PERSIST_SESSION,
+            persist == MCP_TOOL_APPROVAL_PERSIST_ALWAYS,
+        ),
+        Some(serde_json::Value::Array(values)) => (
+            values
+                .iter()
+                .any(|value| value.as_str() == Some(MCP_TOOL_APPROVAL_PERSIST_SESSION)),
+            values
+                .iter()
+                .any(|value| value.as_str() == Some(MCP_TOOL_APPROVAL_PERSIST_ALWAYS)),
+        ),
+        _ => (false, false),
+    }
+}
+
+fn mcp_tool_approval_call_id(request_id: &codex_protocol::mcp::RequestId) -> Option<String> {
+    match request_id {
+        codex_protocol::mcp::RequestId::String(value) => value
+            .strip_prefix(MCP_TOOL_APPROVAL_REQUEST_ID_PREFIX)
+            .map(ToString::to_string),
+        codex_protocol::mcp::RequestId::Integer(_) => None,
+    }
+}
+
+fn format_mcp_tool_approval_content(
+    server_name: &str,
+    message: &str,
+    meta: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let mut sections = vec![message.trim().to_string()];
+
+    let source = meta
+        .get(MCP_TOOL_APPROVAL_CONNECTOR_NAME_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("Source: {value}"))
+        .unwrap_or_else(|| format!("Server: {server_name}"));
+    sections.push(source);
+
+    if let Some(description) = meta
+        .get(MCP_TOOL_APPROVAL_CONNECTOR_DESCRIPTION_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        sections.push(description.to_string());
+    }
+
+    if let Some(description) = meta
+        .get(MCP_TOOL_APPROVAL_TOOL_DESCRIPTION_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        sections.push(description.to_string());
+    }
+
+    if let Some(params) = format_mcp_tool_approval_params(meta) {
+        sections.push(format!("Arguments:\n{params}"));
+    }
+
+    sections.join("\n\n")
+}
+
+fn format_mcp_tool_approval_params(
+    meta: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    if let Some(serde_json::Value::Array(params)) =
+        meta.get(MCP_TOOL_APPROVAL_TOOL_PARAMS_DISPLAY_KEY)
+    {
+        let params = params
+            .iter()
+            .filter_map(|param| {
+                let object = param.as_object()?;
+                let name = object
+                    .get("display_name")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| object.get("name").and_then(serde_json::Value::as_str))?;
+                let value = object.get("value")?;
+                Some(format!(
+                    "- {name}: {}",
+                    format_mcp_tool_approval_value(value)
+                ))
+            })
+            .collect::<Vec<_>>();
+        if !params.is_empty() {
+            return Some(params.join("\n"));
+        }
+    }
+
+    meta.get(MCP_TOOL_APPROVAL_TOOL_PARAMS_KEY).map(|params| {
+        serde_json::to_string_pretty(params)
+            .unwrap_or_else(|_| format_mcp_tool_approval_value(params))
+    })
+}
+
+fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value.clone(),
+        _ => serde_json::to_string(value).unwrap_or_else(|_| value.to_string()),
+    }
 }
 
 #[expect(clippy::large_enum_variant)]
@@ -637,6 +907,33 @@ impl PromptState {
                     .submit(Op::RequestPermissionsResponse {
                         id: call_id,
                         response,
+                    })
+                    .await
+                    .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+            }
+            PendingPermissionRequest::McpElicitation {
+                server_name,
+                request_id,
+                option_map,
+            } => {
+                let response = match response.outcome {
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome {
+                        option_id,
+                        ..
+                    }) => option_map
+                        .get(option_id.0.as_ref())
+                        .cloned()
+                        .unwrap_or_else(ResolvedMcpElicitation::cancel),
+                    RequestPermissionOutcome::Cancelled | _ => ResolvedMcpElicitation::cancel(),
+                };
+
+                self.thread
+                    .submit(Op::ResolveElicitation {
+                        server_name,
+                        request_id,
+                        decision: response.action,
+                        content: response.content,
+                        meta: response.meta,
                     })
                     .await
                     .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -1079,15 +1376,40 @@ impl PromptState {
 
     async fn mcp_elicitation(
         &mut self,
-        _client: &SessionClient,
+        client: &SessionClient,
         event: ElicitationRequestEvent,
     ) -> Result<(), Error> {
+        let raw_input = serde_json::json!(&event);
         let ElicitationRequestEvent {
             server_name,
             id,
             request,
             turn_id: _,
         } = event;
+        if let Some(supported_request) = build_supported_mcp_elicitation_permission_request(
+            &server_name,
+            &id,
+            &request,
+            raw_input,
+        ) {
+            info!(
+                "Routing MCP tool approval elicitation through ACP permission request: server={}, id={:?}",
+                server_name, id
+            );
+            self.spawn_permission_request(
+                client,
+                supported_request.request_key,
+                PendingPermissionRequest::McpElicitation {
+                    server_name,
+                    request_id: id,
+                    option_map: supported_request.option_map,
+                },
+                supported_request.tool_call,
+                supported_request.options,
+            );
+            return Ok(());
+        }
+
         let request_kind = match &request {
             ElicitationRequest::Form { .. } => "form",
             ElicitationRequest::Url { .. } => "url",
@@ -4826,6 +5148,125 @@ mod tests {
                         decision: ReviewDecision::Denied,
                     }) if id == "approval-id" && turn_id.as_deref() == Some("turn-id")
                 ));
+
+                anyhow::Ok(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mcp_tool_approval_elicitation_routes_to_permission_request() -> anyhow::Result<()>
+    {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::with_permission_responses(vec![
+                    RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                        SelectedPermissionOutcome::new(MCP_TOOL_APPROVAL_ALLOW_SESSION_OPTION_ID),
+                    )),
+                ]));
+                let session_client =
+                    SessionClient::with_client(session_id, client.clone(), Arc::default());
+                let thread = Arc::new(StubCodexThread::new());
+                let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+                let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut prompt_state = PromptState::new(
+                    "submission-id".to_string(),
+                    thread.clone(),
+                    message_tx,
+                    response_tx,
+                );
+
+                let request_id = format!("{MCP_TOOL_APPROVAL_REQUEST_ID_PREFIX}call-123");
+                prompt_state
+                    .mcp_elicitation(
+                        &session_client,
+                        ElicitationRequestEvent {
+                            turn_id: Some("turn-id".to_string()),
+                            server_name: "test-server".to_string(),
+                            id: codex_protocol::mcp::RequestId::String(request_id.clone()),
+                            request: ElicitationRequest::Form {
+                                meta: Some(serde_json::json!({
+                                    "codex_approval_kind": "mcp_tool_call",
+                                    "persist": ["session", "always"],
+                                    "connector_name": "Docs",
+                                    "tool_title": "search_docs",
+                                    "tool_description": "Search project documentation",
+                                    "tool_params_display": [
+                                        {
+                                            "display_name": "Query",
+                                            "name": "query",
+                                            "value": "approval flow"
+                                        }
+                                    ]
+                                })),
+                                message: "Allow Docs to run tool \"search_docs\"?".to_string(),
+                                requested_schema: serde_json::json!({
+                                    "type": "object",
+                                    "properties": {}
+                                }),
+                            },
+                        },
+                    )
+                    .await?;
+
+                let ThreadMessage::PermissionRequestResolved {
+                    submission_id,
+                    request_key,
+                    response,
+                } = message_rx.recv().await.unwrap()
+                else {
+                    panic!("expected permission resolution message");
+                };
+                assert_eq!(submission_id, "submission-id");
+
+                {
+                    let requests = client.permission_requests.lock().unwrap();
+                    let request = requests.last().unwrap();
+                    assert_eq!(request.tool_call.tool_call_id.0.as_ref(), "call-123");
+                    assert_eq!(
+                        request
+                            .options
+                            .iter()
+                            .map(|option| option.option_id.0.to_string())
+                            .collect::<Vec<_>>(),
+                        vec![
+                            MCP_TOOL_APPROVAL_ALLOW_OPTION_ID.to_string(),
+                            MCP_TOOL_APPROVAL_ALLOW_SESSION_OPTION_ID.to_string(),
+                            MCP_TOOL_APPROVAL_ALLOW_ALWAYS_OPTION_ID.to_string(),
+                            MCP_TOOL_APPROVAL_CANCEL_OPTION_ID.to_string(),
+                        ]
+                    );
+                }
+
+                prompt_state
+                    .handle_permission_request_resolved(&session_client, request_key, response)
+                    .await?;
+
+                let op = thread.ops.lock().unwrap().last().cloned().unwrap();
+                match op {
+                    Op::ResolveElicitation {
+                        server_name,
+                        request_id: codex_protocol::mcp::RequestId::String(id),
+                        decision,
+                        content,
+                        meta,
+                    } => {
+                        assert_eq!(server_name, "test-server");
+                        assert_eq!(id, request_id);
+                        assert_eq!(decision, ElicitationAction::Accept);
+                        assert!(content.is_none());
+                        assert_eq!(
+                            meta.as_ref()
+                                .and_then(|value| value.get("persist"))
+                                .and_then(serde_json::Value::as_str),
+                            Some(MCP_TOOL_APPROVAL_PERSIST_SESSION)
+                        );
+                    }
+                    other => panic!("unexpected op: {other:?}"),
+                }
 
                 anyhow::Ok(())
             })
