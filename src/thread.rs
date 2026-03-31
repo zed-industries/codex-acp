@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::DerefMut,
     path::{Path, PathBuf},
     rc::Rc,
@@ -17,8 +17,9 @@ use agent_client_protocol::{
     SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
     SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
     SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal,
-    TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, UsageUpdate,
+    TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    UsageUpdate,
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
@@ -35,7 +36,7 @@ use codex_protocol::{
     custom_prompts::CustomPrompt,
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     mcp::CallToolResult,
-    models::{MacOsSeatbeltProfileExtensions, PermissionProfile, ResponseItem, WebSearchAction},
+    models::{PermissionProfile, ResponseItem, WebSearchAction},
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
@@ -45,17 +46,19 @@ use codex_protocol::{
         ApplyPatchApprovalRequestEvent, DynamicToolCallResponseEvent, ElicitationAction,
         ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
-        FileChange, ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent,
-        McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent,
-        McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction,
-        Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
+        FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ItemCompletedEvent,
+        ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent,
+        McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent,
+        NetworkApprovalContext, NetworkPolicyRuleAction, Op, PatchApplyBeginEvent,
+        PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
         ReviewTarget, RolloutItem, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent,
         TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
         ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
-        PermissionGrantScope, RequestPermissionsEvent, RequestPermissionsResponse,
+        PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
+        RequestPermissionsResponse,
     },
     user_input::UserInput,
 };
@@ -362,6 +365,7 @@ fn permissions_request_key(call_id: &str) -> String {
     format!("permissions:{call_id}")
 }
 
+#[expect(clippy::large_enum_variant)]
 enum SubmissionState {
     /// Loading custom prompts from the project
     CustomPrompts(CustomPromptsState),
@@ -460,6 +464,7 @@ struct PromptState {
     submission_id: String,
     active_commands: HashMap<String, ActiveCommand>,
     active_web_search: Option<String>,
+    active_guardian_assessments: HashSet<String>,
     thread: Arc<dyn CodexThreadImpl>,
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     pending_permission_interactions: HashMap<String, PendingPermissionInteraction>,
@@ -480,6 +485,7 @@ impl PromptState {
             submission_id,
             active_commands: HashMap::new(),
             active_web_search: None,
+            active_guardian_assessments: HashSet::new(),
             thread,
             resolution_tx,
             pending_permission_interactions: HashMap::new(),
@@ -609,20 +615,20 @@ impl PromptState {
                         ..
                     }) => match option_id.0.as_ref() {
                         "approved-for-session" => RequestPermissionsResponse {
-                            permissions,
+                            permissions: permissions.into(),
                             scope: PermissionGrantScope::Session,
                         },
                         "approved" => RequestPermissionsResponse {
-                            permissions,
+                            permissions: permissions.into(),
                             scope: PermissionGrantScope::Turn,
                         },
                         _ => RequestPermissionsResponse {
-                            permissions: PermissionProfile::default(),
+                            permissions: RequestPermissionProfile::default(),
                             scope: PermissionGrantScope::Turn,
                         },
                     },
                     RequestPermissionOutcome::Cancelled | _ => RequestPermissionsResponse {
-                        permissions: PermissionProfile::default(),
+                        permissions: RequestPermissionProfile::default(),
                         scope: PermissionGrantScope::Turn,
                     },
                 };
@@ -739,7 +745,7 @@ impl PromptState {
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought("\n\n").await;
             }
-            EventMsg::AgentMessage(AgentMessageEvent { message , phase: _ }) => {
+            EventMsg::AgentMessage(AgentMessageEvent { message , phase: _, memory_citation: _ }) => {
                 info!("Agent message (non-delta) received: {message:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_message_deltas) {
@@ -1017,6 +1023,13 @@ impl PromptState {
                     drop(response_tx.send(Err(err)));
                 }
             }
+            EventMsg::GuardianAssessment(event) => {
+                info!(
+                    "Guardian assessment: id={}, status={:?}, turn_id={}",
+                    event.id, event.status, event.turn_id
+                );
+                self.guardian_assessment(client, event).await;
+            }
 
             // Ignore these events
             EventMsg::ImageGenerationBegin(..)
@@ -1050,7 +1063,7 @@ impl PromptState {
             | EventMsg::CollabResumeEnd(..)
             | EventMsg::CollabCloseBegin(..)
             | EventMsg::CollabCloseEnd(..)
-            | EventMsg::PlanDelta(..) => {}
+            | EventMsg::PlanDelta(..)=> {}
             e @ (EventMsg::McpListToolsResponse(..)
             // returned from Op::ListCustomPrompts, ignore
             | EventMsg::ListCustomPromptsResponse(..)
@@ -1058,9 +1071,7 @@ impl PromptState {
             // Used for returning a single history entry
             | EventMsg::GetHistoryEntryResponse(..)
             | EventMsg::DeprecationNotice(..)
-            | EventMsg::RequestUserInput(..)
-            | EventMsg::ListRemoteSkillsResponse(..)
-            | EventMsg::RemoteSkillDownloaded(..)) => {
+            | EventMsg::RequestUserInput(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
@@ -1794,26 +1805,6 @@ impl PromptState {
         {
             content.push(format!("Network Access: {enabled}"));
         }
-        if let Some(mac) = permissions.macos.as_ref() {
-            let MacOsSeatbeltProfileExtensions {
-                macos_preferences,
-                macos_automation,
-                macos_launch_services,
-                macos_accessibility,
-                macos_calendar,
-                macos_reminders,
-                macos_contacts,
-            } = mac;
-
-            content.push("MacOS Seatbelt Profile Extensions: ".to_string());
-            content.push(format!("Preferences: {:?}", macos_preferences));
-            content.push(format!("Automation: {:?}", macos_automation));
-            content.push(format!("Launch Services: {}", macos_launch_services));
-            content.push(format!("Accessibility: {}", macos_accessibility));
-            content.push(format!("Calendar: {}", macos_calendar));
-            content.push(format!("Reminders: {}", macos_reminders));
-            content.push(format!("Contacts: {:?}", macos_contacts));
-        }
 
         let content = if content.is_empty() {
             None
@@ -1826,7 +1817,7 @@ impl PromptState {
             permissions_request_key(&call_id),
             PendingPermissionRequest::RequestPermissions {
                 call_id,
-                permissions,
+                permissions: permissions.into(),
             },
             ToolCallUpdate::new(
                 tool_call_id,
@@ -1848,6 +1839,68 @@ impl PromptState {
         );
 
         Ok(())
+    }
+
+    async fn guardian_assessment(
+        &mut self,
+        client: &SessionClient,
+        event: GuardianAssessmentEvent,
+    ) {
+        let call_id = guardian_assessment_tool_call_id(&event.id);
+        let status = guardian_assessment_tool_call_status(&event.status);
+        let content = guardian_assessment_content(&event);
+        let raw_event = serde_json::json!(&event);
+
+        match event.status {
+            GuardianAssessmentStatus::InProgress => {
+                if self.active_guardian_assessments.insert(event.id.clone()) {
+                    client
+                        .send_tool_call(
+                            ToolCall::new(call_id, "Guardian Review")
+                                .kind(ToolKind::Think)
+                                .status(status)
+                                .content(content)
+                                .raw_input(raw_event),
+                        )
+                        .await;
+                } else {
+                    client
+                        .send_tool_call_update(ToolCallUpdate::new(
+                            call_id,
+                            ToolCallUpdateFields::new()
+                                .status(status)
+                                .content(content)
+                                .raw_output(raw_event),
+                        ))
+                        .await;
+                }
+            }
+            GuardianAssessmentStatus::Approved
+            | GuardianAssessmentStatus::Denied
+            | GuardianAssessmentStatus::Aborted => {
+                if self.active_guardian_assessments.remove(&event.id) {
+                    client
+                        .send_tool_call_update(ToolCallUpdate::new(
+                            call_id,
+                            ToolCallUpdateFields::new()
+                                .status(status)
+                                .content(content)
+                                .raw_output(raw_event),
+                        ))
+                        .await;
+                } else {
+                    client
+                        .send_tool_call(
+                            ToolCall::new(call_id, "Guardian Review")
+                                .kind(ToolKind::Think)
+                                .status(status)
+                                .content(content)
+                                .raw_input(raw_event),
+                        )
+                        .await;
+                }
+            }
+        }
     }
 }
 
@@ -2670,6 +2723,7 @@ impl<A: Auth> ThreadActor<A> {
                 personality: None,
                 windows_sandbox_level: None,
                 service_tier: None,
+                approvals_reviewer: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2716,6 +2770,7 @@ impl<A: Auth> ThreadActor<A> {
                 personality: None,
                 windows_sandbox_level: None,
                 service_tier: None,
+                approvals_reviewer: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2896,6 +2951,7 @@ impl<A: Auth> ThreadActor<A> {
                 personality: None,
                 windows_sandbox_level: None,
                 service_tier: None,
+                approvals_reviewer: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2962,6 +3018,7 @@ impl<A: Auth> ThreadActor<A> {
                 personality: None,
                 windows_sandbox_level: None,
                 service_tier: None,
+                approvals_reviewer: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3025,7 +3082,11 @@ impl<A: Auth> ThreadActor<A> {
             EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
                 self.client.send_user_message(message.clone()).await;
             }
-            EventMsg::AgentMessage(AgentMessageEvent { message, phase: _ }) => {
+            EventMsg::AgentMessage(AgentMessageEvent {
+                message,
+                phase: _,
+                memory_citation: _,
+            }) => {
                 self.client.send_agent_text(message.clone()).await;
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
@@ -3059,7 +3120,7 @@ impl<A: Auth> ThreadActor<A> {
         for hunk in &parsed.hunks {
             match hunk {
                 codex_apply_patch::Hunk::AddFile { path, contents } => {
-                    let full_path = self.config.cwd.join(path);
+                    let full_path = self.config.cwd.as_path().join(path);
                     file_names.push(path.display().to_string());
                     locations.push(ToolCallLocation::new(full_path.clone()));
                     // New file: no old_text, new_text is the contents
@@ -3069,7 +3130,7 @@ impl<A: Auth> ThreadActor<A> {
                     )));
                 }
                 codex_apply_patch::Hunk::DeleteFile { path } => {
-                    let full_path = self.config.cwd.join(path);
+                    let full_path = self.config.cwd.as_path().join(path);
                     file_names.push(path.display().to_string());
                     locations.push(ToolCallLocation::new(full_path.clone()));
                     // Delete file: old_text would be original content, new_text is empty
@@ -3082,10 +3143,10 @@ impl<A: Auth> ThreadActor<A> {
                     move_path,
                     chunks,
                 } => {
-                    let full_path = self.config.cwd.join(path);
+                    let full_path = self.config.cwd.as_path().join(path);
                     let dest_path = move_path
                         .as_ref()
-                        .map(|p| self.config.cwd.join(p))
+                        .map(|p| self.config.cwd.as_path().join(p))
                         .unwrap_or_else(|| full_path.clone());
                     file_names.push(path.display().to_string());
                     locations.push(ToolCallLocation::new(dest_path.clone()));
@@ -3156,7 +3217,7 @@ impl<A: Auth> ThreadActor<A> {
 
         let cwd = workdir
             .map(PathBuf::from)
-            .unwrap_or_else(|| self.config.cwd.clone());
+            .unwrap_or_else(|| self.config.cwd.clone().into());
 
         let parsed_cmd = parse_command(&command_vec);
         let ParseCommandToolCall {
@@ -3227,7 +3288,7 @@ impl<A: Auth> ThreadActor<A> {
                     .working_directory
                     .as_ref()
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| self.config.cwd.clone());
+                    .unwrap_or_else(|| self.config.cwd.clone().into());
 
                 // Parse the command to get rich info like the live event handler does
                 let parsed_cmd = parse_command(&exec.command);
@@ -3290,7 +3351,11 @@ impl<A: Auth> ThreadActor<A> {
                     )
                     .await;
             }
-            ResponseItem::CustomToolCallOutput { call_id, output } => {
+            ResponseItem::CustomToolCallOutput {
+                name: _,
+                call_id,
+                output,
+            } => {
                 self.client
                     .send_tool_call_completed(call_id.clone(), Some(serde_json::json!(output)))
                     .await;
@@ -3382,27 +3447,223 @@ fn extract_tool_call_content_from_changes(
     Vec<ToolCallLocation>,
     impl Iterator<Item = ToolCallContent>,
 ) {
-    (
+    let changes = changes.into_iter().collect_vec();
+    let title = if changes.is_empty() {
+        "Edit".to_string()
+    } else {
         format!(
             "Edit {}",
-            changes.keys().map(|p| p.display().to_string()).join(", ")
-        ),
-        changes.keys().map(ToolCallLocation::new).collect(),
-        changes.into_iter().map(|(path, change)| {
-            ToolCallContent::Diff(match change {
-                codex_protocol::protocol::FileChange::Add { content } => Diff::new(path, content),
-                codex_protocol::protocol::FileChange::Delete { content } => {
-                    Diff::new(path, String::new()).old_text(content)
+            changes
+                .iter()
+                .map(|(path, change)| tool_call_location_for_change(path, change)
+                    .display()
+                    .to_string())
+                .join(", ")
+        )
+    };
+    let locations = changes
+        .iter()
+        .map(|(path, change)| ToolCallLocation::new(tool_call_location_for_change(path, change)))
+        .collect_vec();
+    let content = changes
+        .into_iter()
+        .flat_map(|(path, change)| extract_tool_call_content_from_change(path, change));
+
+    (title, locations, content)
+}
+
+fn tool_call_location_for_change(path: &Path, change: &FileChange) -> PathBuf {
+    match change {
+        FileChange::Update {
+            move_path: Some(move_path),
+            ..
+        } => move_path.clone(),
+        _ => path.to_path_buf(),
+    }
+}
+
+fn extract_tool_call_content_from_change(
+    path: PathBuf,
+    change: FileChange,
+) -> Vec<ToolCallContent> {
+    match change {
+        FileChange::Add { content } => vec![ToolCallContent::Diff(Diff::new(path, content))],
+        FileChange::Delete { content } => {
+            vec![ToolCallContent::Diff(
+                Diff::new(path, String::new()).old_text(content),
+            )]
+        }
+        FileChange::Update {
+            unified_diff,
+            move_path,
+        } => extract_tool_call_content_from_unified_diff(move_path.unwrap_or(path), unified_diff),
+    }
+}
+
+fn extract_tool_call_content_from_unified_diff(
+    path: PathBuf,
+    unified_diff: String,
+) -> Vec<ToolCallContent> {
+    let Ok(patch) = diffy::Patch::from_str(&unified_diff) else {
+        return vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+            TextContent::new(unified_diff),
+        )))];
+    };
+
+    let diffs = patch
+        .hunks()
+        .iter()
+        .map(|hunk| {
+            let mut old_text = String::new();
+            let mut new_text = String::new();
+
+            for line in hunk.lines() {
+                match line {
+                    diffy::Line::Context(text) => {
+                        old_text.push_str(text);
+                        new_text.push_str(text);
+                    }
+                    diffy::Line::Delete(text) => old_text.push_str(text),
+                    diffy::Line::Insert(text) => new_text.push_str(text),
                 }
-                codex_protocol::protocol::FileChange::Update {
-                    unified_diff: _,
-                    move_path,
-                    old_content,
-                    new_content,
-                } => Diff::new(move_path.unwrap_or(path), new_content).old_text(old_content),
+            }
+
+            ToolCallContent::Diff(Diff::new(path.clone(), new_text).old_text(old_text))
+        })
+        .collect_vec();
+
+    if diffs.is_empty() {
+        vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+            TextContent::new(unified_diff),
+        )))]
+    } else {
+        diffs
+    }
+}
+
+fn guardian_assessment_tool_call_id(id: &str) -> String {
+    format!("guardian_assessment:{id}")
+}
+
+fn guardian_assessment_tool_call_status(status: &GuardianAssessmentStatus) -> ToolCallStatus {
+    match status {
+        GuardianAssessmentStatus::InProgress => ToolCallStatus::InProgress,
+        GuardianAssessmentStatus::Approved => ToolCallStatus::Completed,
+        GuardianAssessmentStatus::Denied | GuardianAssessmentStatus::Aborted => {
+            ToolCallStatus::Failed
+        }
+    }
+}
+
+fn guardian_assessment_content(event: &GuardianAssessmentEvent) -> Vec<ToolCallContent> {
+    let mut lines = vec![format!(
+        "Status: {}",
+        match event.status {
+            GuardianAssessmentStatus::InProgress => "In progress",
+            GuardianAssessmentStatus::Approved => "Approved",
+            GuardianAssessmentStatus::Denied => "Denied",
+            GuardianAssessmentStatus::Aborted => "Aborted",
+        }
+    )];
+
+    if let Some(summary) = event.action.as_ref().and_then(guardian_action_summary) {
+        lines.push(format!("Action: {summary}"));
+    }
+
+    match (event.risk_level, event.risk_score) {
+        (Some(level), Some(score)) => {
+            lines.push(format!(
+                "Risk: {} ({score}/100)",
+                format!("{level:?}").to_lowercase()
+            ));
+        }
+        (Some(level), None) => {
+            lines.push(format!("Risk: {}", format!("{level:?}").to_lowercase()));
+        }
+        (None, Some(score)) => lines.push(format!("Risk score: {score}/100")),
+        (None, None) => {}
+    }
+
+    if let Some(rationale) = event.rationale.as_ref()
+        && !rationale.trim().is_empty()
+    {
+        lines.push(format!("Rationale: {rationale}"));
+    }
+
+    let mut content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+        TextContent::new(lines.join("\n")),
+    )))];
+
+    if let Some(action) = event.action.as_ref()
+        && guardian_action_summary(action).is_none()
+        && let Ok(action_json) = serde_json::to_string_pretty(action)
+    {
+        content.push(ToolCallContent::Content(Content::new(ContentBlock::Text(
+            TextContent::new(format!("Action payload:\n{action_json}")),
+        ))));
+    }
+
+    content
+}
+
+fn guardian_action_summary(action: &serde_json::Value) -> Option<String> {
+    let tool = action.get("tool").and_then(serde_json::Value::as_str)?;
+    match tool {
+        "shell" | "exec_command" => match action.get("command") {
+            Some(serde_json::Value::String(command)) => Some(command.clone()),
+            Some(serde_json::Value::Array(command)) => {
+                let args = command
+                    .iter()
+                    .map(serde_json::Value::as_str)
+                    .collect::<Option<Vec<_>>>()?;
+                shlex::try_join(args.iter().copied())
+                    .ok()
+                    .or_else(|| Some(args.join(" ")))
+            }
+            _ => None,
+        },
+        "apply_patch" => {
+            let files = action
+                .get("files")
+                .and_then(serde_json::Value::as_array)
+                .map(|files| {
+                    files
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let change_count = action
+                .get("change_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(files.len() as u64);
+            Some(if files.len() == 1 {
+                format!("apply_patch touching {}", files[0])
+            } else {
+                format!(
+                    "apply_patch touching {change_count} changes across {} files",
+                    files.len()
+                )
             })
-        }),
-    )
+        }
+        "network_access" => action
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| action.get("host").and_then(serde_json::Value::as_str))
+            .map(|target| format!("network access to {target}")),
+        "mcp_tool_call" => {
+            let tool_name = action
+                .get("tool_name")
+                .and_then(serde_json::Value::as_str)?;
+            let label = action
+                .get("connector_name")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| action.get("server").and_then(serde_json::Value::as_str))
+                .unwrap_or("unknown server");
+            Some(format!("MCP {tool_name} on {label}"))
+        }
+        _ => None,
+    }
 }
 
 /// Extract title and call_id from a WebSearchAction (used for replay)
@@ -4195,6 +4456,7 @@ mod tests {
                                 msg: EventMsg::AgentMessage(AgentMessageEvent {
                                     message: prompt,
                                     phase: None,
+                                    memory_citation: None,
                                 }),
                             })
                             .unwrap();
@@ -4226,6 +4488,7 @@ mod tests {
                             msg: EventMsg::AgentMessage(AgentMessageEvent {
                                 message: "Compact task completed".to_string(),
                                 phase: None,
+                                memory_citation: None,
                             }),
                         })
                         .unwrap();
@@ -4686,6 +4949,7 @@ mod tests {
                         EventMsg::AgentMessage(AgentMessageEvent {
                             message: "still flowing".to_string(),
                             phase: None,
+                            memory_citation: None,
                         }),
                     )
                     .await;
