@@ -21,6 +21,7 @@ use agent_client_protocol::{
     ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
     UsageUpdate,
 };
+use agent_client_protocol::{ExtRequest, ExtResponse};
 use codex_apply_patch::parse_patch;
 use codex_core::{
     AuthManager, CodexThread,

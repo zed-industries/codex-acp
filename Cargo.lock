@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "acp-extension-codex"
-version = "0.10.0"
+version = "0.11.1"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -23,12 +23,14 @@ dependencies = [
  "codex-apply-patch",
  "codex-arg0",
  "codex-core",
+ "codex-exec-server",
  "codex-login",
  "codex-mcp-server",
  "codex-protocol",
  "codex-shell-command",
  "codex-utils-approval-presets",
  "codex-utils-cli",
+ "diffy",
  "heck",
  "itertools 0.14.0",
  "regex-lite",
@@ -1034,39 +1036,6 @@ name = "cmp_any"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9b18233253483ce2f65329a24072ec414db782531bdbb7d0bbc4bd2ce6b7e21"
-
-[[package]]
-name = "codex-acp"
-version = "0.11.1"
-dependencies = [
- "agent-client-protocol",
- "anyhow",
- "async-trait",
- "clap",
- "codex-apply-patch",
- "codex-arg0",
- "codex-core",
- "codex-exec-server",
- "codex-login",
- "codex-mcp-server",
- "codex-protocol",
- "codex-shell-command",
- "codex-utils-approval-presets",
- "codex-utils-cli",
- "diffy",
- "heck",
- "itertools 0.14.0",
- "regex-lite",
- "serde",
- "serde_json",
- "shlex",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "unicode-segmentation",
- "uuid",
-]
 
 [[package]]
 name = "codex-analytics"
