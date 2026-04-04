@@ -12,7 +12,6 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
-mod local_spawner;
 mod prompt_args;
 mod thread;
 
