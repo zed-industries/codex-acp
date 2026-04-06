@@ -18,9 +18,8 @@ name = "codex_acp"
 path = "src/lib.rs"
 
 [dependencies]
-agent-client-protocol = { version = "=0.10.4", features = ["unstable"] }
+agent-client-protocol = { package = "agent-client-protocol-core", git = "https://github.com/agentclientprotocol/rust-sdk", rev = "ec9ceae869b240643ce73bca1b9daf7c266c116b", features = ["unstable"] }
 anyhow = "1"
-async-trait = "0.1"
 clap = "4"
 codex-apply-patch = { git = "https://github.com/openai/codex", tag = "rust-v0.117.0" }
 codex-arg0 = { git = "https://github.com/openai/codex", tag = "rust-v0.117.0" }
