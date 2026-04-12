@@ -59,6 +59,12 @@ pub async fn run_main(
                 )
             })?;
 
+    // Apply residency requirement so the HTTP client sends the
+    // x-openai-internal-codex-residency header on all requests.
+    codex_core::default_client::set_default_client_residency_requirement(
+        config.enforce_residency.value(),
+    );
+
     // Create our Agent implementation with notification channel
     let agent = Rc::new(codex_agent::CodexAgent::new(config));
 
