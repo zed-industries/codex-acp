@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::DerefMut,
     path::{Path, PathBuf},
     rc::Rc,
@@ -17,8 +17,9 @@ use agent_client_protocol::{
     SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
     SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
     SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal,
-    TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, UsageUpdate,
+    TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    UsageUpdate,
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
@@ -35,29 +36,31 @@ use codex_protocol::{
     custom_prompts::CustomPrompt,
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     mcp::CallToolResult,
-    models::{MacOsSeatbeltProfileExtensions, PermissionProfile, ResponseItem, WebSearchAction},
+    models::{PermissionProfile, ResponseItem, WebSearchAction},
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
         AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent, AgentStatus,
-        ApplyPatchApprovalRequestEvent, CollabAgentInteractionEndEvent, CollabAgentSpawnEndEvent,
-        CollabCloseEndEvent, CollabResumeEndEvent, CollabWaitingEndEvent,
-        DynamicToolCallResponseEvent, ElicitationAction, ErrorEvent, Event, EventMsg,
-        ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent,
+        ApplyPatchApprovalRequestEvent, CollabAgentInteractionEndEvent,
+        CollabAgentSpawnEndEvent, CollabCloseEndEvent, CollabResumeEndEvent,
+        CollabWaitingEndEvent, DynamicToolCallResponseEvent, ElicitationAction, ErrorEvent,
+        Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent,
         ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent, FileChange,
-        ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation,
-        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
-        ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
-        PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
+        GuardianAssessmentEvent, GuardianAssessmentStatus, ItemCompletedEvent, ItemStartedEvent,
+        ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent,
+        McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent,
+        NetworkApprovalContext, NetworkPolicyRuleAction, Op, PatchApplyBeginEvent,
+        PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
         ReviewTarget, RolloutItem, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent,
         TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
         ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
-        PermissionGrantScope, RequestPermissionsEvent, RequestPermissionsResponse,
+        PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
+        RequestPermissionsResponse,
     },
     user_input::UserInput,
 };
@@ -345,11 +348,49 @@ enum PendingPermissionRequest {
         call_id: String,
         permissions: PermissionProfile,
     },
+    McpElicitation {
+        server_name: String,
+        request_id: codex_protocol::mcp::RequestId,
+        option_map: HashMap<String, ResolvedMcpElicitation>,
+    },
 }
 
 struct PendingPermissionInteraction {
     request: PendingPermissionRequest,
     task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+struct ResolvedMcpElicitation {
+    action: ElicitationAction,
+    content: Option<serde_json::Value>,
+    meta: Option<serde_json::Value>,
+}
+
+impl ResolvedMcpElicitation {
+    fn accept() -> Self {
+        Self {
+            action: ElicitationAction::Accept,
+            content: None,
+            meta: None,
+        }
+    }
+
+    fn accept_with_persist(persist: &'static str) -> Self {
+        Self {
+            action: ElicitationAction::Accept,
+            content: None,
+            meta: Some(serde_json::json!({ "persist": persist })),
+        }
+    }
+
+    fn cancel() -> Self {
+        Self {
+            action: ElicitationAction::Cancel,
+            content: None,
+            meta: None,
+        }
+    }
 }
 
 fn exec_request_key(call_id: &str) -> String {
@@ -364,6 +405,239 @@ fn permissions_request_key(call_id: &str) -> String {
     format!("permissions:{call_id}")
 }
 
+fn mcp_elicitation_request_key(
+    server_name: &str,
+    request_id: &codex_protocol::mcp::RequestId,
+) -> String {
+    format!("mcp-elicitation:{server_name}:{request_id}")
+}
+
+const MCP_TOOL_APPROVAL_KIND_KEY: &str = "codex_approval_kind";
+const MCP_TOOL_APPROVAL_KIND_MCP_TOOL_CALL: &str = "mcp_tool_call";
+const MCP_TOOL_APPROVAL_PERSIST_KEY: &str = "persist";
+const MCP_TOOL_APPROVAL_PERSIST_SESSION: &str = "session";
+const MCP_TOOL_APPROVAL_PERSIST_ALWAYS: &str = "always";
+const MCP_TOOL_APPROVAL_TOOL_TITLE_KEY: &str = "tool_title";
+const MCP_TOOL_APPROVAL_TOOL_DESCRIPTION_KEY: &str = "tool_description";
+const MCP_TOOL_APPROVAL_CONNECTOR_NAME_KEY: &str = "connector_name";
+const MCP_TOOL_APPROVAL_CONNECTOR_DESCRIPTION_KEY: &str = "connector_description";
+const MCP_TOOL_APPROVAL_TOOL_PARAMS_KEY: &str = "tool_params";
+const MCP_TOOL_APPROVAL_TOOL_PARAMS_DISPLAY_KEY: &str = "tool_params_display";
+const MCP_TOOL_APPROVAL_REQUEST_ID_PREFIX: &str = "mcp_tool_call_approval_";
+const MCP_TOOL_APPROVAL_ALLOW_OPTION_ID: &str = "approved";
+const MCP_TOOL_APPROVAL_ALLOW_SESSION_OPTION_ID: &str = "approved-for-session";
+const MCP_TOOL_APPROVAL_ALLOW_ALWAYS_OPTION_ID: &str = "approved-always";
+const MCP_TOOL_APPROVAL_CANCEL_OPTION_ID: &str = "cancel";
+
+struct SupportedMcpElicitationPermissionRequest {
+    request_key: String,
+    tool_call: ToolCallUpdate,
+    options: Vec<PermissionOption>,
+    option_map: HashMap<String, ResolvedMcpElicitation>,
+}
+
+fn build_supported_mcp_elicitation_permission_request(
+    server_name: &str,
+    request_id: &codex_protocol::mcp::RequestId,
+    request: &ElicitationRequest,
+    raw_input: serde_json::Value,
+) -> Option<SupportedMcpElicitationPermissionRequest> {
+    let ElicitationRequest::Form {
+        meta: Some(meta),
+        message,
+        requested_schema: _,
+    } = request
+    else {
+        return None;
+    };
+    let meta = meta.as_object()?;
+    if meta
+        .get(MCP_TOOL_APPROVAL_KIND_KEY)
+        .and_then(serde_json::Value::as_str)
+        != Some(MCP_TOOL_APPROVAL_KIND_MCP_TOOL_CALL)
+    {
+        return None;
+    }
+
+    let (allow_session_remember, allow_persistent_approval) = mcp_tool_approval_persist_modes(meta);
+    let mut options = vec![PermissionOption::new(
+        MCP_TOOL_APPROVAL_ALLOW_OPTION_ID,
+        "Allow",
+        PermissionOptionKind::AllowOnce,
+    )];
+    let mut option_map = HashMap::from([(
+        MCP_TOOL_APPROVAL_ALLOW_OPTION_ID.to_string(),
+        ResolvedMcpElicitation::accept(),
+    )]);
+
+    if allow_session_remember {
+        options.push(PermissionOption::new(
+            MCP_TOOL_APPROVAL_ALLOW_SESSION_OPTION_ID,
+            "Allow for this session",
+            PermissionOptionKind::AllowAlways,
+        ));
+        option_map.insert(
+            MCP_TOOL_APPROVAL_ALLOW_SESSION_OPTION_ID.to_string(),
+            ResolvedMcpElicitation::accept_with_persist(MCP_TOOL_APPROVAL_PERSIST_SESSION),
+        );
+    }
+
+    if allow_persistent_approval {
+        options.push(PermissionOption::new(
+            MCP_TOOL_APPROVAL_ALLOW_ALWAYS_OPTION_ID,
+            "Allow and don't ask again",
+            PermissionOptionKind::AllowAlways,
+        ));
+        option_map.insert(
+            MCP_TOOL_APPROVAL_ALLOW_ALWAYS_OPTION_ID.to_string(),
+            ResolvedMcpElicitation::accept_with_persist(MCP_TOOL_APPROVAL_PERSIST_ALWAYS),
+        );
+    }
+
+    options.push(PermissionOption::new(
+        MCP_TOOL_APPROVAL_CANCEL_OPTION_ID,
+        "Cancel",
+        PermissionOptionKind::RejectOnce,
+    ));
+    option_map.insert(
+        MCP_TOOL_APPROVAL_CANCEL_OPTION_ID.to_string(),
+        ResolvedMcpElicitation::cancel(),
+    );
+
+    let tool_call_id = mcp_tool_approval_call_id(request_id)
+        .unwrap_or_else(|| format!("mcp-elicitation:{request_id}"));
+    let title = meta
+        .get(MCP_TOOL_APPROVAL_TOOL_TITLE_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+        .map(|title| format!("Approve {title}"))
+        .unwrap_or_else(|| "Approve MCP tool call".to_string());
+    let content = format_mcp_tool_approval_content(server_name, message, meta);
+
+    Some(SupportedMcpElicitationPermissionRequest {
+        request_key: mcp_elicitation_request_key(server_name, request_id),
+        tool_call: ToolCallUpdate::new(
+            ToolCallId::new(tool_call_id),
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Pending)
+                .title(title)
+                .content(vec![ToolCallContent::Content(Content::new(
+                    ContentBlock::Text(TextContent::new(content)),
+                ))])
+                .raw_input(raw_input),
+        ),
+        options,
+        option_map,
+    })
+}
+
+fn mcp_tool_approval_persist_modes(
+    meta: &serde_json::Map<String, serde_json::Value>,
+) -> (bool, bool) {
+    match meta.get(MCP_TOOL_APPROVAL_PERSIST_KEY) {
+        Some(serde_json::Value::String(persist)) => (
+            persist == MCP_TOOL_APPROVAL_PERSIST_SESSION,
+            persist == MCP_TOOL_APPROVAL_PERSIST_ALWAYS,
+        ),
+        Some(serde_json::Value::Array(values)) => (
+            values
+                .iter()
+                .any(|value| value.as_str() == Some(MCP_TOOL_APPROVAL_PERSIST_SESSION)),
+            values
+                .iter()
+                .any(|value| value.as_str() == Some(MCP_TOOL_APPROVAL_PERSIST_ALWAYS)),
+        ),
+        _ => (false, false),
+    }
+}
+
+fn mcp_tool_approval_call_id(request_id: &codex_protocol::mcp::RequestId) -> Option<String> {
+    match request_id {
+        codex_protocol::mcp::RequestId::String(value) => value
+            .strip_prefix(MCP_TOOL_APPROVAL_REQUEST_ID_PREFIX)
+            .map(ToString::to_string),
+        codex_protocol::mcp::RequestId::Integer(_) => None,
+    }
+}
+
+fn format_mcp_tool_approval_content(
+    server_name: &str,
+    message: &str,
+    meta: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let mut sections = vec![message.trim().to_string()];
+
+    let source = meta
+        .get(MCP_TOOL_APPROVAL_CONNECTOR_NAME_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("Source: {value}"))
+        .unwrap_or_else(|| format!("Server: {server_name}"));
+    sections.push(source);
+
+    if let Some(description) = meta
+        .get(MCP_TOOL_APPROVAL_CONNECTOR_DESCRIPTION_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        sections.push(description.to_string());
+    }
+
+    if let Some(description) = meta
+        .get(MCP_TOOL_APPROVAL_TOOL_DESCRIPTION_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        sections.push(description.to_string());
+    }
+
+    if let Some(params) = format_mcp_tool_approval_params(meta) {
+        sections.push(format!("Arguments:\n{params}"));
+    }
+
+    sections.join("\n\n")
+}
+
+fn format_mcp_tool_approval_params(
+    meta: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    if let Some(serde_json::Value::Array(params)) =
+        meta.get(MCP_TOOL_APPROVAL_TOOL_PARAMS_DISPLAY_KEY)
+    {
+        let params = params
+            .iter()
+            .filter_map(|param| {
+                let object = param.as_object()?;
+                let name = object
+                    .get("display_name")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| object.get("name").and_then(serde_json::Value::as_str))?;
+                let value = object.get("value")?;
+                Some(format!(
+                    "- {name}: {}",
+                    format_mcp_tool_approval_value(value)
+                ))
+            })
+            .collect::<Vec<_>>();
+        if !params.is_empty() {
+            return Some(params.join("\n"));
+        }
+    }
+
+    meta.get(MCP_TOOL_APPROVAL_TOOL_PARAMS_KEY).map(|params| {
+        serde_json::to_string_pretty(params)
+            .unwrap_or_else(|_| format_mcp_tool_approval_value(params))
+    })
+}
+
+fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value.clone(),
+        _ => serde_json::to_string(value).unwrap_or_else(|_| value.to_string()),
+    }
+}
+
+#[expect(clippy::large_enum_variant)]
 enum SubmissionState {
     /// Loading custom prompts from the project
     CustomPrompts(CustomPromptsState),
@@ -462,6 +736,7 @@ struct PromptState {
     submission_id: String,
     active_commands: HashMap<String, ActiveCommand>,
     active_web_search: Option<String>,
+    active_guardian_assessments: HashSet<String>,
     thread: Arc<dyn CodexThreadImpl>,
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     pending_permission_interactions: HashMap<String, PendingPermissionInteraction>,
@@ -482,6 +757,7 @@ impl PromptState {
             submission_id,
             active_commands: HashMap::new(),
             active_web_search: None,
+            active_guardian_assessments: HashSet::new(),
             thread,
             resolution_tx,
             pending_permission_interactions: HashMap::new(),
@@ -611,20 +887,20 @@ impl PromptState {
                         ..
                     }) => match option_id.0.as_ref() {
                         "approved-for-session" => RequestPermissionsResponse {
-                            permissions,
+                            permissions: permissions.into(),
                             scope: PermissionGrantScope::Session,
                         },
                         "approved" => RequestPermissionsResponse {
-                            permissions,
+                            permissions: permissions.into(),
                             scope: PermissionGrantScope::Turn,
                         },
                         _ => RequestPermissionsResponse {
-                            permissions: PermissionProfile::default(),
+                            permissions: RequestPermissionProfile::default(),
                             scope: PermissionGrantScope::Turn,
                         },
                     },
                     RequestPermissionOutcome::Cancelled | _ => RequestPermissionsResponse {
-                        permissions: PermissionProfile::default(),
+                        permissions: RequestPermissionProfile::default(),
                         scope: PermissionGrantScope::Turn,
                     },
                 };
@@ -633,6 +909,33 @@ impl PromptState {
                     .submit(Op::RequestPermissionsResponse {
                         id: call_id,
                         response,
+                    })
+                    .await
+                    .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+            }
+            PendingPermissionRequest::McpElicitation {
+                server_name,
+                request_id,
+                option_map,
+            } => {
+                let response = match response.outcome {
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome {
+                        option_id,
+                        ..
+                    }) => option_map
+                        .get(option_id.0.as_ref())
+                        .cloned()
+                        .unwrap_or_else(ResolvedMcpElicitation::cancel),
+                    RequestPermissionOutcome::Cancelled | _ => ResolvedMcpElicitation::cancel(),
+                };
+
+                self.thread
+                    .submit(Op::ResolveElicitation {
+                        server_name,
+                        request_id,
+                        decision: response.action,
+                        content: response.content,
+                        meta: response.meta,
                     })
                     .await
                     .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -741,7 +1044,7 @@ impl PromptState {
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought("\n\n").await;
             }
-            EventMsg::AgentMessage(AgentMessageEvent { message , phase: _ }) => {
+            EventMsg::AgentMessage(AgentMessageEvent { message , phase: _, memory_citation: _ }) => {
                 info!("Agent message (non-delta) received: {message:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_message_deltas) {
@@ -1098,6 +1401,13 @@ impl PromptState {
                     drop(response_tx.send(Err(err)));
                 }
             }
+            EventMsg::GuardianAssessment(event) => {
+                info!(
+                    "Guardian assessment: id={}, status={:?}, turn_id={}",
+                    event.id, event.status, event.turn_id
+                );
+                self.guardian_assessment(client, event).await;
+            }
 
             // Ignore these events
             EventMsg::ImageGenerationBegin(..)
@@ -1129,9 +1439,7 @@ impl PromptState {
             // Used for returning a single history entry
             | EventMsg::GetHistoryEntryResponse(..)
             | EventMsg::DeprecationNotice(..)
-            | EventMsg::RequestUserInput(..)
-            | EventMsg::ListRemoteSkillsResponse(..)
-            | EventMsg::RemoteSkillDownloaded(..)) => {
+            | EventMsg::RequestUserInput(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
@@ -1139,15 +1447,40 @@ impl PromptState {
 
     async fn mcp_elicitation(
         &mut self,
-        _client: &SessionClient,
+        client: &SessionClient,
         event: ElicitationRequestEvent,
     ) -> Result<(), Error> {
+        let raw_input = serde_json::json!(&event);
         let ElicitationRequestEvent {
             server_name,
             id,
             request,
             turn_id: _,
         } = event;
+        if let Some(supported_request) = build_supported_mcp_elicitation_permission_request(
+            &server_name,
+            &id,
+            &request,
+            raw_input,
+        ) {
+            info!(
+                "Routing MCP tool approval elicitation through ACP permission request: server={}, id={:?}",
+                server_name, id
+            );
+            self.spawn_permission_request(
+                client,
+                supported_request.request_key,
+                PendingPermissionRequest::McpElicitation {
+                    server_name,
+                    request_id: id,
+                    option_map: supported_request.option_map,
+                },
+                supported_request.tool_call,
+                supported_request.options,
+            );
+            return Ok(());
+        }
+
         let request_kind = match &request {
             ElicitationRequest::Form { .. } => "form",
             ElicitationRequest::Url { .. } => "url",
@@ -1984,26 +2317,6 @@ impl PromptState {
         {
             content.push(format!("Network Access: {enabled}"));
         }
-        if let Some(mac) = permissions.macos.as_ref() {
-            let MacOsSeatbeltProfileExtensions {
-                macos_preferences,
-                macos_automation,
-                macos_launch_services,
-                macos_accessibility,
-                macos_calendar,
-                macos_reminders,
-                macos_contacts,
-            } = mac;
-
-            content.push("MacOS Seatbelt Profile Extensions: ".to_string());
-            content.push(format!("Preferences: {:?}", macos_preferences));
-            content.push(format!("Automation: {:?}", macos_automation));
-            content.push(format!("Launch Services: {}", macos_launch_services));
-            content.push(format!("Accessibility: {}", macos_accessibility));
-            content.push(format!("Calendar: {}", macos_calendar));
-            content.push(format!("Reminders: {}", macos_reminders));
-            content.push(format!("Contacts: {:?}", macos_contacts));
-        }
 
         let content = if content.is_empty() {
             None
@@ -2016,7 +2329,7 @@ impl PromptState {
             permissions_request_key(&call_id),
             PendingPermissionRequest::RequestPermissions {
                 call_id,
-                permissions,
+                permissions: permissions.into(),
             },
             ToolCallUpdate::new(
                 tool_call_id,
@@ -2038,6 +2351,68 @@ impl PromptState {
         );
 
         Ok(())
+    }
+
+    async fn guardian_assessment(
+        &mut self,
+        client: &SessionClient,
+        event: GuardianAssessmentEvent,
+    ) {
+        let call_id = guardian_assessment_tool_call_id(&event.id);
+        let status = guardian_assessment_tool_call_status(&event.status);
+        let content = guardian_assessment_content(&event);
+        let raw_event = serde_json::json!(&event);
+
+        match event.status {
+            GuardianAssessmentStatus::InProgress => {
+                if self.active_guardian_assessments.insert(event.id.clone()) {
+                    client
+                        .send_tool_call(
+                            ToolCall::new(call_id, "Guardian Review")
+                                .kind(ToolKind::Think)
+                                .status(status)
+                                .content(content)
+                                .raw_input(raw_event),
+                        )
+                        .await;
+                } else {
+                    client
+                        .send_tool_call_update(ToolCallUpdate::new(
+                            call_id,
+                            ToolCallUpdateFields::new()
+                                .status(status)
+                                .content(content)
+                                .raw_output(raw_event),
+                        ))
+                        .await;
+                }
+            }
+            GuardianAssessmentStatus::Approved
+            | GuardianAssessmentStatus::Denied
+            | GuardianAssessmentStatus::Aborted => {
+                if self.active_guardian_assessments.remove(&event.id) {
+                    client
+                        .send_tool_call_update(ToolCallUpdate::new(
+                            call_id,
+                            ToolCallUpdateFields::new()
+                                .status(status)
+                                .content(content)
+                                .raw_output(raw_event),
+                        ))
+                        .await;
+                } else {
+                    client
+                        .send_tool_call(
+                            ToolCall::new(call_id, "Guardian Review")
+                                .kind(ToolKind::Think)
+                                .status(status)
+                                .content(content)
+                                .raw_input(raw_event),
+                        )
+                        .await;
+                }
+            }
+        }
     }
 }
 
@@ -2624,8 +2999,10 @@ impl<A: Auth> ThreadActor<A> {
         let current_mode_id = APPROVAL_PRESETS
             .iter()
             .find(|preset| {
-                &preset.approval == self.config.permissions.approval_policy.get()
-                    && &preset.sandbox == self.config.permissions.sandbox_policy.get()
+                std::mem::discriminant(&preset.approval)
+                    == std::mem::discriminant(self.config.permissions.approval_policy.get())
+                    && std::mem::discriminant(&preset.sandbox)
+                        == std::mem::discriminant(self.config.permissions.sandbox_policy.get())
             })
             .or_else(|| {
                 // When the project is untrusted, the above code won't match
@@ -2860,6 +3237,7 @@ impl<A: Auth> ThreadActor<A> {
                 personality: None,
                 windows_sandbox_level: None,
                 service_tier: None,
+                approvals_reviewer: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2906,6 +3284,7 @@ impl<A: Auth> ThreadActor<A> {
                 personality: None,
                 windows_sandbox_level: None,
                 service_tier: None,
+                approvals_reviewer: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3086,6 +3465,7 @@ impl<A: Auth> ThreadActor<A> {
                 personality: None,
                 windows_sandbox_level: None,
                 service_tier: None,
+                approvals_reviewer: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3152,6 +3532,7 @@ impl<A: Auth> ThreadActor<A> {
                 personality: None,
                 windows_sandbox_level: None,
                 service_tier: None,
+                approvals_reviewer: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3215,7 +3596,11 @@ impl<A: Auth> ThreadActor<A> {
             EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
                 self.client.send_user_message(message.clone()).await;
             }
-            EventMsg::AgentMessage(AgentMessageEvent { message, phase: _ }) => {
+            EventMsg::AgentMessage(AgentMessageEvent {
+                message,
+                phase: _,
+                memory_citation: _,
+            }) => {
                 self.client.send_agent_text(message.clone()).await;
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
@@ -3249,7 +3634,7 @@ impl<A: Auth> ThreadActor<A> {
         for hunk in &parsed.hunks {
             match hunk {
                 codex_apply_patch::Hunk::AddFile { path, contents } => {
-                    let full_path = self.config.cwd.join(path);
+                    let full_path = self.config.cwd.as_path().join(path);
                     file_names.push(path.display().to_string());
                     locations.push(ToolCallLocation::new(full_path.clone()));
                     // New file: no old_text, new_text is the contents
@@ -3259,7 +3644,7 @@ impl<A: Auth> ThreadActor<A> {
                     )));
                 }
                 codex_apply_patch::Hunk::DeleteFile { path } => {
-                    let full_path = self.config.cwd.join(path);
+                    let full_path = self.config.cwd.as_path().join(path);
                     file_names.push(path.display().to_string());
                     locations.push(ToolCallLocation::new(full_path.clone()));
                     // Delete file: old_text would be original content, new_text is empty
@@ -3272,10 +3657,10 @@ impl<A: Auth> ThreadActor<A> {
                     move_path,
                     chunks,
                 } => {
-                    let full_path = self.config.cwd.join(path);
+                    let full_path = self.config.cwd.as_path().join(path);
                     let dest_path = move_path
                         .as_ref()
-                        .map(|p| self.config.cwd.join(p))
+                        .map(|p| self.config.cwd.as_path().join(p))
                         .unwrap_or_else(|| full_path.clone());
                     file_names.push(path.display().to_string());
                     locations.push(ToolCallLocation::new(dest_path.clone()));
@@ -3346,7 +3731,7 @@ impl<A: Auth> ThreadActor<A> {
 
         let cwd = workdir
             .map(PathBuf::from)
-            .unwrap_or_else(|| self.config.cwd.clone());
+            .unwrap_or_else(|| self.config.cwd.clone().into());
 
         let parsed_cmd = parse_command(&command_vec);
         let ParseCommandToolCall {
@@ -3417,7 +3802,7 @@ impl<A: Auth> ThreadActor<A> {
                     .working_directory
                     .as_ref()
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| self.config.cwd.clone());
+                    .unwrap_or_else(|| self.config.cwd.clone().into());
 
                 // Parse the command to get rich info like the live event handler does
                 let parsed_cmd = parse_command(&exec.command);
@@ -3480,7 +3865,11 @@ impl<A: Auth> ThreadActor<A> {
                     )
                     .await;
             }
-            ResponseItem::CustomToolCallOutput { call_id, output } => {
+            ResponseItem::CustomToolCallOutput {
+                name: _,
+                call_id,
+                output,
+            } => {
                 self.client
                     .send_tool_call_completed(call_id.clone(), Some(serde_json::json!(output)))
                     .await;
@@ -3572,27 +3961,223 @@ fn extract_tool_call_content_from_changes(
     Vec<ToolCallLocation>,
     impl Iterator<Item = ToolCallContent>,
 ) {
-    (
+    let changes = changes.into_iter().collect_vec();
+    let title = if changes.is_empty() {
+        "Edit".to_string()
+    } else {
         format!(
             "Edit {}",
-            changes.keys().map(|p| p.display().to_string()).join(", ")
-        ),
-        changes.keys().map(ToolCallLocation::new).collect(),
-        changes.into_iter().map(|(path, change)| {
-            ToolCallContent::Diff(match change {
-                codex_protocol::protocol::FileChange::Add { content } => Diff::new(path, content),
-                codex_protocol::protocol::FileChange::Delete { content } => {
-                    Diff::new(path, String::new()).old_text(content)
+            changes
+                .iter()
+                .map(|(path, change)| tool_call_location_for_change(path, change)
+                    .display()
+                    .to_string())
+                .join(", ")
+        )
+    };
+    let locations = changes
+        .iter()
+        .map(|(path, change)| ToolCallLocation::new(tool_call_location_for_change(path, change)))
+        .collect_vec();
+    let content = changes
+        .into_iter()
+        .flat_map(|(path, change)| extract_tool_call_content_from_change(path, change));
+
+    (title, locations, content)
+}
+
+fn tool_call_location_for_change(path: &Path, change: &FileChange) -> PathBuf {
+    match change {
+        FileChange::Update {
+            move_path: Some(move_path),
+            ..
+        } => move_path.clone(),
+        _ => path.to_path_buf(),
+    }
+}
+
+fn extract_tool_call_content_from_change(
+    path: PathBuf,
+    change: FileChange,
+) -> Vec<ToolCallContent> {
+    match change {
+        FileChange::Add { content } => vec![ToolCallContent::Diff(Diff::new(path, content))],
+        FileChange::Delete { content } => {
+            vec![ToolCallContent::Diff(
+                Diff::new(path, String::new()).old_text(content),
+            )]
+        }
+        FileChange::Update {
+            unified_diff,
+            move_path,
+        } => extract_tool_call_content_from_unified_diff(move_path.unwrap_or(path), unified_diff),
+    }
+}
+
+fn extract_tool_call_content_from_unified_diff(
+    path: PathBuf,
+    unified_diff: String,
+) -> Vec<ToolCallContent> {
+    let Ok(patch) = diffy::Patch::from_str(&unified_diff) else {
+        return vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+            TextContent::new(unified_diff),
+        )))];
+    };
+
+    let diffs = patch
+        .hunks()
+        .iter()
+        .map(|hunk| {
+            let mut old_text = String::new();
+            let mut new_text = String::new();
+
+            for line in hunk.lines() {
+                match line {
+                    diffy::Line::Context(text) => {
+                        old_text.push_str(text);
+                        new_text.push_str(text);
+                    }
+                    diffy::Line::Delete(text) => old_text.push_str(text),
+                    diffy::Line::Insert(text) => new_text.push_str(text),
                 }
-                codex_protocol::protocol::FileChange::Update {
-                    unified_diff: _,
-                    move_path,
-                    old_content,
-                    new_content,
-                } => Diff::new(move_path.unwrap_or(path), new_content).old_text(old_content),
+            }
+
+            ToolCallContent::Diff(Diff::new(path.clone(), new_text).old_text(old_text))
+        })
+        .collect_vec();
+
+    if diffs.is_empty() {
+        vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+            TextContent::new(unified_diff),
+        )))]
+    } else {
+        diffs
+    }
+}
+
+fn guardian_assessment_tool_call_id(id: &str) -> String {
+    format!("guardian_assessment:{id}")
+}
+
+fn guardian_assessment_tool_call_status(status: &GuardianAssessmentStatus) -> ToolCallStatus {
+    match status {
+        GuardianAssessmentStatus::InProgress => ToolCallStatus::InProgress,
+        GuardianAssessmentStatus::Approved => ToolCallStatus::Completed,
+        GuardianAssessmentStatus::Denied | GuardianAssessmentStatus::Aborted => {
+            ToolCallStatus::Failed
+        }
+    }
+}
+
+fn guardian_assessment_content(event: &GuardianAssessmentEvent) -> Vec<ToolCallContent> {
+    let mut lines = vec![format!(
+        "Status: {}",
+        match event.status {
+            GuardianAssessmentStatus::InProgress => "In progress",
+            GuardianAssessmentStatus::Approved => "Approved",
+            GuardianAssessmentStatus::Denied => "Denied",
+            GuardianAssessmentStatus::Aborted => "Aborted",
+        }
+    )];
+
+    if let Some(summary) = event.action.as_ref().and_then(guardian_action_summary) {
+        lines.push(format!("Action: {summary}"));
+    }
+
+    match (event.risk_level, event.risk_score) {
+        (Some(level), Some(score)) => {
+            lines.push(format!(
+                "Risk: {} ({score}/100)",
+                format!("{level:?}").to_lowercase()
+            ));
+        }
+        (Some(level), None) => {
+            lines.push(format!("Risk: {}", format!("{level:?}").to_lowercase()));
+        }
+        (None, Some(score)) => lines.push(format!("Risk score: {score}/100")),
+        (None, None) => {}
+    }
+
+    if let Some(rationale) = event.rationale.as_ref()
+        && !rationale.trim().is_empty()
+    {
+        lines.push(format!("Rationale: {rationale}"));
+    }
+
+    let mut content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+        TextContent::new(lines.join("\n")),
+    )))];
+
+    if let Some(action) = event.action.as_ref()
+        && guardian_action_summary(action).is_none()
+        && let Ok(action_json) = serde_json::to_string_pretty(action)
+    {
+        content.push(ToolCallContent::Content(Content::new(ContentBlock::Text(
+            TextContent::new(format!("Action payload:\n{action_json}")),
+        ))));
+    }
+
+    content
+}
+
+fn guardian_action_summary(action: &serde_json::Value) -> Option<String> {
+    let tool = action.get("tool").and_then(serde_json::Value::as_str)?;
+    match tool {
+        "shell" | "exec_command" => match action.get("command") {
+            Some(serde_json::Value::String(command)) => Some(command.clone()),
+            Some(serde_json::Value::Array(command)) => {
+                let args = command
+                    .iter()
+                    .map(serde_json::Value::as_str)
+                    .collect::<Option<Vec<_>>>()?;
+                shlex::try_join(args.iter().copied())
+                    .ok()
+                    .or_else(|| Some(args.join(" ")))
+            }
+            _ => None,
+        },
+        "apply_patch" => {
+            let files = action
+                .get("files")
+                .and_then(serde_json::Value::as_array)
+                .map(|files| {
+                    files
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let change_count = action
+                .get("change_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(files.len() as u64);
+            Some(if files.len() == 1 {
+                format!("apply_patch touching {}", files[0])
+            } else {
+                format!(
+                    "apply_patch touching {change_count} changes across {} files",
+                    files.len()
+                )
             })
-        }),
-    )
+        }
+        "network_access" => action
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| action.get("host").and_then(serde_json::Value::as_str))
+            .map(|target| format!("network access to {target}")),
+        "mcp_tool_call" => {
+            let tool_name = action
+                .get("tool_name")
+                .and_then(serde_json::Value::as_str)?;
+            let label = action
+                .get("connector_name")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| action.get("server").and_then(serde_json::Value::as_str))
+                .unwrap_or("unknown server");
+            Some(format!("MCP {tool_name} on {label}"))
+        }
+        _ => None,
+    }
 }
 
 /// Extract title and call_id from a WebSearchAction (used for replay)
@@ -4406,6 +4991,8 @@ mod tests {
                             new_agent_nickname: Some("Dewey".into()),
                             new_agent_role: Some("explorer".into()),
                             prompt: "spawn prompt".into(),
+                            model: String::new(),
+                            reasoning_effort: Default::default(),
                             status: AgentStatus::Running,
                         }));
                         send(EventMsg::TurnComplete(TurnCompleteEvent {
@@ -4592,6 +5179,7 @@ mod tests {
                                 msg: EventMsg::AgentMessage(AgentMessageEvent {
                                     message: prompt,
                                     phase: None,
+                                    memory_citation: None,
                                 }),
                             })
                             .unwrap();
@@ -4623,6 +5211,7 @@ mod tests {
                             msg: EventMsg::AgentMessage(AgentMessageEvent {
                                 message: "Compact task completed".to_string(),
                                 phase: None,
+                                memory_citation: None,
                             }),
                         })
                         .unwrap();
@@ -4967,6 +5556,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mcp_tool_approval_elicitation_routes_to_permission_request() -> anyhow::Result<()>
+    {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::with_permission_responses(vec![
+                    RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                        SelectedPermissionOutcome::new(MCP_TOOL_APPROVAL_ALLOW_SESSION_OPTION_ID),
+                    )),
+                ]));
+                let session_client =
+                    SessionClient::with_client(session_id, client.clone(), Arc::default());
+                let thread = Arc::new(StubCodexThread::new());
+                let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+                let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut prompt_state = PromptState::new(
+                    "submission-id".to_string(),
+                    thread.clone(),
+                    message_tx,
+                    response_tx,
+                );
+
+                let request_id = format!("{MCP_TOOL_APPROVAL_REQUEST_ID_PREFIX}call-123");
+                prompt_state
+                    .mcp_elicitation(
+                        &session_client,
+                        ElicitationRequestEvent {
+                            turn_id: Some("turn-id".to_string()),
+                            server_name: "test-server".to_string(),
+                            id: codex_protocol::mcp::RequestId::String(request_id.clone()),
+                            request: ElicitationRequest::Form {
+                                meta: Some(serde_json::json!({
+                                    "codex_approval_kind": "mcp_tool_call",
+                                    "persist": ["session", "always"],
+                                    "connector_name": "Docs",
+                                    "tool_title": "search_docs",
+                                    "tool_description": "Search project documentation",
+                                    "tool_params_display": [
+                                        {
+                                            "display_name": "Query",
+                                            "name": "query",
+                                            "value": "approval flow"
+                                        }
+                                    ]
+                                })),
+                                message: "Allow Docs to run tool \"search_docs\"?".to_string(),
+                                requested_schema: serde_json::json!({
+                                    "type": "object",
+                                    "properties": {}
+                                }),
+                            },
+                        },
+                    )
+                    .await?;
+
+                let ThreadMessage::PermissionRequestResolved {
+                    submission_id,
+                    request_key,
+                    response,
+                } = message_rx.recv().await.unwrap()
+                else {
+                    panic!("expected permission resolution message");
+                };
+                assert_eq!(submission_id, "submission-id");
+
+                {
+                    let requests = client.permission_requests.lock().unwrap();
+                    let request = requests.last().unwrap();
+                    assert_eq!(request.tool_call.tool_call_id.0.as_ref(), "call-123");
+                    assert_eq!(
+                        request
+                            .options
+                            .iter()
+                            .map(|option| option.option_id.0.to_string())
+                            .collect::<Vec<_>>(),
+                        vec![
+                            MCP_TOOL_APPROVAL_ALLOW_OPTION_ID.to_string(),
+                            MCP_TOOL_APPROVAL_ALLOW_SESSION_OPTION_ID.to_string(),
+                            MCP_TOOL_APPROVAL_ALLOW_ALWAYS_OPTION_ID.to_string(),
+                            MCP_TOOL_APPROVAL_CANCEL_OPTION_ID.to_string(),
+                        ]
+                    );
+                }
+
+                prompt_state
+                    .handle_permission_request_resolved(&session_client, request_key, response)
+                    .await?;
+
+                let op = thread.ops.lock().unwrap().last().cloned().unwrap();
+                match op {
+                    Op::ResolveElicitation {
+                        server_name,
+                        request_id: codex_protocol::mcp::RequestId::String(id),
+                        decision,
+                        content,
+                        meta,
+                    } => {
+                        assert_eq!(server_name, "test-server");
+                        assert_eq!(id, request_id);
+                        assert_eq!(decision, ElicitationAction::Accept);
+                        assert!(content.is_none());
+                        assert_eq!(
+                            meta.as_ref()
+                                .and_then(|value| value.get("persist"))
+                                .and_then(serde_json::Value::as_str),
+                            Some(MCP_TOOL_APPROVAL_PERSIST_SESSION)
+                        );
+                    }
+                    other => panic!("unexpected op: {other:?}"),
+                }
+
+                anyhow::Ok(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_mcp_elicitation_declines_unsupported_form_requests() -> anyhow::Result<()> {
         LocalSet::new()
             .run_until(async {
@@ -5083,6 +5791,7 @@ mod tests {
                         EventMsg::AgentMessage(AgentMessageEvent {
                             message: "still flowing".to_string(),
                             phase: None,
+                            memory_citation: None,
                         }),
                     )
                     .await;
