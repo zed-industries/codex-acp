@@ -1,9 +1,6 @@
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet},
-    ops::DerefMut,
     path::{Path, PathBuf},
-    rc::Rc,
     sync::{Arc, LazyLock, Mutex},
 };
 
@@ -23,18 +20,18 @@ use agent_client_protocol::{
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
-    AuthManager, CodexThread,
+    CodexThread,
     config::{Config, set_project_trust_level},
-    error::CodexErr,
-    models_manager::manager::{ModelsManager, RefreshStrategy},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
+use codex_login::AuthManager;
+use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_protocol::{
     approvals::{ElicitationRequest, ElicitationRequestEvent},
     config_types::TrustLevel,
-    custom_prompts::CustomPrompt,
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
+    error::CodexErr,
     mcp::CallToolResult,
     models::{PermissionProfile, ResponseItem, WebSearchAction},
     openai_models::{ModelPreset, ReasoningEffort},
@@ -46,10 +43,11 @@ use codex_protocol::{
         ApplyPatchApprovalRequestEvent, DynamicToolCallResponseEvent, ElicitationAction,
         ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
-        FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ItemCompletedEvent,
-        ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent,
-        McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent,
-        NetworkApprovalContext, NetworkPolicyRuleAction, Op, PatchApplyBeginEvent,
+        FileChange, GuardianAssessmentAction, GuardianAssessmentEvent,
+        GuardianAssessmentStatus, ItemCompletedEvent, ItemStartedEvent, McpInvocation,
+        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent,
+        McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext,
+        NetworkPolicyRuleAction, Op, PatchApplyBeginEvent,
         PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
         ReviewTarget, RolloutItem, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent,
@@ -71,10 +69,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::{
-    ACP_CLIENT,
-    prompt_args::{expand_custom_prompt, parse_slash_name},
-};
+use crate::{ACP_CLIENT, prompt_args::parse_slash_name};
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
@@ -637,8 +632,6 @@ fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
 
 #[expect(clippy::large_enum_variant)]
 enum SubmissionState {
-    /// Loading custom prompts from the project
-    CustomPrompts(CustomPromptsState),
     /// User prompts, including slash commands like /init, /review, /compact, /undo.
     Prompt(PromptState),
 }
@@ -646,14 +639,12 @@ enum SubmissionState {
 impl SubmissionState {
     fn is_active(&self) -> bool {
         match self {
-            Self::CustomPrompts(state) => state.is_active(),
             Self::Prompt(state) => state.is_active(),
         }
     }
 
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         match self {
-            Self::CustomPrompts(state) => state.handle_event(event),
             Self::Prompt(state) => state.handle_event(client, event).await,
         }
     }
@@ -665,7 +656,6 @@ impl SubmissionState {
         response: Result<RequestPermissionResponse, Error>,
     ) -> Result<(), Error> {
         match self {
-            Self::CustomPrompts(..) => Ok(()),
             Self::Prompt(state) => {
                 state
                     .handle_permission_request_resolved(client, request_key, response)
@@ -675,50 +665,14 @@ impl SubmissionState {
     }
 
     fn abort_pending_interactions(&mut self) {
-        if let Self::Prompt(state) = self {
-            state.abort_pending_interactions();
-        }
+        let Self::Prompt(state) = self;
+        state.abort_pending_interactions();
     }
 
     fn fail(&mut self, err: Error) {
-        if let Self::Prompt(state) = self
-            && let Some(response_tx) = state.response_tx.take()
-        {
+        let Self::Prompt(state) = self;
+        if let Some(response_tx) = state.response_tx.take() {
             drop(response_tx.send(Err(err)));
-        }
-    }
-}
-
-struct CustomPromptsState {
-    response_tx: Option<oneshot::Sender<Result<Vec<CustomPrompt>, Error>>>,
-}
-
-impl CustomPromptsState {
-    fn new(response_tx: oneshot::Sender<Result<Vec<CustomPrompt>, Error>>) -> Self {
-        Self {
-            response_tx: Some(response_tx),
-        }
-    }
-
-    fn is_active(&self) -> bool {
-        let Some(response_tx) = &self.response_tx else {
-            return false;
-        };
-        !response_tx.is_closed()
-    }
-
-    fn handle_event(&mut self, event: EventMsg) {
-        match event {
-            EventMsg::ListCustomPromptsResponse(ListCustomPromptsResponseEvent {
-                custom_prompts,
-            }) => {
-                if let Some(tx) = self.response_tx.take() {
-                    drop(tx.send(Ok(custom_prompts)));
-                }
-            }
-            e => {
-                warn!("Unexpected event: {e:?}");
-            }
         }
     }
 }
@@ -979,6 +933,7 @@ impl PromptState {
                 model_context_window,
                 collaboration_mode_kind,
                 turn_id,
+                ..
             }) => {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
             }
@@ -1189,7 +1144,11 @@ impl PromptState {
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
             }
-            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id }) => {
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                last_agent_message,
+                turn_id,
+                ..
+            }) => {
                 info!(
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
@@ -1239,7 +1198,9 @@ impl PromptState {
                         .ok();
                 }
             }
-            EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id }) => {
+            EventMsg::TurnAborted(TurnAbortedEvent {
+                reason, turn_id, ..
+            }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
                 self.abort_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
@@ -1353,7 +1314,9 @@ impl PromptState {
             | EventMsg::CollabAgentInteractionEnd(..)
             | EventMsg::RealtimeConversationStarted(..)
             | EventMsg::RealtimeConversationRealtime(..)
+            | EventMsg::RealtimeConversationSdp(..)
             | EventMsg::RealtimeConversationClosed(..)
+            | EventMsg::RealtimeConversationListVoicesResponse(..)
             | EventMsg::CollabWaitingBegin(..)
             | EventMsg::CollabWaitingEnd(..)
             | EventMsg::CollabResumeBegin(..)
@@ -1362,8 +1325,6 @@ impl PromptState {
             | EventMsg::CollabCloseEnd(..)
             | EventMsg::PlanDelta(..)=> {}
             e @ (EventMsg::McpListToolsResponse(..)
-            // returned from Op::ListCustomPrompts, ignore
-            | EventMsg::ListCustomPromptsResponse(..)
             | EventMsg::ListSkillsResponse(..)
             // Used for returning a single history entry
             | EventMsg::GetHistoryEntryResponse(..)
@@ -1719,7 +1680,6 @@ impl PromptState {
             additional_permissions,
             available_decisions: _,
             proposed_network_policy_amendments,
-            skill_metadata: _,
         } = event;
 
         // Create a new tool call for the command execution
@@ -2199,6 +2159,7 @@ impl PromptState {
             }
             GuardianAssessmentStatus::Approved
             | GuardianAssessmentStatus::Denied
+            | GuardianAssessmentStatus::TimedOut
             | GuardianAssessmentStatus::Aborted => {
                 if self.active_guardian_assessments.remove(&event.id) {
                     client
@@ -2322,6 +2283,15 @@ fn build_exec_permission_options(
                 option_id: "denied",
                 permission_option: PermissionOption::new(
                     "denied",
+                    "No, continue without running it",
+                    PermissionOptionKind::RejectOnce,
+                ),
+                decision: ReviewDecision::Denied,
+            },
+            ReviewDecision::TimedOut => ExecPermissionOption {
+                option_id: "timed-out",
+                permission_option: PermissionOption::new(
+                    "timed-out",
                     "No, continue without running it",
                     PermissionOptionKind::RejectOnce,
                 ),
@@ -2566,8 +2536,6 @@ struct ThreadActor<A> {
     thread: Arc<dyn CodexThreadImpl>,
     /// The configuration for the thread.
     config: Config,
-    /// The custom prompts loaded for this workspace.
-    custom_prompts: Rc<RefCell<Vec<CustomPrompt>>>,
     /// The models available for this thread.
     models_manager: Arc<dyn ModelsManagerImpl>,
     /// Internal message sender used to route spawned interaction results back to the actor.
@@ -2599,7 +2567,6 @@ impl<A: Auth> ThreadActor<A> {
             client,
             thread,
             config,
-            custom_prompts: Rc::default(),
             models_manager,
             resolution_tx,
             submissions: HashMap::new(),
@@ -2644,47 +2611,11 @@ impl<A: Auth> ThreadActor<A> {
             ThreadMessage::Load { response_tx } => {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
-                let client = self.client.clone();
-                let mut available_commands = Self::builtin_commands();
-                let load_custom_prompts = self.load_custom_prompts().await;
-                let custom_prompts = self.custom_prompts.clone();
-
-                // Have this happen after the session is loaded by putting it
-                // in a separate task
-                tokio::task::spawn_local(async move {
-                    let mut new_custom_prompts = load_custom_prompts
-                        .await
-                        .map_err(|_| Error::internal_error())
-                        .flatten()
-                        .inspect_err(|e| error!("Failed to load custom prompts {e:?}"))
-                        .unwrap_or_default();
-
-                    for prompt in &new_custom_prompts {
-                        available_commands.push(
-                            AvailableCommand::new(
-                                prompt.name.clone(),
-                                prompt.description.clone().unwrap_or_default(),
-                            )
-                            .input(prompt.argument_hint.as_ref().map(
-                                |hint| {
-                                    AvailableCommandInput::Unstructured(
-                                        UnstructuredCommandInput::new(hint.clone()),
-                                    )
-                                },
-                            )),
-                        );
-                    }
-                    std::mem::swap(
-                        custom_prompts.borrow_mut().deref_mut(),
-                        &mut new_custom_prompts,
-                    );
-
-                    client
-                        .send_notification(SessionUpdate::AvailableCommandsUpdate(
-                            AvailableCommandsUpdate::new(available_commands),
-                        ))
-                        .await;
-                });
+                self.client
+                    .send_notification(SessionUpdate::AvailableCommandsUpdate(
+                        AvailableCommandsUpdate::new(Self::builtin_commands()),
+                    ))
+                    .await;
             }
             ThreadMessage::GetConfigOptions { response_tx } => {
                 let result = self.config_options().await;
@@ -2785,24 +2716,6 @@ impl<A: Auth> ThreadActor<A> {
             AvailableCommand::new("undo", "undo Codex’s most recent turn"),
             AvailableCommand::new("logout", "logout of Codex"),
         ]
-    }
-
-    async fn load_custom_prompts(&mut self) -> oneshot::Receiver<Result<Vec<CustomPrompt>, Error>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        let submission_id = match self.thread.submit(Op::ListCustomPrompts).await {
-            Ok(id) => id,
-            Err(e) => {
-                drop(response_tx.send(Err(Error::internal_error().data(e.to_string()))));
-                return response_rx;
-            }
-        };
-
-        self.submissions.insert(
-            submission_id,
-            SubmissionState::CustomPrompts(CustomPromptsState::new(response_tx)),
-        );
-
-        response_rx
     }
 
     fn modes(&self) -> Option<SessionModeState> {
@@ -3163,6 +3076,7 @@ impl<A: Auth> ThreadActor<A> {
                             text_elements: vec![],
                         }],
                         final_output_json_schema: None,
+                        responsesapi_client_metadata: None,
                     }
                 }
                 "review" => {
@@ -3210,22 +3124,10 @@ impl<A: Auth> ThreadActor<A> {
                     return Err(Error::auth_required());
                 }
                 _ => {
-                    if let Some(prompt) =
-                        expand_custom_prompt(name, rest, self.custom_prompts.borrow().as_ref())
-                            .map_err(|e| Error::invalid_params().data(e.user_message()))?
-                    {
-                        op = Op::UserInput {
-                            items: vec![UserInput::Text {
-                                text: prompt,
-                                text_elements: vec![],
-                            }],
-                            final_output_json_schema: None,
-                        }
-                    } else {
-                        op = Op::UserInput {
-                            items,
-                            final_output_json_schema: None,
-                        }
+                    op = Op::UserInput {
+                        items,
+                        final_output_json_schema: None,
+                        responsesapi_client_metadata: None,
                     }
                 }
             }
@@ -3233,6 +3135,7 @@ impl<A: Auth> ThreadActor<A> {
             op = Op::UserInput {
                 items,
                 final_output_json_schema: None,
+                responsesapi_client_metadata: None,
             }
         }
 
@@ -3873,7 +3776,9 @@ fn guardian_assessment_tool_call_status(status: &GuardianAssessmentStatus) -> To
     match status {
         GuardianAssessmentStatus::InProgress => ToolCallStatus::InProgress,
         GuardianAssessmentStatus::Approved => ToolCallStatus::Completed,
-        GuardianAssessmentStatus::Denied | GuardianAssessmentStatus::Aborted => {
+        GuardianAssessmentStatus::Denied
+        | GuardianAssessmentStatus::TimedOut
+        | GuardianAssessmentStatus::Aborted => {
             ToolCallStatus::Failed
         }
     }
@@ -3886,26 +3791,17 @@ fn guardian_assessment_content(event: &GuardianAssessmentEvent) -> Vec<ToolCallC
             GuardianAssessmentStatus::InProgress => "In progress",
             GuardianAssessmentStatus::Approved => "Approved",
             GuardianAssessmentStatus::Denied => "Denied",
+            GuardianAssessmentStatus::TimedOut => "Timed out",
             GuardianAssessmentStatus::Aborted => "Aborted",
         }
     )];
 
-    if let Some(summary) = event.action.as_ref().and_then(guardian_action_summary) {
+    if let Some(summary) = guardian_action_summary(&event.action) {
         lines.push(format!("Action: {summary}"));
     }
 
-    match (event.risk_level, event.risk_score) {
-        (Some(level), Some(score)) => {
-            lines.push(format!(
-                "Risk: {} ({score}/100)",
-                format!("{level:?}").to_lowercase()
-            ));
-        }
-        (Some(level), None) => {
-            lines.push(format!("Risk: {}", format!("{level:?}").to_lowercase()));
-        }
-        (None, Some(score)) => lines.push(format!("Risk score: {score}/100")),
-        (None, None) => {}
+    if let Some(level) = event.risk_level {
+        lines.push(format!("Risk: {}", format!("{level:?}").to_lowercase()));
     }
 
     if let Some(rationale) = event.rationale.as_ref()
@@ -3918,9 +3814,8 @@ fn guardian_assessment_content(event: &GuardianAssessmentEvent) -> Vec<ToolCallC
         TextContent::new(lines.join("\n")),
     )))];
 
-    if let Some(action) = event.action.as_ref()
-        && guardian_action_summary(action).is_none()
-        && let Ok(action_json) = serde_json::to_string_pretty(action)
+    if guardian_action_summary(&event.action).is_none()
+        && let Ok(action_json) = serde_json::to_string_pretty(&event.action)
     {
         content.push(ToolCallContent::Content(Content::new(ContentBlock::Text(
             TextContent::new(format!("Action payload:\n{action_json}")),
@@ -3930,63 +3825,34 @@ fn guardian_assessment_content(event: &GuardianAssessmentEvent) -> Vec<ToolCallC
     content
 }
 
-fn guardian_action_summary(action: &serde_json::Value) -> Option<String> {
-    let tool = action.get("tool").and_then(serde_json::Value::as_str)?;
-    match tool {
-        "shell" | "exec_command" => match action.get("command") {
-            Some(serde_json::Value::String(command)) => Some(command.clone()),
-            Some(serde_json::Value::Array(command)) => {
-                let args = command
-                    .iter()
-                    .map(serde_json::Value::as_str)
-                    .collect::<Option<Vec<_>>>()?;
-                shlex::try_join(args.iter().copied())
-                    .ok()
-                    .or_else(|| Some(args.join(" ")))
-            }
-            _ => None,
-        },
-        "apply_patch" => {
-            let files = action
-                .get("files")
-                .and_then(serde_json::Value::as_array)
-                .map(|files| {
-                    files
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let change_count = action
-                .get("change_count")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(files.len() as u64);
-            Some(if files.len() == 1 {
-                format!("apply_patch touching {}", files[0])
-            } else {
-                format!(
-                    "apply_patch touching {change_count} changes across {} files",
-                    files.len()
-                )
-            })
+fn guardian_action_summary(action: &GuardianAssessmentAction) -> Option<String> {
+    match action {
+        GuardianAssessmentAction::Command { command, .. } => Some(command.clone()),
+        GuardianAssessmentAction::Execve { program, argv, .. } => {
+            let args = std::iter::once(program.as_str())
+                .chain(argv.iter().map(String::as_str))
+                .collect::<Vec<_>>();
+            shlex::try_join(args.iter().copied())
+                .ok()
+                .or_else(|| Some(args.join(" ")))
         }
-        "network_access" => action
-            .get("target")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| action.get("host").and_then(serde_json::Value::as_str))
-            .map(|target| format!("network access to {target}")),
-        "mcp_tool_call" => {
-            let tool_name = action
-                .get("tool_name")
-                .and_then(serde_json::Value::as_str)?;
-            let label = action
-                .get("connector_name")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| action.get("server").and_then(serde_json::Value::as_str))
-                .unwrap_or("unknown server");
+        GuardianAssessmentAction::ApplyPatch { files, .. } => Some(if files.len() == 1 {
+            format!("apply_patch touching {}", files[0].display())
+        } else {
+            format!("apply_patch touching {} files", files.len())
+        }),
+        GuardianAssessmentAction::NetworkAccess { target, host, .. } => {
+            Some(format!("network access to {target} ({host})"))
+        }
+        GuardianAssessmentAction::McpToolCall {
+            server,
+            tool_name,
+            connector_name,
+            ..
+        } => {
+            let label = connector_name.as_deref().unwrap_or(server);
             Some(format!("MCP {tool_name} on {label}"))
         }
-        _ => None,
     }
 }
 
@@ -4063,7 +3929,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prompt() -> anyhow::Result<()> {
-        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, _, message_tx, local_set) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4099,7 +3965,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_compact() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, local_set) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4137,7 +4003,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_undo() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, local_set) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4187,7 +4053,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_init() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, local_set) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4228,6 +4094,7 @@ mod tests {
                     text_elements: vec![]
                 }],
                 final_output_json_schema: None,
+                responsesapi_client_metadata: None,
             }],
             "ops don't match {ops:?}"
         );
@@ -4237,7 +4104,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_review() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, local_set) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4288,7 +4155,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_custom_review() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, local_set) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
         let instructions = "Review what we did in agents.md";
 
@@ -4347,7 +4214,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_review() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, local_set) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4404,7 +4271,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_branch_review() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, local_set) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4458,67 +4325,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_custom_prompts() -> anyhow::Result<()> {
-        let custom_prompts = vec![CustomPrompt {
-            name: "custom".to_string(),
-            path: "/tmp/custom.md".into(),
-            content: "Custom prompt with $1 arg.".into(),
-            description: None,
-            argument_hint: None,
-        }];
-        let (session_id, client, thread, message_tx, local_set) = setup(custom_prompts).await?;
-        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
-
-        message_tx.send(ThreadMessage::Prompt {
-            request: PromptRequest::new(session_id.clone(), vec!["/custom foo".into()]),
-            response_tx: prompt_response_tx,
-        })?;
-
-        tokio::try_join!(
-            async {
-                let stop_reason = prompt_response_rx.await??.await??;
-                assert_eq!(stop_reason, StopReason::EndTurn);
-                drop(message_tx);
-                anyhow::Ok(())
-            },
-            async {
-                local_set.await;
-                anyhow::Ok(())
-            }
-        )?;
-
-        let notifications = client.notifications.lock().unwrap();
-        assert_eq!(notifications.len(), 1);
-        assert!(
-            matches!(
-                &notifications[0].update,
-                SessionUpdate::AgentMessageChunk(ContentChunk {
-                    content: ContentBlock::Text(TextContent { text, .. }),
-                    ..
-                }) if text == "Custom prompt with foo arg."
-            ),
-            "notifications don't match {notifications:?}"
-        );
-
-        let ops = thread.ops.lock().unwrap();
-        assert_eq!(
-            ops.as_slice(),
-            &[Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: "Custom prompt with foo arg.".into(),
-                    text_elements: vec![]
-                }],
-                final_output_json_schema: None,
-            }],
-            "ops don't match {ops:?}"
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_delta_deduplication() -> anyhow::Result<()> {
-        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, _, message_tx, local_set) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4557,9 +4365,7 @@ mod tests {
         Ok(())
     }
 
-    async fn setup(
-        custom_prompts: Vec<CustomPrompt>,
-    ) -> anyhow::Result<(
+    async fn setup() -> anyhow::Result<(
         SessionId,
         Arc<StubClient>,
         Arc<StubCodexThread>,
@@ -4580,7 +4386,7 @@ mod tests {
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let mut actor = ThreadActor::new(
+        let actor = ThreadActor::new(
             StubAuth,
             session_client,
             conversation.clone(),
@@ -4590,7 +4396,6 @@ mod tests {
             resolution_tx,
             resolution_rx,
         );
-        actor.custom_prompts = Rc::new(RefCell::new(custom_prompts));
 
         let local_set = LocalSet::new();
         local_set.spawn_local(actor.spawn());
@@ -4662,7 +4467,11 @@ mod tests {
                     if prompt == "parallel-exec" {
                         // Emit interleaved exec events: Begin A, Begin B, End A, End B
                         let turn_id = id.to_string();
-                        let cwd = std::env::current_dir().unwrap();
+                        let cwd: codex_utils_absolute_path::AbsolutePathBuf =
+                            std::env::current_dir()
+                            .unwrap()
+                            .try_into()
+                            .expect("current dir should be absolute");
                         let send = |msg| {
                             self.op_tx
                                 .send(Event {
@@ -4732,6 +4541,8 @@ mod tests {
                         send(EventMsg::TurnComplete(TurnCompleteEvent {
                             last_agent_message: None,
                             turn_id,
+                            completed_at: None,
+                            duration_ms: None,
                         }));
                     } else if prompt == "approval-block" {
                         self.op_tx
@@ -4742,13 +4553,15 @@ mod tests {
                                     approval_id: Some("approval-id".to_string()),
                                     turn_id: id.to_string(),
                                     command: vec!["echo".to_string(), "hi".to_string()],
-                                    cwd: std::env::current_dir().unwrap(),
+                                    cwd: std::env::current_dir()
+                                        .unwrap()
+                                        .try_into()
+                                        .expect("current dir should be absolute"),
                                     reason: None,
                                     network_approval_context: None,
                                     proposed_execpolicy_amendment: None,
                                     proposed_network_policy_amendments: None,
                                     additional_permissions: None,
-                                    skill_metadata: None,
                                     available_decisions: Some(vec![
                                         ReviewDecision::Approved,
                                         ReviewDecision::Abort,
@@ -4790,6 +4603,8 @@ mod tests {
                                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                     last_agent_message: None,
                                     turn_id: id.to_string(),
+                                    completed_at: None,
+                                    duration_ms: None,
                                 }),
                             })
                             .unwrap();
@@ -4800,6 +4615,7 @@ mod tests {
                         .send(Event {
                             id: id.to_string(),
                             msg: EventMsg::TurnStarted(TurnStartedEvent {
+                                started_at: None,
                                 model_context_window: None,
                                 collaboration_mode_kind: ModeKind::default(),
                                 turn_id: id.to_string(),
@@ -4822,6 +4638,8 @@ mod tests {
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                                 turn_id: id.to_string(),
+                                completed_at: None,
+                                duration_ms: None,
                             }),
                         })
                         .unwrap();
@@ -4854,6 +4672,8 @@ mod tests {
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                                 turn_id: id.to_string(),
+                                completed_at: None,
+                                duration_ms: None,
                             }),
                         })
                         .unwrap();
@@ -4887,6 +4707,8 @@ mod tests {
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                                 turn_id: id.to_string(),
+                                completed_at: None,
+                                duration_ms: None,
                             }),
                         })
                         .unwrap();
@@ -4904,6 +4726,8 @@ mod tests {
                                 msg: EventMsg::TurnAborted(TurnAbortedEvent {
                                     turn_id: Some(active_prompt_id),
                                     reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                                    completed_at: None,
+                                    duration_ms: None,
                                 }),
                             })
                             .unwrap();
@@ -4991,7 +4815,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parallel_exec_commands() -> anyhow::Result<()> {
-        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, _, message_tx, local_set) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -5099,13 +4923,14 @@ mod tests {
                             approval_id: Some("approval-id".to_string()),
                             turn_id: "turn-id".to_string(),
                             command: vec!["echo".to_string(), "hi".to_string()],
-                            cwd: std::env::current_dir()?,
+                            cwd: std::env::current_dir()?
+                                .try_into()
+                                .expect("current dir should be absolute"),
                             reason: None,
                             network_approval_context: None,
                             proposed_execpolicy_amendment: None,
                             proposed_network_policy_amendments: None,
                             additional_permissions: None,
-                            skill_metadata: None,
                             available_decisions: Some(vec![
                                 ReviewDecision::Approved,
                                 ReviewDecision::Denied,
@@ -5368,13 +5193,14 @@ mod tests {
                             approval_id: Some("approval-id".to_string()),
                             turn_id: "turn-id".to_string(),
                             command: vec!["echo".to_string(), "hi".to_string()],
-                            cwd: std::env::current_dir()?,
+                            cwd: std::env::current_dir()?
+                                .try_into()
+                                .expect("current dir should be absolute"),
                             reason: None,
                             network_approval_context: None,
                             proposed_execpolicy_amendment: None,
                             proposed_network_policy_amendments: None,
                             additional_permissions: None,
-                            skill_metadata: None,
                             available_decisions: Some(vec![
                                 ReviewDecision::Approved,
                                 ReviewDecision::Abort,
