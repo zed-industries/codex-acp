@@ -250,7 +250,8 @@ impl Agent for CodexAgent {
         Ok(InitializeResponse::new(protocol_version)
             .agent_capabilities(agent_capabilities)
             .agent_info(
-                Implementation::new("acp-extension-codex", env!("CARGO_PKG_VERSION")).title("Codex"),
+                Implementation::new("acp-extension-codex", env!("CARGO_PKG_VERSION"))
+                    .title("Codex"),
             )
             .auth_methods(auth_methods))
     }
