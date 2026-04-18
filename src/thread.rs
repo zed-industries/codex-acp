@@ -33,7 +33,7 @@ use codex_core::{
 };
 use codex_protocol::{
     approvals::{ElicitationRequest, ElicitationRequestEvent},
-    config_types::TrustLevel,
+    config_types::{ServiceTier, TrustLevel},
     custom_prompts::CustomPrompt,
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     mcp::CallToolResult,
@@ -80,6 +80,7 @@ use crate::{
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
+const FAST_MODE_CONFIG_ID: &str = "fast_mode";
 const USAGE_METHOD: &str = "acp_ext:session_usage_update";
 const RATE_LIMITS_METHOD: &str = "acp_ext:session_rate_limits";
 
@@ -3019,6 +3020,15 @@ impl<A: Auth> ThreadActor<A> {
                 .description("Choose which model Codex should use"),
         );
 
+        options.push(
+            SessionConfigOption::boolean(
+                FAST_MODE_CONFIG_ID,
+                "Fast Mode",
+                matches!(self.config.service_tier, Some(ServiceTier::Fast)),
+            )
+            .description("Use the fastest inference tier for future turns"),
+        );
+
         // Reasoning effort selector (only if the current preset exists and has >1 supported effort)
         if let Some(preset) = current_preset
             && preset.supported_reasoning_efforts.len() > 1
@@ -3086,6 +3096,13 @@ impl<A: Auth> ThreadActor<A> {
         config_id: SessionConfigId,
         value: SessionConfigOptionValue,
     ) -> Result<(), Error> {
+        if config_id.0.as_ref() == FAST_MODE_CONFIG_ID {
+            let SessionConfigOptionValue::Boolean { value } = value else {
+                return Err(Error::invalid_params().data("Fast Mode expects a boolean value"));
+            };
+            return self.handle_set_fast_mode(value).await;
+        }
+
         let SessionConfigOptionValue::ValueId { value } = value else {
             return Err(Error::invalid_params().data("Unsupported config option value"));
         };
@@ -3095,6 +3112,31 @@ impl<A: Auth> ThreadActor<A> {
             "reasoning_effort" => self.handle_set_config_reasoning_effort(value).await,
             _ => Err(Error::invalid_params().data("Unsupported config option")),
         }
+    }
+
+    async fn handle_set_fast_mode(&mut self, enabled: bool) -> Result<(), Error> {
+        let service_tier = enabled.then_some(ServiceTier::Fast);
+
+        self.thread
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                model: None,
+                effort: None,
+                summary: None,
+                collaboration_mode: None,
+                personality: None,
+                windows_sandbox_level: None,
+                service_tier: Some(service_tier),
+                approvals_reviewer: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.config.service_tier = service_tier;
+
+        Ok(())
     }
 
     async fn handle_set_config_model(&mut self, value: SessionConfigValueId) -> Result<(), Error> {
@@ -4191,6 +4233,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_config_options_include_fast_mode() -> anyhow::Result<()> {
+        let (_, _, _, message_tx, local_set) = setup(vec![]).await?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::GetConfigOptions { response_tx })?;
+
+        tokio::try_join!(
+            async {
+                let options = response_rx.await??;
+                let fast_mode = options
+                    .iter()
+                    .find(|option| option.id.0.as_ref() == FAST_MODE_CONFIG_ID)
+                    .expect("fast mode config option");
+
+                assert_eq!(fast_mode.name, "Fast Mode");
+                match &fast_mode.kind {
+                    agent_client_protocol::SessionConfigKind::Boolean(value) => {
+                        assert!(!value.current_value);
+                    }
+                    _ => anyhow::bail!("expected boolean fast mode option"),
+                }
+
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fast_mode_config_option_updates_service_tier() -> anyhow::Result<()> {
+        let (_, _, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (enable_tx, enable_rx) = tokio::sync::oneshot::channel();
+        let (disable_tx, disable_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::SetConfigOption {
+            config_id: SessionConfigId::new(FAST_MODE_CONFIG_ID),
+            value: SessionConfigOptionValue::boolean(true),
+            response_tx: enable_tx,
+        })?;
+        message_tx.send(ThreadMessage::SetConfigOption {
+            config_id: SessionConfigId::new(FAST_MODE_CONFIG_ID),
+            value: SessionConfigOptionValue::boolean(false),
+            response_tx: disable_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                enable_rx.await??;
+                disable_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(
+            &ops[0],
+            Op::OverrideTurnContext {
+                service_tier: Some(Some(ServiceTier::Fast)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &ops[1],
+            Op::OverrideTurnContext {
+                service_tier: Some(None),
+                ..
+            }
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_compact() -> anyhow::Result<()> {
         let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -4988,6 +5115,7 @@ mod tests {
                 | Op::ResolveElicitation { .. }
                 | Op::RequestPermissionsResponse { .. }
                 | Op::PatchApproval { .. }
+                | Op::OverrideTurnContext { .. }
                 | Op::Interrupt => {}
                 Op::Shutdown => {
                     if let Some(active_prompt_id) = self.active_prompt_id.lock().unwrap().take() {
