@@ -629,7 +629,6 @@ fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
     }
 }
 
-#[expect(clippy::large_enum_variant)]
 enum SubmissionState {
     /// User prompts, including slash commands like /init, /review, /compact, /undo.
     Prompt(PromptState),
