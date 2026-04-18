@@ -12,15 +12,13 @@ use agent_client_protocol::{
 };
 use codex_config::types::{McpServerConfig, McpServerTransportConfig};
 use codex_core::{
-    NewThread, RolloutRecorder, ThreadManager, ThreadSortKey,
-    config::Config,
-    find_thread_path_by_id_str,
-    parse_cursor,
+    NewThread, RolloutRecorder, ThreadManager, ThreadSortKey, config::Config,
+    find_thread_path_by_id_str, parse_cursor,
 };
 use codex_exec_server::EnvironmentManager;
 use codex_login::{
-    AuthManager, CLIENT_ID, CodexAuth, ServerOptions,
-    CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
+    AuthManager, CLIENT_ID, CODEX_API_KEY_ENV_VAR, CodexAuth, OPENAI_API_KEY_ENV_VAR,
+    ServerOptions,
     auth::{read_codex_api_key_from_env, read_openai_api_key_from_env},
 };
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;

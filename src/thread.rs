@@ -43,11 +43,10 @@ use codex_protocol::{
         ApplyPatchApprovalRequestEvent, DynamicToolCallResponseEvent, ElicitationAction,
         ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
-        FileChange, GuardianAssessmentAction, GuardianAssessmentEvent,
-        GuardianAssessmentStatus, ItemCompletedEvent, ItemStartedEvent, McpInvocation,
-        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent,
-        McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext,
-        NetworkPolicyRuleAction, Op, PatchApplyBeginEvent,
+        FileChange, GuardianAssessmentAction, GuardianAssessmentEvent, GuardianAssessmentStatus,
+        ItemCompletedEvent, ItemStartedEvent, McpInvocation, McpStartupCompleteEvent,
+        McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent,
+        NetworkApprovalContext, NetworkPolicyRuleAction, Op, PatchApplyBeginEvent,
         PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
         ReviewTarget, RolloutItem, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent,
@@ -3778,9 +3777,7 @@ fn guardian_assessment_tool_call_status(status: &GuardianAssessmentStatus) -> To
         GuardianAssessmentStatus::Approved => ToolCallStatus::Completed,
         GuardianAssessmentStatus::Denied
         | GuardianAssessmentStatus::TimedOut
-        | GuardianAssessmentStatus::Aborted => {
-            ToolCallStatus::Failed
-        }
+        | GuardianAssessmentStatus::Aborted => ToolCallStatus::Failed,
     }
 }
 
@@ -4469,9 +4466,9 @@ mod tests {
                         let turn_id = id.to_string();
                         let cwd: codex_utils_absolute_path::AbsolutePathBuf =
                             std::env::current_dir()
-                            .unwrap()
-                            .try_into()
-                            .expect("current dir should be absolute");
+                                .unwrap()
+                                .try_into()
+                                .expect("current dir should be absolute");
                         let send = |msg| {
                             self.op_tx
                                 .send(Event {
