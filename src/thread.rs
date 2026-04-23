@@ -3384,13 +3384,16 @@ impl<A: Auth> ThreadActor<A> {
     /// - `EventMsg` for user/agent messages and reasoning (like the TUI does)
     /// - `ResponseItem` for tool calls only (not persisted as EventMsg)
     async fn handle_replay_history(&mut self, history: Vec<RolloutItem>) -> Result<(), Error> {
+        let mut plan_call_ids = std::collections::HashSet::new();
+
         for item in history {
             match item {
                 RolloutItem::EventMsg(event_msg) => {
                     self.replay_event_msg(&event_msg).await;
                 }
                 RolloutItem::ResponseItem(response_item) => {
-                    self.replay_response_item(&response_item).await;
+                    self.replay_response_item(&response_item, &mut plan_call_ids)
+                        .await;
                 }
                 // Skip SessionMeta, TurnContext, Compacted
                 _ => {}
@@ -3501,12 +3504,13 @@ impl<A: Auth> ThreadActor<A> {
         Some((title, locations, content))
     }
 
-    /// Parse shell function call arguments to extract command info for rich display.
+    /// Parse shell-like function call arguments to extract command info for rich display.
     /// Returns (title, kind, locations) if successful.
     ///
-    /// Handles both:
+    /// Handles:
     /// - `shell` / `container.exec`: `command` is `Vec<String>`
     /// - `shell_command`: `command` is a `String` (shell script)
+    /// - `exec_command`: `cmd` is a `String`
     fn parse_shell_function_call(
         &self,
         name: &str,
@@ -3525,6 +3529,18 @@ impl<A: Auth> ThreadActor<A> {
             // Wrap in bash -lc for parsing
             (
                 vec!["bash".to_string(), "-lc".to_string(), args.command],
+                args.workdir,
+            )
+        } else if name == "exec_command" {
+            #[derive(serde::Deserialize)]
+            struct ExecCommandArgs {
+                cmd: String,
+                #[serde(default)]
+                workdir: Option<String>,
+            }
+            let args: ExecCommandArgs = serde_json::from_str(arguments).ok()?;
+            (
+                vec!["bash".to_string(), "-lc".to_string(), args.cmd],
                 args.workdir,
             )
         } else {
@@ -3557,7 +3573,11 @@ impl<A: Auth> ThreadActor<A> {
 
     /// Convert and send a single ResponseItem as ACP notification(s) during replay.
     /// Only handles tool calls - messages/reasoning are handled via EventMsg.
-    async fn replay_response_item(&self, item: &ResponseItem) {
+    async fn replay_response_item(
+        &self,
+        item: &ResponseItem,
+        plan_call_ids: &mut std::collections::HashSet<String>,
+    ) {
         match item {
             // Skip Message and Reasoning - these are handled via EventMsg
             ResponseItem::Message { .. } | ResponseItem::Reasoning { .. } => {}
@@ -3567,10 +3587,24 @@ impl<A: Auth> ThreadActor<A> {
                 call_id,
                 ..
             } => {
-                // Check if this is a shell command - parse it like we do for LocalShellCall
-                if matches!(name.as_str(), "shell" | "container.exec" | "shell_command")
-                    && let Some((title, kind, locations)) =
-                        self.parse_shell_function_call(name, arguments)
+                if name == "update_plan" {
+                    if let Ok(UpdatePlanArgs {
+                        explanation: _,
+                        plan,
+                    }) = serde_json::from_str::<UpdatePlanArgs>(arguments)
+                    {
+                        self.client.update_plan(plan).await;
+                        plan_call_ids.insert(call_id.clone());
+                        return;
+                    }
+                }
+
+                // Check if this is a shell-like command - parse it like we do for LocalShellCall
+                if matches!(
+                    name.as_str(),
+                    "shell" | "container.exec" | "shell_command" | "exec_command"
+                ) && let Some((title, kind, locations)) =
+                    self.parse_shell_function_call(name, arguments)
                 {
                     self.client
                         .send_tool_call(
@@ -3597,6 +3631,10 @@ impl<A: Auth> ThreadActor<A> {
                     .await;
             }
             ResponseItem::FunctionCallOutput { call_id, output } => {
+                if plan_call_ids.contains(call_id) {
+                    return;
+                }
+
                 self.client
                     .send_tool_call_completed(call_id.clone(), serde_json::to_value(output).ok())
                     .await;
@@ -4054,6 +4092,7 @@ mod tests {
     use agent_client_protocol::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
     use codex_protocol::config_types::ModeKind;
+    use codex_protocol::models::FunctionCallOutputPayload;
     use tokio::{
         sync::{Mutex, Notify, mpsc::UnboundedSender},
         task::LocalSet,
@@ -5067,6 +5106,153 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_exec_command_function_call_is_structured() -> anyhow::Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::new());
+                let session_client =
+                    SessionClient::with_client(session_id, client.clone(), Arc::default());
+                let thread = Arc::new(StubCodexThread::new());
+                let models_manager = Arc::new(StubModelsManager);
+                let config = Config::load_with_cli_overrides_and_harness_overrides(
+                    vec![],
+                    ConfigOverrides::default(),
+                )
+                .await?;
+                let (_message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+
+                let actor = ThreadActor::new(
+                    StubAuth,
+                    session_client,
+                    thread,
+                    models_manager,
+                    config,
+                    message_rx,
+                    resolution_tx,
+                    resolution_rx,
+                );
+
+                let mut plan_call_ids = std::collections::HashSet::new();
+
+                actor
+                    .replay_response_item(
+                        &ResponseItem::FunctionCall {
+                            id: None,
+                            call_id: "call-id".to_string(),
+                            name: "exec_command".to_string(),
+                            arguments: serde_json::json!({
+                                "cmd": "cat README.md",
+                                "workdir": "/tmp/project"
+                            })
+                            .to_string(),
+                        },
+                        &mut plan_call_ids,
+                    )
+                    .await;
+
+                let notifications = client.notifications.lock().unwrap();
+                assert_eq!(notifications.len(), 1, "{notifications:?}");
+                assert!(matches!(
+                    &notifications[0].update,
+                    SessionUpdate::ToolCall(tool_call)
+                        if tool_call.title == "Read README.md"
+                            && tool_call.kind == ToolKind::Read
+                            && tool_call.status == ToolCallStatus::Completed
+                            && tool_call.raw_input.is_some()
+                ));
+
+                anyhow::Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_replay_update_plan_function_call_emits_plan_update() -> anyhow::Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::new());
+                let session_client =
+                    SessionClient::with_client(session_id, client.clone(), Arc::default());
+                let thread = Arc::new(StubCodexThread::new());
+                let models_manager = Arc::new(StubModelsManager);
+                let config = Config::load_with_cli_overrides_and_harness_overrides(
+                    vec![],
+                    ConfigOverrides::default(),
+                )
+                .await?;
+                let (_message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+
+                let actor = ThreadActor::new(
+                    StubAuth,
+                    session_client,
+                    thread,
+                    models_manager,
+                    config,
+                    message_rx,
+                    resolution_tx,
+                    resolution_rx,
+                );
+
+                let mut plan_call_ids = std::collections::HashSet::new();
+
+                actor
+                    .replay_response_item(
+                        &ResponseItem::FunctionCall {
+                            id: None,
+                            call_id: "plan-call-id".to_string(),
+                            name: "update_plan".to_string(),
+                            arguments: serde_json::json!({
+                                "explanation": "testing replay",
+                                "plan": [
+                                    {
+                                        "step": "Read files",
+                                        "status": "in_progress"
+                                    },
+                                    {
+                                        "step": "Write summary",
+                                        "status": "pending"
+                                    }
+                                ]
+                            })
+                            .to_string(),
+                        },
+                        &mut plan_call_ids,
+                    )
+                    .await;
+
+                actor
+                    .replay_response_item(
+                        &ResponseItem::FunctionCallOutput {
+                            call_id: "plan-call-id".to_string(),
+                            output: FunctionCallOutputPayload::from_text("ok".to_string()),
+                        },
+                        &mut plan_call_ids,
+                    )
+                    .await;
+
+                let notifications = client.notifications.lock().unwrap();
+                assert_eq!(notifications.len(), 1, "{notifications:?}");
+                assert!(matches!(
+                    &notifications[0].update,
+                    SessionUpdate::Plan(plan)
+                        if plan.entries.len() == 2
+                            && plan.entries[0].content == "Read files"
+                            && plan.entries[0].status == PlanEntryStatus::InProgress
+                            && plan.entries[1].content == "Write summary"
+                            && plan.entries[1].status == PlanEntryStatus::Pending
+                ));
+                assert!(plan_call_ids.contains("plan-call-id"));
+
+                anyhow::Ok(())
+            })
+            .await
     }
 
     #[tokio::test]
