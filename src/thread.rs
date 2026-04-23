@@ -42,12 +42,14 @@ use codex_protocol::{
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
-        AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent,
-        ApplyPatchApprovalRequestEvent, DynamicToolCallResponseEvent, ElicitationAction,
-        ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
-        ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
-        FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ItemCompletedEvent,
-        ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent,
+        AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent, AgentStatus,
+        ApplyPatchApprovalRequestEvent, CollabAgentInteractionEndEvent,
+        CollabAgentSpawnEndEvent, CollabCloseEndEvent, CollabResumeEndEvent,
+        CollabWaitingEndEvent, DynamicToolCallResponseEvent, ElicitationAction, ErrorEvent,
+        Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent,
+        ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent, FileChange,
+        GuardianAssessmentEvent, GuardianAssessmentStatus, ItemCompletedEvent, ItemStartedEvent,
+        ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent,
         McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent,
         NetworkApprovalContext, NetworkPolicyRuleAction, Op, PatchApplyBeginEvent,
         PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
@@ -1135,6 +1137,85 @@ impl PromptState {
                 );
                 self.end_dynamic_tool_call(client, event).await;
             }
+            EventMsg::CollabAgentSpawnBegin(event) => {
+                info!(
+                    "Collab spawn begin: call_id={}, sender_thread_id={}",
+                    event.call_id, event.sender_thread_id
+                );
+                self.start_collab_tool_call(client, event.call_id.clone(), "spawn_agent", &event)
+                    .await;
+            }
+            EventMsg::CollabAgentSpawnEnd(event) => {
+                info!(
+                    "Collab spawn end: call_id={}, sender_thread_id={}, new_thread_id={:?}, status={:?}",
+                    event.call_id, event.sender_thread_id, event.new_thread_id, event.status
+                );
+                self.end_collab_spawn_tool_call(client, event).await;
+            }
+            EventMsg::CollabAgentInteractionBegin(event) => {
+                info!(
+                    "Collab interaction begin: call_id={}, sender_thread_id={}, receiver_thread_id={}",
+                    event.call_id, event.sender_thread_id, event.receiver_thread_id
+                );
+                self.start_collab_tool_call(client, event.call_id.clone(), "send_input", &event)
+                    .await;
+            }
+            EventMsg::CollabAgentInteractionEnd(event) => {
+                info!(
+                    "Collab interaction end: call_id={}, sender_thread_id={}, receiver_thread_id={}, status={:?}",
+                    event.call_id, event.sender_thread_id, event.receiver_thread_id, event.status
+                );
+                self.end_collab_interaction_tool_call(client, event).await;
+            }
+            EventMsg::CollabWaitingBegin(event) => {
+                info!(
+                    "Collab wait begin: call_id={}, sender_thread_id={}, receivers={}",
+                    event.call_id,
+                    event.sender_thread_id,
+                    event.receiver_thread_ids.len()
+                );
+                self.start_collab_tool_call(client, event.call_id.clone(), "wait", &event)
+                    .await;
+            }
+            EventMsg::CollabWaitingEnd(event) => {
+                info!(
+                    "Collab wait end: call_id={}, sender_thread_id={}, statuses={}",
+                    event.call_id,
+                    event.sender_thread_id,
+                    event.statuses.len()
+                );
+                self.end_collab_wait_tool_call(client, event).await;
+            }
+            EventMsg::CollabCloseBegin(event) => {
+                info!(
+                    "Collab close begin: call_id={}, sender_thread_id={}, receiver_thread_id={}",
+                    event.call_id, event.sender_thread_id, event.receiver_thread_id
+                );
+                self.start_collab_tool_call(client, event.call_id.clone(), "close_agent", &event)
+                    .await;
+            }
+            EventMsg::CollabCloseEnd(event) => {
+                info!(
+                    "Collab close end: call_id={}, sender_thread_id={}, receiver_thread_id={}, status={:?}",
+                    event.call_id, event.sender_thread_id, event.receiver_thread_id, event.status
+                );
+                self.end_collab_close_tool_call(client, event).await;
+            }
+            EventMsg::CollabResumeBegin(event) => {
+                info!(
+                    "Collab resume begin: call_id={}, sender_thread_id={}, receiver_thread_id={}",
+                    event.call_id, event.sender_thread_id, event.receiver_thread_id
+                );
+                self.start_collab_tool_call(client, event.call_id.clone(), "resume_agent", &event)
+                    .await;
+            }
+            EventMsg::CollabResumeEnd(event) => {
+                info!(
+                    "Collab resume end: call_id={}, sender_thread_id={}, receiver_thread_id={}, status={:?}",
+                    event.call_id, event.sender_thread_id, event.receiver_thread_id, event.status
+                );
+                self.end_collab_resume_tool_call(client, event).await;
+            }
             EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
                 call_id,
                 invocation,
@@ -1347,20 +1428,10 @@ impl PromptState {
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..)
             // TODO: Subagent UI?
-            | EventMsg::CollabAgentSpawnBegin(..)
-            | EventMsg::CollabAgentSpawnEnd(..)
-            | EventMsg::CollabAgentInteractionBegin(..)
-            | EventMsg::CollabAgentInteractionEnd(..)
             | EventMsg::RealtimeConversationStarted(..)
             | EventMsg::RealtimeConversationRealtime(..)
             | EventMsg::RealtimeConversationClosed(..)
-            | EventMsg::CollabWaitingBegin(..)
-            | EventMsg::CollabWaitingEnd(..)
-            | EventMsg::CollabResumeBegin(..)
-            | EventMsg::CollabResumeEnd(..)
-            | EventMsg::CollabCloseBegin(..)
-            | EventMsg::CollabCloseEnd(..)
-            | EventMsg::PlanDelta(..)=> {}
+            | EventMsg::PlanDelta(..) => {}
             e @ (EventMsg::McpListToolsResponse(..)
             // returned from Op::ListCustomPrompts, ignore
             | EventMsg::ListCustomPromptsResponse(..)
@@ -1656,6 +1727,119 @@ impl PromptState {
                     ),
             ))
             .await;
+    }
+
+    async fn start_collab_tool_call<T: serde::Serialize>(
+        &self,
+        client: &SessionClient,
+        call_id: String,
+        title: &str,
+        event: &T,
+    ) {
+        client
+            .send_tool_call(
+                ToolCall::new(call_id, title)
+                    .kind(ToolKind::Other)
+                    .status(ToolCallStatus::InProgress)
+                    .raw_input(serde_json::to_value(event).ok()),
+            )
+            .await;
+    }
+
+    async fn end_collab_tool_call<T: serde::Serialize>(
+        &self,
+        client: &SessionClient,
+        call_id: String,
+        title: &str,
+        status: ToolCallStatus,
+        event: &T,
+    ) {
+        client
+            .send_tool_call_update(ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(status)
+                    .title(title)
+                    .raw_output(serde_json::to_value(event).ok()),
+            ))
+            .await;
+    }
+
+    async fn end_collab_spawn_tool_call(
+        &self,
+        client: &SessionClient,
+        event: CollabAgentSpawnEndEvent,
+    ) {
+        let status = if event.new_thread_id.is_some() && !is_collab_status_failure(&event.status) {
+            ToolCallStatus::Completed
+        } else {
+            ToolCallStatus::Failed
+        };
+
+        self.end_collab_tool_call(client, event.call_id.clone(), "spawn_agent", status, &event)
+            .await;
+    }
+
+    async fn end_collab_interaction_tool_call(
+        &self,
+        client: &SessionClient,
+        event: CollabAgentInteractionEndEvent,
+    ) {
+        let status = if is_collab_status_failure(&event.status) {
+            ToolCallStatus::Failed
+        } else {
+            ToolCallStatus::Completed
+        };
+
+        self.end_collab_tool_call(client, event.call_id.clone(), "send_input", status, &event)
+            .await;
+    }
+
+    async fn end_collab_wait_tool_call(
+        &self,
+        client: &SessionClient,
+        event: CollabWaitingEndEvent,
+    ) {
+        self.end_collab_tool_call(
+            client,
+            event.call_id.clone(),
+            "wait",
+            collab_wait_tool_call_status(&event.statuses),
+            &event,
+        )
+        .await;
+    }
+
+    async fn end_collab_close_tool_call(&self, client: &SessionClient, event: CollabCloseEndEvent) {
+        let status = if is_collab_status_failure(&event.status) {
+            ToolCallStatus::Failed
+        } else {
+            ToolCallStatus::Completed
+        };
+
+        self.end_collab_tool_call(client, event.call_id.clone(), "close_agent", status, &event)
+            .await;
+    }
+
+    async fn end_collab_resume_tool_call(
+        &self,
+        client: &SessionClient,
+        event: CollabResumeEndEvent,
+    ) {
+        let status = if is_collab_status_failure(&event.status) {
+            ToolCallStatus::Failed
+        } else {
+            ToolCallStatus::Completed
+        };
+
+        self.end_collab_tool_call(
+            client,
+            event.call_id.clone(),
+            "resume_agent",
+            status,
+            &event,
+        )
+        .await;
     }
 
     async fn end_mcp_tool_call(
@@ -3419,12 +3603,131 @@ impl<A: Auth> ThreadActor<A> {
             EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text }) => {
                 self.client.send_agent_thought(text.clone()).await;
             }
+            EventMsg::CollabAgentSpawnBegin(event) => {
+                self.replay_start_collab_tool_call(event.call_id.clone(), "spawn_agent", event)
+                    .await;
+            }
+            EventMsg::CollabAgentSpawnEnd(event) => {
+                let status = if event.new_thread_id.is_some() && !is_collab_status_failure(&event.status) {
+                    ToolCallStatus::Completed
+                } else {
+                    ToolCallStatus::Failed
+                };
+                self.replay_end_collab_tool_call(
+                    event.call_id.clone(),
+                    "spawn_agent",
+                    status,
+                    event,
+                )
+                .await;
+            }
+            EventMsg::CollabAgentInteractionBegin(event) => {
+                self.replay_start_collab_tool_call(event.call_id.clone(), "send_input", event)
+                    .await;
+            }
+            EventMsg::CollabAgentInteractionEnd(event) => {
+                let status = if is_collab_status_failure(&event.status) {
+                    ToolCallStatus::Failed
+                } else {
+                    ToolCallStatus::Completed
+                };
+                self.replay_end_collab_tool_call(
+                    event.call_id.clone(),
+                    "send_input",
+                    status,
+                    event,
+                )
+                .await;
+            }
+            EventMsg::CollabWaitingBegin(event) => {
+                self.replay_start_collab_tool_call(event.call_id.clone(), "wait", event)
+                    .await;
+            }
+            EventMsg::CollabWaitingEnd(event) => {
+                self.replay_end_collab_tool_call(
+                    event.call_id.clone(),
+                    "wait",
+                    collab_wait_tool_call_status(&event.statuses),
+                    event,
+                )
+                .await;
+            }
+            EventMsg::CollabCloseBegin(event) => {
+                self.replay_start_collab_tool_call(event.call_id.clone(), "close_agent", event)
+                    .await;
+            }
+            EventMsg::CollabCloseEnd(event) => {
+                let status = if is_collab_status_failure(&event.status) {
+                    ToolCallStatus::Failed
+                } else {
+                    ToolCallStatus::Completed
+                };
+                self.replay_end_collab_tool_call(
+                    event.call_id.clone(),
+                    "close_agent",
+                    status,
+                    event,
+                )
+                .await;
+            }
+            EventMsg::CollabResumeBegin(event) => {
+                self.replay_start_collab_tool_call(event.call_id.clone(), "resume_agent", event)
+                    .await;
+            }
+            EventMsg::CollabResumeEnd(event) => {
+                let status = if is_collab_status_failure(&event.status) {
+                    ToolCallStatus::Failed
+                } else {
+                    ToolCallStatus::Completed
+                };
+                self.replay_end_collab_tool_call(
+                    event.call_id.clone(),
+                    "resume_agent",
+                    status,
+                    event,
+                )
+                .await;
+            }
             // Skip other event types during replay - they either:
             // - Are transient (deltas, turn lifecycle)
             // - Don't have direct ACP equivalents
             // - Are handled via ResponseItem instead
             _ => {}
         }
+    }
+
+    async fn replay_start_collab_tool_call<T: serde::Serialize>(
+        &self,
+        call_id: String,
+        title: &str,
+        event: &T,
+    ) {
+        self.client
+            .send_tool_call(
+                ToolCall::new(call_id, title)
+                    .kind(ToolKind::Other)
+                    .status(ToolCallStatus::InProgress)
+                    .raw_input(serde_json::to_value(event).ok()),
+            )
+            .await;
+    }
+
+    async fn replay_end_collab_tool_call<T: serde::Serialize>(
+        &self,
+        call_id: String,
+        title: &str,
+        status: ToolCallStatus,
+        event: &T,
+    ) {
+        self.client
+            .send_tool_call_update(ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(status)
+                    .title(title)
+                    .raw_output(serde_json::to_value(event).ok()),
+            ))
+            .await;
     }
 
     /// Parse apply_patch call input to extract patch content for display.
@@ -4034,6 +4337,20 @@ fn generate_fallback_id(prefix: &str) -> String {
     format!("{}_{}", prefix, Uuid::new_v4())
 }
 
+fn is_collab_status_failure(status: &AgentStatus) -> bool {
+    matches!(status, AgentStatus::Errored(_) | AgentStatus::NotFound)
+}
+
+fn collab_wait_tool_call_status(
+    statuses: &HashMap<codex_protocol::ThreadId, AgentStatus>,
+) -> ToolCallStatus {
+    if statuses.is_empty() || statuses.values().any(is_collab_status_failure) {
+        ToolCallStatus::Failed
+    } else {
+        ToolCallStatus::Completed
+    }
+}
+
 /// Checks if a prompt is slash command
 fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
     let line = content.first().and_then(|block| match block {
@@ -4053,13 +4370,43 @@ mod tests {
 
     use agent_client_protocol::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
-    use codex_protocol::config_types::ModeKind;
+    use codex_protocol::{
+        ThreadId,
+        config_types::ModeKind,
+        protocol::{
+            AgentStatus, CollabAgentInteractionBeginEvent, CollabAgentInteractionEndEvent,
+            CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent, CollabCloseBeginEvent,
+            CollabCloseEndEvent, CollabResumeBeginEvent, CollabResumeEndEvent,
+            CollabWaitingBeginEvent, CollabWaitingEndEvent,
+        },
+    };
     use tokio::{
         sync::{Mutex, Notify, mpsc::UnboundedSender},
         task::LocalSet,
     };
 
     use super::*;
+
+    fn raw_input(notification: &SessionNotification) -> &serde_json::Value {
+        match &notification.update {
+            SessionUpdate::ToolCall(tool_call) => tool_call
+                .raw_input
+                .as_ref()
+                .expect("tool call should include raw_input"),
+            other => panic!("expected ToolCall notification, got {other:?}"),
+        }
+    }
+
+    fn raw_output(notification: &SessionNotification) -> &serde_json::Value {
+        match &notification.update {
+            SessionUpdate::ToolCallUpdate(update) => update
+                .fields
+                .raw_output
+                .as_ref()
+                .expect("tool call update should include raw_output"),
+            other => panic!("expected ToolCallUpdate notification, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn test_prompt() -> anyhow::Result<()> {
@@ -4759,6 +5106,231 @@ mod tests {
                                 }),
                             })
                             .unwrap();
+                    } else if prompt == "collab-spawn" {
+                        let turn_id = id.to_string();
+                        let sender_thread_id = ThreadId::new();
+                        let new_thread_id = ThreadId::new();
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+
+                        send(EventMsg::CollabAgentSpawnBegin(
+                            CollabAgentSpawnBeginEvent {
+                                call_id: "spawn-call".into(),
+                                sender_thread_id,
+                                prompt: "spawn prompt".into(),
+                                model: String::new(),
+                                reasoning_effort: Default::default(),
+                            },
+                        ));
+                        send(EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                            call_id: "spawn-call".into(),
+                            sender_thread_id,
+                            new_thread_id: Some(new_thread_id),
+                            new_agent_nickname: Some("Dewey".into()),
+                            new_agent_role: Some("explorer".into()),
+                            prompt: "spawn prompt".into(),
+                            model: String::new(),
+                            reasoning_effort: Default::default(),
+                            status: AgentStatus::Running,
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id,
+                        }));
+                    } else if prompt == "collab-wait-fail" {
+                        let turn_id = id.to_string();
+                        let sender_thread_id = ThreadId::new();
+                        let receiver_thread_id = ThreadId::new();
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+
+                        send(EventMsg::CollabWaitingBegin(CollabWaitingBeginEvent {
+                            sender_thread_id,
+                            receiver_thread_ids: vec![receiver_thread_id],
+                            receiver_agents: vec![],
+                            call_id: "wait-call".into(),
+                        }));
+                        send(EventMsg::CollabWaitingEnd(CollabWaitingEndEvent {
+                            sender_thread_id,
+                            call_id: "wait-call".into(),
+                            agent_statuses: vec![],
+                            statuses: [(receiver_thread_id, AgentStatus::Errored("boom".into()))]
+                                .into_iter()
+                                .collect(),
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id,
+                        }));
+                    } else if prompt == "collab-wait-timeout" {
+                        let turn_id = id.to_string();
+                        let sender_thread_id = ThreadId::new();
+                        let receiver_thread_id = ThreadId::new();
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+
+                        send(EventMsg::CollabWaitingBegin(CollabWaitingBeginEvent {
+                            sender_thread_id,
+                            receiver_thread_ids: vec![receiver_thread_id],
+                            receiver_agents: vec![],
+                            call_id: "wait-timeout-call".into(),
+                        }));
+                        send(EventMsg::CollabWaitingEnd(CollabWaitingEndEvent {
+                            sender_thread_id,
+                            call_id: "wait-timeout-call".into(),
+                            agent_statuses: vec![],
+                            statuses: HashMap::new(),
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id,
+                        }));
+                    } else if prompt == "collab-send-input" {
+                        let turn_id = id.to_string();
+                        let sender_thread_id = ThreadId::new();
+                        let receiver_thread_id = ThreadId::new();
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+
+                        send(EventMsg::CollabAgentInteractionBegin(
+                            CollabAgentInteractionBeginEvent {
+                                call_id: "send-input-call".into(),
+                                sender_thread_id,
+                                receiver_thread_id,
+                                prompt: "follow-up prompt".into(),
+                            },
+                        ));
+                        send(EventMsg::CollabAgentInteractionEnd(
+                            CollabAgentInteractionEndEvent {
+                                call_id: "send-input-call".into(),
+                                sender_thread_id,
+                                receiver_thread_id,
+                                receiver_agent_nickname: Some("Huey".into()),
+                                receiver_agent_role: Some("worker".into()),
+                                prompt: "follow-up prompt".into(),
+                                status: AgentStatus::Running,
+                            },
+                        ));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id,
+                        }));
+                    } else if prompt == "collab-close" {
+                        let turn_id = id.to_string();
+                        let sender_thread_id = ThreadId::new();
+                        let receiver_thread_id = ThreadId::new();
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+
+                        send(EventMsg::CollabCloseBegin(CollabCloseBeginEvent {
+                            call_id: "close-call".into(),
+                            sender_thread_id,
+                            receiver_thread_id,
+                        }));
+                        send(EventMsg::CollabCloseEnd(CollabCloseEndEvent {
+                            call_id: "close-call".into(),
+                            sender_thread_id,
+                            receiver_thread_id,
+                            receiver_agent_nickname: Some("Louie".into()),
+                            receiver_agent_role: Some("worker".into()),
+                            status: AgentStatus::Running,
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id,
+                        }));
+                    } else if prompt == "collab-close-fail" {
+                        let turn_id = id.to_string();
+                        let sender_thread_id = ThreadId::new();
+                        let receiver_thread_id = ThreadId::new();
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+
+                        send(EventMsg::CollabCloseBegin(CollabCloseBeginEvent {
+                            call_id: "close-fail-call".into(),
+                            sender_thread_id,
+                            receiver_thread_id,
+                        }));
+                        send(EventMsg::CollabCloseEnd(CollabCloseEndEvent {
+                            call_id: "close-fail-call".into(),
+                            sender_thread_id,
+                            receiver_thread_id,
+                            receiver_agent_nickname: Some("Louie".into()),
+                            receiver_agent_role: Some("worker".into()),
+                            status: AgentStatus::NotFound,
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id,
+                        }));
+                    } else if prompt == "collab-resume-fail" {
+                        let turn_id = id.to_string();
+                        let sender_thread_id = ThreadId::new();
+                        let receiver_thread_id = ThreadId::new();
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+
+                        send(EventMsg::CollabResumeBegin(CollabResumeBeginEvent {
+                            call_id: "resume-call".into(),
+                            sender_thread_id,
+                            receiver_thread_id,
+                            receiver_agent_nickname: Some("Dewey".into()),
+                            receiver_agent_role: Some("explorer".into()),
+                        }));
+                        send(EventMsg::CollabResumeEnd(CollabResumeEndEvent {
+                            call_id: "resume-call".into(),
+                            sender_thread_id,
+                            receiver_thread_id,
+                            receiver_agent_nickname: Some("Dewey".into()),
+                            receiver_agent_role: Some("explorer".into()),
+                            status: AgentStatus::NotFound,
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id,
+                        }));
                     } else {
                         self.op_tx
                             .send(Event {
@@ -5487,6 +6059,412 @@ mod tests {
 
         let ops = conversation.ops.lock().unwrap();
         assert!(matches!(ops.last(), Some(Op::Shutdown)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_collab_spawn_emits_live_tool_call_notifications() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["collab-spawn".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 2, "notifications: {notifications:?}");
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::ToolCall(tool_call)
+                if tool_call.tool_call_id == ToolCallId::new("spawn-call")
+                    && tool_call.title == "spawn_agent"
+                    && tool_call.kind == ToolKind::Other
+                    && tool_call.status == ToolCallStatus::InProgress
+                    && tool_call.raw_input.is_some()
+        ));
+        assert!(matches!(
+            &notifications[1].update,
+            SessionUpdate::ToolCallUpdate(update)
+                if update.tool_call_id == ToolCallId::new("spawn-call")
+                    && update.fields.title.as_deref() == Some("spawn_agent")
+                    && update.fields.status == Some(ToolCallStatus::Completed)
+                    && update.fields.raw_output.is_some()
+        ));
+        assert_eq!(raw_input(&notifications[0])["prompt"], "spawn prompt");
+        assert_eq!(raw_input(&notifications[0])["model"], "");
+        assert_eq!(raw_input(&notifications[0])["reasoning_effort"], "medium");
+        assert!(
+            raw_output(&notifications[1])["new_thread_id"].as_str().is_some(),
+            "spawn raw_output should include new_thread_id"
+        );
+        assert_eq!(raw_output(&notifications[1])["prompt"], "spawn prompt");
+        assert_eq!(raw_output(&notifications[1])["model"], "");
+        assert_eq!(raw_output(&notifications[1])["reasoning_effort"], "medium");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_collab_wait_emits_failed_tool_call_update_on_error() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["collab-wait-fail".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 2, "notifications: {notifications:?}");
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::ToolCall(tool_call)
+                if tool_call.tool_call_id == ToolCallId::new("wait-call")
+                    && tool_call.title == "wait"
+                    && tool_call.kind == ToolKind::Other
+                    && tool_call.status == ToolCallStatus::InProgress
+                    && tool_call.raw_input.is_some()
+        ));
+        assert!(matches!(
+            &notifications[1].update,
+            SessionUpdate::ToolCallUpdate(update)
+                if update.tool_call_id == ToolCallId::new("wait-call")
+                    && update.fields.title.as_deref() == Some("wait")
+                    && update.fields.status == Some(ToolCallStatus::Failed)
+                    && update.fields.raw_output.is_some()
+        ));
+        assert_eq!(
+            raw_output(&notifications[1])["statuses"]
+                .as_object()
+                .expect("wait raw_output should include statuses")
+                .len(),
+            1
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_collab_wait_timeout_emits_failed_tool_call_update() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["collab-wait-timeout".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 2, "notifications: {notifications:?}");
+        assert!(matches!(
+            &notifications[1].update,
+            SessionUpdate::ToolCallUpdate(update)
+                if update.tool_call_id == ToolCallId::new("wait-timeout-call")
+                    && update.fields.title.as_deref() == Some("wait")
+                    && update.fields.status == Some(ToolCallStatus::Failed)
+                    && update.fields.raw_output.is_some()
+        ));
+        assert!(
+            raw_output(&notifications[1])["statuses"]
+                .as_object()
+                .expect("wait timeout raw_output should include statuses")
+                .is_empty()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_collab_send_input_emits_live_tool_call_notifications() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["collab-send-input".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 2, "notifications: {notifications:?}");
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::ToolCall(tool_call)
+                if tool_call.tool_call_id == ToolCallId::new("send-input-call")
+                    && tool_call.title == "send_input"
+                    && tool_call.kind == ToolKind::Other
+                    && tool_call.status == ToolCallStatus::InProgress
+                    && tool_call.raw_input.is_some()
+        ));
+        assert!(matches!(
+            &notifications[1].update,
+            SessionUpdate::ToolCallUpdate(update)
+                if update.tool_call_id == ToolCallId::new("send-input-call")
+                    && update.fields.title.as_deref() == Some("send_input")
+                    && update.fields.status == Some(ToolCallStatus::Completed)
+                    && update.fields.raw_output.is_some()
+        ));
+        assert_eq!(raw_input(&notifications[0])["prompt"], "follow-up prompt");
+        assert_eq!(raw_output(&notifications[1])["prompt"], "follow-up prompt");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_collab_close_emits_live_tool_call_notifications() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["collab-close".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 2, "notifications: {notifications:?}");
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::ToolCall(tool_call)
+                if tool_call.tool_call_id == ToolCallId::new("close-call")
+                    && tool_call.title == "close_agent"
+                    && tool_call.kind == ToolKind::Other
+                    && tool_call.status == ToolCallStatus::InProgress
+                    && tool_call.raw_input.is_some()
+        ));
+        assert!(matches!(
+            &notifications[1].update,
+            SessionUpdate::ToolCallUpdate(update)
+                if update.tool_call_id == ToolCallId::new("close-call")
+                    && update.fields.title.as_deref() == Some("close_agent")
+                    && update.fields.status == Some(ToolCallStatus::Completed)
+                    && update.fields.raw_output.is_some()
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_collab_resume_emits_failed_tool_call_update_on_not_found() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["collab-resume-fail".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 2, "notifications: {notifications:?}");
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::ToolCall(tool_call)
+                if tool_call.tool_call_id == ToolCallId::new("resume-call")
+                    && tool_call.title == "resume_agent"
+                    && tool_call.kind == ToolKind::Other
+                    && tool_call.status == ToolCallStatus::InProgress
+                    && tool_call.raw_input.is_some()
+        ));
+        assert!(matches!(
+            &notifications[1].update,
+            SessionUpdate::ToolCallUpdate(update)
+                if update.tool_call_id == ToolCallId::new("resume-call")
+                    && update.fields.title.as_deref() == Some("resume_agent")
+                    && update.fields.status == Some(ToolCallStatus::Failed)
+                    && update.fields.raw_output.is_some()
+        ));
+        assert_eq!(raw_output(&notifications[1])["status"], "not_found");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_collab_close_emits_failed_tool_call_update_on_not_found() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["collab-close-fail".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 2, "notifications: {notifications:?}");
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::ToolCall(tool_call)
+                if tool_call.tool_call_id == ToolCallId::new("close-fail-call")
+                    && tool_call.title == "close_agent"
+                    && tool_call.kind == ToolKind::Other
+                    && tool_call.status == ToolCallStatus::InProgress
+                    && tool_call.raw_input.is_some()
+        ));
+        assert!(matches!(
+            &notifications[1].update,
+            SessionUpdate::ToolCallUpdate(update)
+                if update.tool_call_id == ToolCallId::new("close-fail-call")
+                    && update.fields.title.as_deref() == Some("close_agent")
+                    && update.fields.status == Some(ToolCallStatus::Failed)
+                    && update.fields.raw_output.is_some()
+        ));
+        assert_eq!(raw_output(&notifications[1])["status"], "not_found");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_history_reconstructs_collab_tool_calls() -> anyhow::Result<()> {
+        let (_session_id, client, _thread, message_tx, local_set) = setup(vec![]).await?;
+        let sender_thread_id = ThreadId::new();
+        let receiver_thread_id = ThreadId::new();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::ReplayHistory {
+            history: vec![
+                RolloutItem::EventMsg(EventMsg::CollabAgentInteractionBegin(
+                    CollabAgentInteractionBeginEvent {
+                        call_id: "replay-send".into(),
+                        sender_thread_id,
+                        receiver_thread_id,
+                        prompt: "replay prompt".into(),
+                    },
+                )),
+                RolloutItem::EventMsg(EventMsg::CollabAgentInteractionEnd(
+                    CollabAgentInteractionEndEvent {
+                        call_id: "replay-send".into(),
+                        sender_thread_id,
+                        receiver_thread_id,
+                        receiver_agent_nickname: Some("Huey".into()),
+                        receiver_agent_role: Some("worker".into()),
+                        prompt: "replay prompt".into(),
+                        status: AgentStatus::Interrupted,
+                    },
+                )),
+            ],
+            response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                response_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 2, "notifications: {notifications:?}");
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::ToolCall(tool_call)
+                if tool_call.tool_call_id == ToolCallId::new("replay-send")
+                    && tool_call.title == "send_input"
+                    && tool_call.status == ToolCallStatus::InProgress
+        ));
+        assert!(matches!(
+            &notifications[1].update,
+            SessionUpdate::ToolCallUpdate(update)
+                if update.tool_call_id == ToolCallId::new("replay-send")
+                    && update.fields.title.as_deref() == Some("send_input")
+                    && update.fields.status == Some(ToolCallStatus::Completed)
+        ));
+        assert_eq!(raw_input(&notifications[0])["prompt"], "replay prompt");
+        assert_eq!(raw_output(&notifications[1])["status"], "interrupted");
 
         Ok(())
     }
