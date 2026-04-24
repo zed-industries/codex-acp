@@ -12,22 +12,17 @@ use acp::schema::{
 };
 use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
+use codex_config::{McpServerConfig, McpServerTransportConfig};
 use codex_core::{
-    CodexAuth, NewThread, RolloutRecorder, ThreadManager, ThreadSortKey,
-    auth::AuthManager,
-    config::{
-        Config,
-        types::{McpServerConfig, McpServerTransportConfig},
-    },
-    find_thread_path_by_id_str,
-    models_manager::collaboration_mode_presets::CollaborationModesConfig,
-    parse_cursor,
+    NewThread, RolloutRecorder, SortDirection, ThreadManager, ThreadSortKey, config::Config,
+    find_thread_path_by_id_str, parse_cursor,
 };
-use codex_exec_server::EnvironmentManager;
+use codex_exec_server::{EnvironmentManager, EnvironmentManagerArgs, ExecServerRuntimePaths};
 use codex_login::{
     CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
-    auth::{read_codex_api_key_from_env, read_openai_api_key_from_env},
+    auth::{AuthManager, CodexAuth, read_codex_api_key_from_env, read_openai_api_key_from_env},
 };
+use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_protocol::{
     ThreadId,
     protocol::{InitialHistory, SessionSource},
@@ -66,11 +61,12 @@ const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, codex_linux_sandbox_exe: Option<PathBuf>) -> std::io::Result<Self> {
         let auth_manager = AuthManager::shared(
-            config.codex_home.clone(),
+            config.codex_home.to_path_buf(),
             false,
             config.cli_auth_credentials_store_mode,
+            Some(config.chatgpt_base_url.clone()),
         );
 
         let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
@@ -83,16 +79,19 @@ impl CodexAgent {
                 // False for now
                 default_mode_request_user_input: false,
             },
-            Arc::new(EnvironmentManager::from_env()),
+            Arc::new(EnvironmentManager::new(EnvironmentManagerArgs::from_env(
+                ExecServerRuntimePaths::new(std::env::current_exe()?, codex_linux_sandbox_exe)?,
+            ))),
+            None,
         );
-        Self {
+        Ok(Self {
             auth_manager,
             client_capabilities,
             config,
             thread_manager,
             sessions: Arc::default(),
             session_roots,
-        }
+        })
     }
 
     /// Build and run the ACP agent, serving requests over the given transport.
@@ -347,6 +346,9 @@ impl CodexAgent {
                             scopes: None,
                             oauth_resource: None,
                             tools: Default::default(),
+                            experimental_environment: None,
+                            supports_parallel_tool_calls: false,
+                            default_tools_approval_mode: None,
                         },
                     );
                 }
@@ -383,6 +385,9 @@ impl CodexAgent {
                             scopes: None,
                             oauth_resource: None,
                             tools: Default::default(),
+                            experimental_environment: None,
+                            supports_parallel_tool_calls: false,
+                            default_tools_approval_mode: None,
                         },
                     );
                 }
@@ -462,8 +467,8 @@ impl CodexAgent {
             CodexAuthMethod::ChatGpt => {
                 // Perform browser/device login via codex-rs, then report success/failure to the client.
                 let opts = codex_login::ServerOptions::new(
-                    self.config.codex_home.clone(),
-                    codex_core::auth::CLIENT_ID.to_string(),
+                    self.config.codex_home.to_path_buf(),
+                    codex_login::auth::CLIENT_ID.to_string(),
                     None,
                     self.config.cli_auth_credentials_store_mode,
                 );
@@ -597,7 +602,7 @@ impl CodexAgent {
         let rollout_items = match &history {
             InitialHistory::Resumed(resumed) => resumed.history.clone(),
             InitialHistory::Forked(items) => items.clone(),
-            InitialHistory::New => Vec::new(),
+            InitialHistory::Cleared | InitialHistory::New => Vec::new(),
         };
 
         let config = self.build_session_config(&cwd, mcp_servers)?;
@@ -655,11 +660,13 @@ impl CodexAgent {
             SESSION_LIST_PAGE_SIZE,
             cursor_obj.as_ref(),
             ThreadSortKey::UpdatedAt,
+            SortDirection::Desc,
             &[
                 SessionSource::Cli,
                 SessionSource::VSCode,
                 SessionSource::Unknown,
             ],
+            None,
             None,
             self.config.model_provider_id.as_str(),
             None,
