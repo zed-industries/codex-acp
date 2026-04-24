@@ -1,10 +1,20 @@
 /// Mostly copied from `codex_tui::bottom_pane::prompt_args`: <https://github.com/zed-industries/codex/blob/9baf30493dd9f531af1e4dc49a781654b1b2c966/codex-rs/tui/src/bottom_pane/prompt_args.rs#L1>
-use codex_protocol::custom_prompts::CustomPrompt;
 use regex_lite::Regex;
 use shlex::Shlex;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::LazyLock;
+
+#[derive(Debug, Clone)]
+pub struct CustomPrompt {
+    pub name: String,
+    #[expect(dead_code)]
+    pub path: PathBuf,
+    pub content: String,
+    pub description: Option<String>,
+    pub argument_hint: Option<String>,
+}
 
 static PROMPT_ARG_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\$[A-Z][A-Z0-9_]*").unwrap_or_else(|_| std::process::abort()));
