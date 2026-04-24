@@ -10,7 +10,6 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
-mod prompt_args;
 mod thread;
 
 /// Run the Codex ACP agent.
@@ -41,7 +40,7 @@ pub async fn run_main(
     })?;
 
     let config_overrides = ConfigOverrides {
-        codex_linux_sandbox_exe,
+        codex_linux_sandbox_exe: codex_linux_sandbox_exe.clone(),
         ..ConfigOverrides::default()
     };
 
@@ -54,8 +53,16 @@ pub async fn run_main(
                     format!("error loading config: {e}"),
                 )
             })?;
+    // Apply residency requirement so the HTTP client sends the
+    // x-openai-internal-codex-residency header on all requests.
+    codex_login::default_client::set_default_client_residency_requirement(
+        config.enforce_residency.value(),
+    );
 
-    let agent = Arc::new(codex_agent::CodexAgent::new(config));
+    let agent = Arc::new(codex_agent::CodexAgent::new(
+        config,
+        codex_linux_sandbox_exe,
+    )?);
 
     let stdin = tokio::io::stdin().compat();
     let stdout = tokio::io::stdout().compat_write();

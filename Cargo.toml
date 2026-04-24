@@ -21,17 +21,31 @@ path = "src/lib.rs"
 agent-client-protocol = { version = "=0.11.1", features = ["unstable"] }
 anyhow = "1"
 clap = "4"
-codex-apply-patch = { git = "https://github.com/openai/codex", tag = "rust-v0.117.0" }
-codex-arg0 = { git = "https://github.com/openai/codex", tag = "rust-v0.117.0" }
-codex-core = { git = "https://github.com/openai/codex", tag = "rust-v0.117.0" }
-codex-exec-server = { git = "https://github.com/openai/codex", tag = "rust-v0.117.0" }
-codex-mcp-server = { git = "https://github.com/openai/codex", tag = "rust-v0.117.0" }
-codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.117.0" }
-codex-login = { git = "https://github.com/openai/codex", tag = "rust-v0.117.0" }
-codex-shell-command = { git = "https://github.com/openai/codex", tag = "rust-v0.117.0" }
-codex-utils-approval-presets = { git = "https://github.com/openai/codex", tag = "rust-v0.117.0" }
-codex-utils-cli = { git = "https://github.com/openai/codex", tag = "rust-v0.117.0" }
+codex-apply-patch = { git = "https://github.com/openai/codex", tag = "rust-v0.124.0" }
+codex-arg0 = { git = "https://github.com/openai/codex", tag = "rust-v0.124.0" }
+codex-config = { git = "https://github.com/openai/codex", tag = "rust-v0.124.0" }
+codex-core = { git = "https://github.com/openai/codex", tag = "rust-v0.124.0" }
+codex-exec-server = { git = "https://github.com/openai/codex", tag = "rust-v0.124.0" }
+codex-mcp-server = { git = "https://github.com/openai/codex", tag = "rust-v0.124.0" }
+codex-models-manager = { git = "https://github.com/openai/codex", tag = "rust-v0.124.0" }
+codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.124.0" }
+codex-login = { git = "https://github.com/openai/codex", tag = "rust-v0.124.0" }
+codex-shell-command = { git = "https://github.com/openai/codex", tag = "rust-v0.124.0" }
+codex-utils-approval-presets = { git = "https://github.com/openai/codex", tag = "rust-v0.124.0" }
+codex-utils-cli = { git = "https://github.com/openai/codex", tag = "rust-v0.124.0" }
 diffy = "0.4.2"
+# Pin gix-actor to 0.40.0 because 0.40.1 bumped winnow to 1.0 in what is
+# technically a patch release, which makes it incompatible with gix-object
+# 0.58.0 (reached transitively via gix 0.81.0 -> codex-git-utils). Both crates
+# expose winnow types in their public APIs, so they must agree on the winnow
+# major version. Remove this pin once gix-object publishes a release compatible
+# with winnow 1.0 and the rest of the gix stack has picked it up.
+gix-actor = "=0.40.0"
+# Pin icu_calendar to 2.1.x because 2.2.x broke API compatibility with
+# temporal_rs 0.1.2, which is transitively required by
+# codex-code-mode -> v8 146.4.0 -> temporal_capi 0.1.2 -> temporal_rs ^0.1.2.
+# See https://github.com/boa-dev/temporal/issues/703
+icu_calendar = "~2.1"
 itertools = "0.14.0"
 regex-lite = "0.1"
 serde = { version = "1", features = ["derive"] }

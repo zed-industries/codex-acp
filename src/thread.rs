@@ -1,10 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    ops::DerefMut,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, LazyLock, Mutex},
+    time::Duration,
 };
 
 use agent_client_protocol::{
@@ -26,22 +26,28 @@ use agent_client_protocol::{
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
-    AuthManager, CodexThread,
+    CodexThread,
     config::{Config, set_project_trust_level},
-    error::CodexErr,
-    models_manager::manager::{ModelsManager, RefreshStrategy},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
+use codex_login::auth::AuthManager;
+use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_protocol::{
-    approvals::{ElicitationRequest, ElicitationRequestEvent},
+    approvals::{
+        ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
+        GuardianCommandSource,
+    },
     config_types::TrustLevel,
-    custom_prompts::CustomPrompt,
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
+    error::CodexErr,
     mcp::CallToolResult,
     models::{PermissionProfile, ResponseItem, WebSearchAction},
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
+    permissions::{
+        FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSpecialPath,
+    },
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
@@ -50,14 +56,14 @@ use codex_protocol::{
         ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
         FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ItemCompletedEvent,
-        ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent,
-        McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent,
-        NetworkApprovalContext, NetworkPolicyRuleAction, Op, PatchApplyBeginEvent,
-        PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
-        ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
-        ReviewTarget, RolloutItem, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent,
-        TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
-        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        ItemStartedEvent, McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent,
+        McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext,
+        NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
+        PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
+        ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SandboxPolicy,
+        StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent, TurnAbortedEvent,
+        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
+        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -73,8 +79,6 @@ use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use uuid::Uuid;
-
-use crate::prompt_args::{expand_custom_prompt, parse_slash_name};
 
 /// Abstraction over the ACP connection for sending notifications and requests
 /// back to the client. This replaces the old `Client` trait usage.
@@ -671,10 +675,7 @@ fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
     }
 }
 
-#[expect(clippy::large_enum_variant)]
 enum SubmissionState {
-    /// Loading custom prompts from the project
-    CustomPrompts(CustomPromptsState),
     /// User prompts, including slash commands like /init, /review, /compact, /undo.
     Prompt(PromptState),
 }
@@ -682,14 +683,12 @@ enum SubmissionState {
 impl SubmissionState {
     fn is_active(&self) -> bool {
         match self {
-            Self::CustomPrompts(state) => state.is_active(),
             Self::Prompt(state) => state.is_active(),
         }
     }
 
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         match self {
-            Self::CustomPrompts(state) => state.handle_event(event),
             Self::Prompt(state) => state.handle_event(client, event).await,
         }
     }
@@ -701,7 +700,6 @@ impl SubmissionState {
         response: Result<RequestPermissionResponse, Error>,
     ) -> Result<(), Error> {
         match self {
-            Self::CustomPrompts(..) => Ok(()),
             Self::Prompt(state) => {
                 state
                     .handle_permission_request_resolved(client, request_key, response)
@@ -711,8 +709,10 @@ impl SubmissionState {
     }
 
     fn abort_pending_interactions(&mut self) {
-        if let Self::Prompt(state) = self {
-            state.abort_pending_interactions();
+        match self {
+            Self::Prompt(state) => {
+                state.abort_pending_interactions();
+            }
         }
     }
 
@@ -721,40 +721,6 @@ impl SubmissionState {
             && let Some(response_tx) = state.response_tx.take()
         {
             drop(response_tx.send(Err(err)));
-        }
-    }
-}
-
-struct CustomPromptsState {
-    response_tx: Option<oneshot::Sender<Result<Vec<CustomPrompt>, Error>>>,
-}
-
-impl CustomPromptsState {
-    fn new(response_tx: oneshot::Sender<Result<Vec<CustomPrompt>, Error>>) -> Self {
-        Self {
-            response_tx: Some(response_tx),
-        }
-    }
-
-    fn is_active(&self) -> bool {
-        let Some(response_tx) = &self.response_tx else {
-            return false;
-        };
-        !response_tx.is_closed()
-    }
-
-    fn handle_event(&mut self, event: EventMsg) {
-        match event {
-            EventMsg::ListCustomPromptsResponse(ListCustomPromptsResponseEvent {
-                custom_prompts,
-            }) => {
-                if let Some(tx) = self.response_tx.take() {
-                    drop(tx.send(Ok(custom_prompts)));
-                }
-            }
-            e => {
-                warn!("Unexpected event: {e:?}");
-            }
         }
     }
 }
@@ -923,19 +889,23 @@ impl PromptState {
                         "approved-for-session" => RequestPermissionsResponse {
                             permissions: permissions.into(),
                             scope: PermissionGrantScope::Session,
+                            strict_auto_review: false,
                         },
                         "approved" => RequestPermissionsResponse {
                             permissions: permissions.into(),
                             scope: PermissionGrantScope::Turn,
+                            strict_auto_review: false,
                         },
                         _ => RequestPermissionsResponse {
                             permissions: RequestPermissionProfile::default(),
                             scope: PermissionGrantScope::Turn,
+                            strict_auto_review: true,
                         },
                     },
                     RequestPermissionOutcome::Cancelled | _ => RequestPermissionsResponse {
                         permissions: RequestPermissionProfile::default(),
                         scope: PermissionGrantScope::Turn,
+                        strict_auto_review: true,
                     },
                 };
 
@@ -1015,6 +985,7 @@ impl PromptState {
                 model_context_window,
                 collaboration_mode_kind,
                 turn_id,
+                started_at: _,
             }) => {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
             }
@@ -1155,8 +1126,8 @@ impl PromptState {
                 );
                 self.terminal_interaction(client, event);
             }
-            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, tool, arguments }) => {
-                info!("Dynamic tool call request: call_id={call_id}, turn_id={turn_id}, tool={tool}");
+            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, namespace, tool, arguments }) => {
+                info!("Dynamic tool call request: call_id={call_id}, turn_id={turn_id}, namespace={namespace:?}, tool={tool}");
                 self.start_dynamic_tool_call(client, call_id, tool, arguments);
             }
             EventMsg::DynamicToolCallResponse(event) => {
@@ -1169,6 +1140,7 @@ impl PromptState {
             EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
                 call_id,
                 invocation,
+                mcp_app_resource_uri: _
             }) => {
                 info!(
                     "MCP tool call begin: call_id={call_id}, invocation={} {}",
@@ -1181,6 +1153,7 @@ impl PromptState {
                 invocation,
                 duration,
                 result,
+                mcp_app_resource_uri: _,
             }) => {
                 info!(
                     "MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}",
@@ -1206,6 +1179,14 @@ impl PromptState {
                 );
                 self.start_patch_apply(client, event);
             }
+            EventMsg::PatchApplyUpdated(event) => {
+                info!(
+                    "Patch apply updated: call_id={}, change_count={}",
+                    event.call_id,
+                    event.changes.len()
+                );
+                self.update_patch_apply(client, event);
+            }
             EventMsg::PatchApplyEnd(event) => {
                 info!(
                     "Patch apply end: call_id={}, success={}",
@@ -1220,7 +1201,7 @@ impl PromptState {
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
             }
-            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id }) => {
+            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id, completed_at: _, duration_ms: _, time_to_first_token_ms: _, }) => {
                 info!(
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
@@ -1268,7 +1249,7 @@ impl PromptState {
                         .ok();
                 }
             }
-            EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id }) => {
+            EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _ }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
                 self.abort_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
@@ -1305,7 +1286,8 @@ impl PromptState {
                     drop(response_tx.send(Err(err)));
                 }
             }
-            EventMsg::Warning(WarningEvent { message }) => {
+            EventMsg::Warning(WarningEvent { message })
+            | EventMsg::GuardianWarning(WarningEvent { message }) => {
                 warn!("Warning: {message}");
                 // Forward warnings to the client as agent messages so users see
                 // informational notices (e.g., the post-compact advisory message).
@@ -1333,6 +1315,9 @@ impl PromptState {
             }
             EventMsg::ModelReroute(ModelRerouteEvent { from_model, to_model, reason }) => {
                 info!("Model reroute: from={from_model}, to={to_model}, reason={reason:?}");
+            }
+            EventMsg::ModelVerification(event) => {
+                info!("Model verification requested: {event:?}");
             }
 
             EventMsg::ContextCompacted(..) => {
@@ -1381,6 +1366,7 @@ impl PromptState {
             | EventMsg::RealtimeConversationStarted(..)
             | EventMsg::RealtimeConversationRealtime(..)
             | EventMsg::RealtimeConversationClosed(..)
+            | EventMsg::RealtimeConversationSdp(..)
             | EventMsg::CollabWaitingBegin(..)
             | EventMsg::CollabWaitingEnd(..)
             | EventMsg::CollabResumeBegin(..)
@@ -1389,9 +1375,8 @@ impl PromptState {
             | EventMsg::CollabCloseEnd(..)
             | EventMsg::PlanDelta(..)=> {}
             e @ (EventMsg::McpListToolsResponse(..)
-            // returned from Op::ListCustomPrompts, ignore
-            | EventMsg::ListCustomPromptsResponse(..)
             | EventMsg::ListSkillsResponse(..)
+            | EventMsg::RealtimeConversationListVoicesResponse(..)
             // Used for returning a single history entry
             | EventMsg::GetHistoryEntryResponse(..)
             | EventMsg::DeprecationNotice(..)
@@ -1563,6 +1548,28 @@ impl PromptState {
         );
     }
 
+    fn update_patch_apply(&self, client: &SessionClient, event: PatchApplyUpdatedEvent) {
+        let raw_input = serde_json::json!(&event);
+        let PatchApplyUpdatedEvent { call_id, changes } = event;
+
+        if changes.is_empty() {
+            return;
+        }
+
+        let (title, locations, content) = extract_tool_call_content_from_changes(changes);
+
+        client.send_tool_call_update(ToolCallUpdate::new(
+            call_id,
+            ToolCallUpdateFields::new()
+                .kind(ToolKind::Edit)
+                .status(ToolCallStatus::InProgress)
+                .title(title)
+                .locations(locations)
+                .content(content.collect::<Vec<_>>())
+                .raw_input(raw_input),
+        ));
+    }
+
     fn end_patch_apply(&self, client: &SessionClient, event: PatchApplyEndEvent) {
         let raw_output = serde_json::json!(&event);
         let PatchApplyEndEvent {
@@ -1634,6 +1641,7 @@ impl PromptState {
             turn_id: _,
             tool: _,
             arguments: _,
+            namespace: _,
             content_items,
             success,
             error,
@@ -1730,7 +1738,6 @@ impl PromptState {
             additional_permissions,
             available_decisions: _,
             proposed_network_policy_amendments,
-            skill_metadata: _,
         } = event;
 
         // Create a new tool call for the command execution
@@ -2095,6 +2102,7 @@ impl PromptState {
             turn_id: _,
             reason,
             permissions,
+            cwd: _,
         } = event;
 
         // Create a new tool call for the command execution
@@ -2106,17 +2114,32 @@ impl PromptState {
             content.push(reason.clone());
         }
         if let Some(file_system) = permissions.file_system.as_ref() {
-            if let Some(read) = file_system.read.as_ref() {
-                content.push(format!(
-                    "File System Read Access: {}",
-                    read.iter().map(|p| p.display()).join(", ")
-                ));
+            let reads = format_file_system_entries(
+                file_system
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.access == FileSystemAccessMode::Read),
+            );
+            if !reads.is_empty() {
+                content.push(format!("File System Read Access: {reads}"));
             }
-            if let Some(write) = file_system.write.as_ref() {
-                content.push(format!(
-                    "File System Write Access: {}",
-                    write.iter().map(|p| p.display()).join(", ")
-                ));
+            let writes = format_file_system_entries(
+                file_system
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.access == FileSystemAccessMode::Write),
+            );
+            if !writes.is_empty() {
+                content.push(format!("File System Write Access: {writes}"));
+            }
+            let denies = format_file_system_entries(
+                file_system
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.access == FileSystemAccessMode::None),
+            );
+            if !denies.is_empty() {
+                content.push(format!("File System Denied Access: {denies}"));
             }
         }
         if let Some(network) = permissions.network.as_ref()
@@ -2186,7 +2209,8 @@ impl PromptState {
                     ));
                 }
             }
-            GuardianAssessmentStatus::Approved
+            GuardianAssessmentStatus::TimedOut
+            | GuardianAssessmentStatus::Approved
             | GuardianAssessmentStatus::Denied
             | GuardianAssessmentStatus::Aborted => {
                 if self.active_guardian_assessments.remove(&event.id) {
@@ -2321,6 +2345,15 @@ fn build_exec_permission_options(
                 ),
                 decision: ReviewDecision::Abort,
             },
+            ReviewDecision::TimedOut => ExecPermissionOption {
+                option_id: "timed_out",
+                permission_option: PermissionOption::new(
+                    "timed_out",
+                    "Time out, tell Codex what to do differently",
+                    PermissionOptionKind::RejectOnce,
+                ),
+                decision: ReviewDecision::TimedOut,
+            },
         })
         .collect()
 }
@@ -2370,7 +2403,7 @@ fn parse_command_tool_call(parsed_cmd: Vec<ParsedCommand>, cwd: &Path) -> ParseC
                 kind = ToolKind::Search;
             }
             ParsedCommand::Unknown { cmd } => {
-                titles.push(format!("Run {cmd}"));
+                titles.push(cmd);
                 terminal_output = true;
             }
         }
@@ -2547,8 +2580,6 @@ struct ThreadActor<A> {
     thread: Arc<dyn CodexThreadImpl>,
     /// The configuration for the thread.
     config: Config,
-    /// The custom prompts loaded for this workspace.
-    custom_prompts: Arc<Mutex<Vec<CustomPrompt>>>,
     /// The models available for this thread.
     models_manager: Arc<dyn ModelsManagerImpl>,
     /// Internal message sender used to route spawned interaction results back to the actor.
@@ -2580,7 +2611,6 @@ impl<A: Auth> ThreadActor<A> {
             client,
             thread,
             config,
-            custom_prompts: Arc::default(),
             models_manager,
             resolution_tx,
             submissions: HashMap::new(),
@@ -2626,42 +2656,12 @@ impl<A: Auth> ThreadActor<A> {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
                 let client = self.client.clone();
-                let mut available_commands = Self::builtin_commands();
-                let load_custom_prompts = self.load_custom_prompts().await;
-                let custom_prompts = self.custom_prompts.clone();
-
                 // Have this happen after the session is loaded by putting it
                 // in a separate task
                 tokio::spawn(async move {
-                    let mut new_custom_prompts = load_custom_prompts
-                        .await
-                        .map_err(|_| Error::internal_error())
-                        .flatten()
-                        .inspect_err(|e| error!("Failed to load custom prompts {e:?}"))
-                        .unwrap_or_default();
-
-                    for prompt in &new_custom_prompts {
-                        available_commands.push(
-                            AvailableCommand::new(
-                                prompt.name.clone(),
-                                prompt.description.clone().unwrap_or_default(),
-                            )
-                            .input(prompt.argument_hint.as_ref().map(
-                                |hint| {
-                                    AvailableCommandInput::Unstructured(
-                                        UnstructuredCommandInput::new(hint.clone()),
-                                    )
-                                },
-                            )),
-                        );
-                    }
-                    std::mem::swap(
-                        custom_prompts.lock().unwrap().deref_mut(),
-                        &mut new_custom_prompts,
-                    );
-
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                     client.send_notification(SessionUpdate::AvailableCommandsUpdate(
-                        AvailableCommandsUpdate::new(available_commands),
+                        AvailableCommandsUpdate::new(Self::builtin_commands()),
                     ));
                 });
             }
@@ -2764,24 +2764,6 @@ impl<A: Auth> ThreadActor<A> {
             AvailableCommand::new("undo", "undo Codex’s most recent turn"),
             AvailableCommand::new("logout", "logout of Codex"),
         ]
-    }
-
-    async fn load_custom_prompts(&mut self) -> oneshot::Receiver<Result<Vec<CustomPrompt>, Error>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        let submission_id = match self.thread.submit(Op::ListCustomPrompts).await {
-            Ok(id) => id,
-            Err(e) => {
-                drop(response_tx.send(Err(Error::internal_error().data(e.to_string()))));
-                return response_rx;
-            }
-        };
-
-        self.submissions.insert(
-            submission_id,
-            SubmissionState::CustomPrompts(CustomPromptsState::new(response_tx)),
-        );
-
-        response_rx
     }
 
     fn modes(&self) -> Option<SessionModeState> {
@@ -3026,6 +3008,7 @@ impl<A: Auth> ThreadActor<A> {
                 windows_sandbox_level: None,
                 service_tier: None,
                 approvals_reviewer: None,
+                permission_profile: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3073,6 +3056,7 @@ impl<A: Auth> ThreadActor<A> {
                 windows_sandbox_level: None,
                 service_tier: None,
                 approvals_reviewer: None,
+                permission_profile: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3141,6 +3125,8 @@ impl<A: Auth> ThreadActor<A> {
                             text_elements: vec![],
                         }],
                         final_output_json_schema: None,
+                        environments: None,
+                        responsesapi_client_metadata: None,
                     }
                 }
                 "review" => {
@@ -3188,25 +3174,11 @@ impl<A: Auth> ThreadActor<A> {
                     return Err(Error::auth_required());
                 }
                 _ => {
-                    if let Some(prompt) = expand_custom_prompt(
-                        name,
-                        rest,
-                        self.custom_prompts.lock().unwrap().as_ref(),
-                    )
-                    .map_err(|e| Error::invalid_params().data(e.user_message()))?
-                    {
-                        op = Op::UserInput {
-                            items: vec![UserInput::Text {
-                                text: prompt,
-                                text_elements: vec![],
-                            }],
-                            final_output_json_schema: None,
-                        }
-                    } else {
-                        op = Op::UserInput {
-                            items,
-                            final_output_json_schema: None,
-                        }
+                    op = Op::UserInput {
+                        items,
+                        final_output_json_schema: None,
+                        environments: None,
+                        responsesapi_client_metadata: None,
                     }
                 }
             }
@@ -3214,6 +3186,8 @@ impl<A: Auth> ThreadActor<A> {
             op = Op::UserInput {
                 items,
                 final_output_json_schema: None,
+                environments: None,
+                responsesapi_client_metadata: None,
             }
         }
 
@@ -3257,6 +3231,7 @@ impl<A: Auth> ThreadActor<A> {
                 windows_sandbox_level: None,
                 service_tier: None,
                 approvals_reviewer: None,
+                permission_profile: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3324,6 +3299,7 @@ impl<A: Auth> ThreadActor<A> {
                 windows_sandbox_level: None,
                 service_tier: None,
                 approvals_reviewer: None,
+                permission_profile: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3838,9 +3814,9 @@ fn guardian_assessment_tool_call_status(status: &GuardianAssessmentStatus) -> To
     match status {
         GuardianAssessmentStatus::InProgress => ToolCallStatus::InProgress,
         GuardianAssessmentStatus::Approved => ToolCallStatus::Completed,
-        GuardianAssessmentStatus::Denied | GuardianAssessmentStatus::Aborted => {
-            ToolCallStatus::Failed
-        }
+        GuardianAssessmentStatus::Denied
+        | GuardianAssessmentStatus::Aborted
+        | GuardianAssessmentStatus::TimedOut => ToolCallStatus::Failed,
     }
 }
 
@@ -3852,25 +3828,16 @@ fn guardian_assessment_content(event: &GuardianAssessmentEvent) -> Vec<ToolCallC
             GuardianAssessmentStatus::Approved => "Approved",
             GuardianAssessmentStatus::Denied => "Denied",
             GuardianAssessmentStatus::Aborted => "Aborted",
+            GuardianAssessmentStatus::TimedOut => "Timed out",
         }
     )];
 
-    if let Some(summary) = event.action.as_ref().and_then(guardian_action_summary) {
+    if let Some(summary) = guardian_action_summary(&event.action) {
         lines.push(format!("Action: {summary}"));
     }
 
-    match (event.risk_level, event.risk_score) {
-        (Some(level), Some(score)) => {
-            lines.push(format!(
-                "Risk: {} ({score}/100)",
-                format!("{level:?}").to_lowercase()
-            ));
-        }
-        (Some(level), None) => {
-            lines.push(format!("Risk: {}", format!("{level:?}").to_lowercase()));
-        }
-        (None, Some(score)) => lines.push(format!("Risk score: {score}/100")),
-        (None, None) => {}
+    if let Some(level) = event.risk_level {
+        lines.push(format!("Risk: {}", format!("{level:?}").to_lowercase()));
     }
 
     if let Some(rationale) = event.rationale.as_ref()
@@ -3879,79 +3846,110 @@ fn guardian_assessment_content(event: &GuardianAssessmentEvent) -> Vec<ToolCallC
         lines.push(format!("Rationale: {rationale}"));
     }
 
-    let mut content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+    let content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
         TextContent::new(lines.join("\n")),
     )))];
-
-    if let Some(action) = event.action.as_ref()
-        && guardian_action_summary(action).is_none()
-        && let Ok(action_json) = serde_json::to_string_pretty(action)
-    {
-        content.push(ToolCallContent::Content(Content::new(ContentBlock::Text(
-            TextContent::new(format!("Action payload:\n{action_json}")),
-        ))));
-    }
 
     content
 }
 
-fn guardian_action_summary(action: &serde_json::Value) -> Option<String> {
-    let tool = action.get("tool").and_then(serde_json::Value::as_str)?;
-    match tool {
-        "shell" | "exec_command" => match action.get("command") {
-            Some(serde_json::Value::String(command)) => Some(command.clone()),
-            Some(serde_json::Value::Array(command)) => {
-                let args = command
-                    .iter()
-                    .map(serde_json::Value::as_str)
-                    .collect::<Option<Vec<_>>>()?;
-                shlex::try_join(args.iter().copied())
-                    .ok()
-                    .or_else(|| Some(args.join(" ")))
-            }
-            _ => None,
-        },
-        "apply_patch" => {
-            let files = action
-                .get("files")
-                .and_then(serde_json::Value::as_array)
-                .map(|files| {
-                    files
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let change_count = action
-                .get("change_count")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(files.len() as u64);
-            Some(if files.len() == 1 {
-                format!("apply_patch touching {}", files[0])
-            } else {
-                format!(
-                    "apply_patch touching {change_count} changes across {} files",
-                    files.len()
-                )
-            })
+fn guardian_action_summary(action: &GuardianAssessmentAction) -> Option<String> {
+    match action {
+        GuardianAssessmentAction::Command {
+            source,
+            command,
+            cwd: _,
+        } => {
+            let label = guardian_command_source_label(source);
+            Some(format!("{label} {command}"))
         }
-        "network_access" => action
-            .get("target")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| action.get("host").and_then(serde_json::Value::as_str))
-            .map(|target| format!("network access to {target}")),
-        "mcp_tool_call" => {
-            let tool_name = action
-                .get("tool_name")
-                .and_then(serde_json::Value::as_str)?;
-            let label = action
-                .get("connector_name")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| action.get("server").and_then(serde_json::Value::as_str))
-                .unwrap_or("unknown server");
+        GuardianAssessmentAction::Execve {
+            source,
+            program,
+            argv,
+            cwd: _,
+        } => {
+            let label = guardian_command_source_label(source);
+            let command: Vec<&str> = if argv.is_empty() {
+                vec![program.as_str()]
+            } else {
+                argv.iter().map(String::as_str).collect()
+            };
+            let joined = shlex::try_join(command.iter().copied())
+                .ok()
+                .unwrap_or_else(|| command.join(" "));
+            Some(format!("{label} {joined}"))
+        }
+        GuardianAssessmentAction::ApplyPatch { files, cwd: _ } => Some(if files.len() == 1 {
+            format!("apply_patch touching {}", files[0].display())
+        } else {
+            format!("apply_patch touching {} files", files.len())
+        }),
+        GuardianAssessmentAction::NetworkAccess { target, host, .. } => {
+            let label = if target.is_empty() { host } else { target };
+            Some(format!("network access to {label}"))
+        }
+        GuardianAssessmentAction::McpToolCall {
+            server,
+            tool_name,
+            connector_name,
+            ..
+        } => {
+            let label = connector_name.as_deref().unwrap_or(server.as_str());
             Some(format!("MCP {tool_name} on {label}"))
         }
-        _ => None,
+        GuardianAssessmentAction::RequestPermissions { reason, .. } => Some(
+            reason
+                .clone()
+                .unwrap_or_else(|| "request additional permissions".to_string()),
+        ),
+    }
+}
+
+fn guardian_command_source_label(source: &GuardianCommandSource) -> &'static str {
+    match source {
+        GuardianCommandSource::Shell => "shell",
+        GuardianCommandSource::UnifiedExec => "exec",
+    }
+}
+
+fn format_file_system_entries<'a>(
+    entries: impl Iterator<Item = &'a FileSystemSandboxEntry>,
+) -> String {
+    entries
+        .map(format_file_system_entry)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_file_system_entry(entry: &FileSystemSandboxEntry) -> String {
+    match &entry.path {
+        FileSystemPath::Path { path } => path.display().to_string(),
+        FileSystemPath::GlobPattern { pattern } => format!("glob `{pattern}`"),
+        FileSystemPath::Special { value } => format_file_system_special(value),
+    }
+}
+
+fn format_file_system_special(value: &FileSystemSpecialPath) -> String {
+    match value {
+        FileSystemSpecialPath::Root => ":root".to_string(),
+        FileSystemSpecialPath::Minimal => ":minimal".to_string(),
+        FileSystemSpecialPath::CurrentWorkingDirectory => ":cwd".to_string(),
+        FileSystemSpecialPath::ProjectRoots { subpath } => {
+            format_file_system_subpath(":project_roots", subpath.as_deref())
+        }
+        FileSystemSpecialPath::Tmpdir => ":tmpdir".to_string(),
+        FileSystemSpecialPath::SlashTmp => "/tmp".to_string(),
+        FileSystemSpecialPath::Unknown { path, subpath } => {
+            format_file_system_subpath(path, subpath.as_deref())
+        }
+    }
+}
+
+fn format_file_system_subpath(base: &str, subpath: Option<&Path>) -> String {
+    match subpath {
+        Some(subpath) => format!("{base}/{}", subpath.display()),
+        None => base.to_string(),
     }
 }
 
@@ -4005,8 +4003,23 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
         UserInput::Text { text, .. } => Some(text),
         _ => None,
     })?;
-
-    parse_slash_name(line)
+    // Parse a first-line slash command of the form `/name <rest>`.
+    // Returns `(name, rest_after_name)` if the line begins with `/` and contains
+    // a non-empty name; otherwise returns `None`.
+    let stripped = line.strip_prefix('/')?;
+    let mut name_end = stripped.len();
+    for (idx, ch) in stripped.char_indices() {
+        if ch.is_whitespace() {
+            name_end = idx;
+            break;
+        }
+    }
+    let name = &stripped[..name_end];
+    if name.is_empty() {
+        return None;
+    }
+    let rest = stripped[name_end..].trim_start();
+    Some((name, rest))
 }
 
 #[cfg(test)]
@@ -4025,7 +4038,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prompt() -> anyhow::Result<()> {
-        let (session_id, client, _, message_tx, _handle) = setup(vec![]).await?;
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4052,7 +4065,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_compact() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, _handle) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4079,9 +4092,26 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_guardian_execve_summary_uses_argv_without_duplication() -> anyhow::Result<()> {
+        let action = GuardianAssessmentAction::Execve {
+            source: GuardianCommandSource::UnifiedExec,
+            program: "/bin/ls".to_string(),
+            argv: vec!["/bin/ls".to_string(), "-l".to_string()],
+            cwd: std::env::current_dir()?.try_into()?,
+        };
+
+        assert_eq!(
+            guardian_action_summary(&action),
+            Some("exec /bin/ls -l".to_string())
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_undo() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, _handle) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4122,7 +4152,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_init() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, _handle) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4154,6 +4184,8 @@ mod tests {
                     text_elements: vec![]
                 }],
                 final_output_json_schema: None,
+                environments: None,
+                responsesapi_client_metadata: None,
             }],
             "ops don't match {ops:?}"
         );
@@ -4163,7 +4195,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_review() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, _handle) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4205,7 +4237,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_custom_review() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, _handle) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
         let instructions = "Review what we did in agents.md";
 
@@ -4255,7 +4287,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_review() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, _handle) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4303,7 +4335,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_branch_review() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, _handle) = setup(vec![]).await?;
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4348,58 +4380,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_custom_prompts() -> anyhow::Result<()> {
-        let custom_prompts = vec![CustomPrompt {
-            name: "custom".to_string(),
-            path: "/tmp/custom.md".into(),
-            content: "Custom prompt with $1 arg.".into(),
-            description: None,
-            argument_hint: None,
-        }];
-        let (session_id, client, thread, message_tx, _handle) = setup(custom_prompts).await?;
-        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
-
-        message_tx.send(ThreadMessage::Prompt {
-            request: PromptRequest::new(session_id.clone(), vec!["/custom foo".into()]),
-            response_tx: prompt_response_tx,
-        })?;
-
-        let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
-        drop(message_tx);
-
-        let notifications = client.notifications.lock().unwrap();
-        assert_eq!(notifications.len(), 1);
-        assert!(
-            matches!(
-                &notifications[0].update,
-                SessionUpdate::AgentMessageChunk(ContentChunk {
-                    content: ContentBlock::Text(TextContent { text, .. }),
-                    ..
-                }) if text == "Custom prompt with foo arg."
-            ),
-            "notifications don't match {notifications:?}"
-        );
-
-        let ops = thread.ops.lock().unwrap();
-        assert_eq!(
-            ops.as_slice(),
-            &[Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: "Custom prompt with foo arg.".into(),
-                    text_elements: vec![]
-                }],
-                final_output_json_schema: None,
-            }],
-            "ops don't match {ops:?}"
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_delta_deduplication() -> anyhow::Result<()> {
-        let (session_id, client, _, message_tx, _handle) = setup(vec![]).await?;
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4429,9 +4411,7 @@ mod tests {
         Ok(())
     }
 
-    async fn setup(
-        custom_prompts: Vec<CustomPrompt>,
-    ) -> anyhow::Result<(
+    async fn setup() -> anyhow::Result<(
         SessionId,
         Arc<StubClient>,
         Arc<StubCodexThread>,
@@ -4452,7 +4432,7 @@ mod tests {
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let mut actor = ThreadActor::new(
+        let actor = ThreadActor::new(
             StubAuth,
             session_client,
             conversation.clone(),
@@ -4462,7 +4442,6 @@ mod tests {
             resolution_tx,
             resolution_rx,
         );
-        actor.custom_prompts = Arc::new(std::sync::Mutex::new(custom_prompts));
 
         let handle = tokio::spawn(actor.spawn());
         Ok((session_id, client, conversation, message_tx, handle))
@@ -4552,7 +4531,7 @@ mod tests {
                                 process_id: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "a".into()],
-                                cwd: cwd.clone(),
+                                cwd: cwd.clone().try_into()?,
                                 parsed_cmd: vec![ParsedCommand::Unknown {
                                     cmd: "echo a".into(),
                                 }],
@@ -4564,7 +4543,7 @@ mod tests {
                                 process_id: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "b".into()],
-                                cwd: cwd.clone(),
+                                cwd: cwd.clone().try_into()?,
                                 parsed_cmd: vec![ParsedCommand::Unknown {
                                     cmd: "echo b".into(),
                                 }],
@@ -4576,7 +4555,7 @@ mod tests {
                                 process_id: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "a".into()],
-                                cwd: cwd.clone(),
+                                cwd: cwd.clone().try_into()?,
                                 parsed_cmd: vec![],
                                 source: Default::default(),
                                 interaction_input: None,
@@ -4593,7 +4572,7 @@ mod tests {
                                 process_id: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "b".into()],
-                                cwd: cwd.clone(),
+                                cwd: cwd.clone().try_into()?,
                                 parsed_cmd: vec![],
                                 source: Default::default(),
                                 interaction_input: None,
@@ -4608,6 +4587,9 @@ mod tests {
                             send(EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                                 turn_id,
+                                completed_at: None,
+                                duration_ms: None,
+                                time_to_first_token_ms: None,
                             }));
                         } else if prompt == "approval-block" {
                             self.op_tx
@@ -4618,13 +4600,12 @@ mod tests {
                                         approval_id: Some("approval-id".to_string()),
                                         turn_id: id.to_string(),
                                         command: vec!["echo".to_string(), "hi".to_string()],
-                                        cwd: std::env::current_dir().unwrap(),
+                                        cwd: std::env::current_dir().unwrap().try_into().unwrap(),
                                         reason: None,
                                         network_approval_context: None,
                                         proposed_execpolicy_amendment: None,
                                         proposed_network_policy_amendments: None,
                                         additional_permissions: None,
-                                        skill_metadata: None,
                                         available_decisions: Some(vec![
                                             ReviewDecision::Approved,
                                             ReviewDecision::Abort,
@@ -4666,6 +4647,9 @@ mod tests {
                                     msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                         last_agent_message: None,
                                         turn_id: id.to_string(),
+                                        completed_at: None,
+                                        duration_ms: None,
+                                        time_to_first_token_ms: None,
                                     }),
                                 })
                                 .unwrap();
@@ -4679,6 +4663,7 @@ mod tests {
                                     model_context_window: None,
                                     collaboration_mode_kind: ModeKind::default(),
                                     turn_id: id.to_string(),
+                                    started_at: None,
                                 }),
                             })
                             .unwrap();
@@ -4698,6 +4683,9 @@ mod tests {
                                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                     last_agent_message: None,
                                     turn_id: id.to_string(),
+                                    completed_at: None,
+                                    duration_ms: None,
+                                    time_to_first_token_ms: None,
                                 }),
                             })
                             .unwrap();
@@ -4730,6 +4718,9 @@ mod tests {
                                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                     last_agent_message: None,
                                     turn_id: id.to_string(),
+                                    completed_at: None,
+                                    duration_ms: None,
+                                    time_to_first_token_ms: None,
                                 }),
                             })
                             .unwrap();
@@ -4763,6 +4754,9 @@ mod tests {
                                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                     last_agent_message: None,
                                     turn_id: id.to_string(),
+                                    completed_at: None,
+                                    duration_ms: None,
+                                    time_to_first_token_ms: None,
                                 }),
                             })
                             .unwrap();
@@ -4782,6 +4776,8 @@ mod tests {
                                         turn_id: Some(active_prompt_id),
                                         reason:
                                             codex_protocol::protocol::TurnAbortReason::Interrupted,
+                                        completed_at: None,
+                                        duration_ms: None,
                                     }),
                                 })
                                 .unwrap();
@@ -4874,7 +4870,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parallel_exec_commands() -> anyhow::Result<()> {
-        let (session_id, client, _, message_tx, _handle) = setup(vec![]).await?;
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4969,13 +4965,12 @@ mod tests {
                 approval_id: Some("approval-id".to_string()),
                 turn_id: "turn-id".to_string(),
                 command: vec!["echo".to_string(), "hi".to_string()],
-                cwd: std::env::current_dir()?,
+                cwd: std::env::current_dir()?.try_into()?,
                 reason: None,
                 network_approval_context: None,
                 proposed_execpolicy_amendment: None,
                 proposed_network_policy_amendments: None,
                 additional_permissions: None,
-                skill_metadata: None,
                 available_decisions: Some(vec![ReviewDecision::Approved, ReviewDecision::Denied]),
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo hi".to_string(),
@@ -5213,13 +5208,12 @@ mod tests {
                     approval_id: Some("approval-id".to_string()),
                     turn_id: "turn-id".to_string(),
                     command: vec!["echo".to_string(), "hi".to_string()],
-                    cwd: std::env::current_dir()?,
+                    cwd: std::env::current_dir()?.try_into()?,
                     reason: None,
                     network_approval_context: None,
                     proposed_execpolicy_amendment: None,
                     proposed_network_policy_amendments: None,
                     additional_permissions: None,
-                    skill_metadata: None,
                     available_decisions: Some(vec![
                         ReviewDecision::Approved,
                         ReviewDecision::Abort,
