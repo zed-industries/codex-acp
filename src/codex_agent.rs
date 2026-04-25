@@ -432,9 +432,16 @@ impl CodexAgent {
             CodexAuthMethod::CodexApiKey.into(),
             CodexAuthMethod::OpenAiApiKey.into(),
         ];
+        if std::env::var("CODEX_ACP_DISABLE_ENV_AUTH_METHODS").is_ok() {
+            auth_methods.retain(|method| {
+                matches!(method, AuthMethod::Agent(AuthMethodAgent { id, .. }) if id.0.as_ref() == "chatgpt")
+            });
+        }
         // Until codex device code auth works, we can't use this in remote ssh projects
         if std::env::var("NO_BROWSER").is_ok() {
-            auth_methods.remove(0);
+            auth_methods.retain(|method| {
+                !matches!(method, AuthMethod::Agent(AuthMethodAgent { id, .. }) if id.0.as_ref() == "chatgpt")
+            });
         }
 
         Ok(InitializeResponse::new(protocol_version)
