@@ -112,6 +112,7 @@ const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 fn skill_commands(skills: &[SkillMetadata]) -> Vec<AvailableCommand> {
     skills
         .iter()
+        .filter(|skill| skill.enabled)
         .map(|skill| {
             AvailableCommand::new(
                 format!("skills:{}", skill.name),
@@ -137,7 +138,6 @@ fn skills_for_cwd(cwd: &Path, entries: &[SkillsListEntry]) -> Vec<SkillMetadata>
     entries
         .iter()
         .find(|entry| entry.cwd.as_path() == cwd)
-        .or_else(|| entries.first())
         .map(|entry| entry.skills.clone())
         .unwrap_or_default()
 }
@@ -2730,7 +2730,7 @@ impl<A: Auth> ThreadActor<A> {
             ThreadMessage::Load { response_tx } => {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
-                self.refresh_skills(false).await;
+                self.refresh_skills(true).await;
             }
             ThreadMessage::SkillsLoaded { skills } => {
                 if let Some(skills) = skills {
@@ -4580,6 +4580,97 @@ mod tests {
             SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate { available_commands, .. })
                 if available_commands.iter().any(|command| command.name == "skills:demo")
         )));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_load_does_not_publish_disabled_skills() -> anyhow::Result<()> {
+        let skill = SkillMetadata {
+            name: "disabled-demo".to_string(),
+            description: "Disabled demo skill".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            path: PathBuf::from("/tmp/disabled-demo/SKILL.md").try_into()?,
+            scope: codex_protocol::protocol::SkillScope::Repo,
+            enabled: false,
+        };
+        let (_session_id, client, _thread, message_tx, handle) =
+            setup_with_skills(vec![skill]).await?;
+        let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Load {
+            response_tx: load_response_tx,
+        })?;
+
+        drop(load_response_rx.await??);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(message_tx);
+        handle.await?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications
+                .iter()
+                .all(|notification| match &notification.update {
+                    SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate {
+                        available_commands,
+                        ..
+                    }) => {
+                        !available_commands
+                            .iter()
+                            .any(|command| command.name == "skills:disabled-demo")
+                    }
+                    _ => true,
+                })
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_load_does_not_publish_skills_for_other_cwd() -> anyhow::Result<()> {
+        let skill = SkillMetadata {
+            name: "other-cwd".to_string(),
+            description: "Other cwd skill".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            path: PathBuf::from("/tmp/other-cwd/SKILL.md").try_into()?,
+            scope: codex_protocol::protocol::SkillScope::Repo,
+            enabled: true,
+        };
+        let (_session_id, client, thread, message_tx, handle) =
+            setup_with_skills(vec![skill]).await?;
+        thread.skills_entries.lock().unwrap()[0].cwd = PathBuf::from("/tmp/not-the-session-cwd");
+        let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Load {
+            response_tx: load_response_tx,
+        })?;
+
+        drop(load_response_rx.await??);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(message_tx);
+        handle.await?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications
+                .iter()
+                .all(|notification| match &notification.update {
+                    SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate {
+                        available_commands,
+                        ..
+                    }) => {
+                        !available_commands
+                            .iter()
+                            .any(|command| command.name == "skills:other-cwd")
+                    }
+                    _ => true,
+                })
+        );
 
         Ok(())
     }
