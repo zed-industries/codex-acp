@@ -32,7 +32,7 @@ use codex_core::{
     review_prompts::user_facing_hint,
 };
 use codex_login::auth::AuthManager;
-use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
+use codex_models_manager::manager::{ModelsManager as CodexModelsManager, RefreshStrategy};
 use codex_protocol::{
     approvals::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
@@ -42,7 +42,7 @@ use codex_protocol::{
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
     mcp::CallToolResult,
-    models::{PermissionProfile, ResponseItem, WebSearchAction},
+    models::{AdditionalPermissionProfile, ResponseItem, WebSearchAction},
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
     permissions::{
@@ -137,20 +137,23 @@ pub trait ModelsManagerImpl: Send + Sync {
     fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>>;
 }
 
-impl ModelsManagerImpl for ModelsManager {
+struct CodexModelsManagerAdapter(Arc<dyn CodexModelsManager>);
+
+impl ModelsManagerImpl for CodexModelsManagerAdapter {
     fn get_model(
         &self,
         model_id: &Option<String>,
     ) -> Pin<Box<dyn Future<Output = String> + Send + '_>> {
         let model_id = model_id.clone();
         Box::pin(async move {
-            self.get_default_model(&model_id, RefreshStrategy::OnlineIfUncached)
+            self.0
+                .get_default_model(&model_id, RefreshStrategy::OnlineIfUncached)
                 .await
         })
     }
 
     fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
-        Box::pin(self.list_models(RefreshStrategy::OnlineIfUncached))
+        Box::pin(self.0.list_models(RefreshStrategy::OnlineIfUncached))
     }
 }
 
@@ -221,7 +224,7 @@ impl Thread {
         session_id: SessionId,
         thread: Arc<dyn CodexThreadImpl>,
         auth: Arc<AuthManager>,
-        models_manager: Arc<dyn ModelsManagerImpl>,
+        models_manager: Arc<dyn CodexModelsManager>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         config: Config,
         cx: ConnectionTo<Client>,
@@ -233,7 +236,7 @@ impl Thread {
             auth,
             SessionClient::new(session_id, cx, client_capabilities),
             thread.clone(),
-            models_manager,
+            Arc::new(CodexModelsManagerAdapter(models_manager)),
             config,
             message_rx,
             resolution_tx,
@@ -384,7 +387,7 @@ enum PendingPermissionRequest {
     },
     RequestPermissions {
         call_id: String,
-        permissions: PermissionProfile,
+        permissions: RequestPermissionProfile,
     },
     McpElicitation {
         server_name: String,
@@ -887,12 +890,12 @@ impl PromptState {
                         ..
                     }) => match option_id.0.as_ref() {
                         "approved-for-session" => RequestPermissionsResponse {
-                            permissions: permissions.into(),
+                            permissions: permissions.clone(),
                             scope: PermissionGrantScope::Session,
                             strict_auto_review: false,
                         },
                         "approved" => RequestPermissionsResponse {
-                            permissions: permissions.into(),
+                            permissions: permissions.clone(),
                             scope: PermissionGrantScope::Turn,
                             strict_auto_review: false,
                         },
@@ -2159,7 +2162,7 @@ impl PromptState {
             permissions_request_key(&call_id),
             PendingPermissionRequest::RequestPermissions {
                 call_id,
-                permissions: permissions.into(),
+                permissions,
             },
             ToolCallUpdate::new(
                 tool_call_id,
@@ -2245,7 +2248,7 @@ struct ExecPermissionOption {
 fn build_exec_permission_options(
     available_decisions: &[ReviewDecision],
     network_approval_context: Option<&NetworkApprovalContext>,
-    additional_permissions: Option<&PermissionProfile>,
+    additional_permissions: Option<&AdditionalPermissionProfile>,
 ) -> Vec<ExecPermissionOption> {
     available_decisions
         .iter()
