@@ -30,6 +30,7 @@ use codex_core::{
     config::{Config, set_project_trust_level},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
+    util::normalize_thread_name,
 };
 use codex_login::auth::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
@@ -77,7 +78,7 @@ use heck::ToTitleCase;
 use itertools::Itertools;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Abstraction over the ACP connection for sending notifications and requests
@@ -678,18 +679,21 @@ fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
 enum SubmissionState {
     /// User prompts, including slash commands like /init, /review, /compact, /undo.
     Prompt(PromptState),
+    Rename(RenameState),
 }
 
 impl SubmissionState {
     fn is_active(&self) -> bool {
         match self {
             Self::Prompt(state) => state.is_active(),
+            Self::Rename(state) => state.is_active(),
         }
     }
 
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         match self {
             Self::Prompt(state) => state.handle_event(client, event).await,
+            Self::Rename(state) => state.handle_event(client, event),
         }
     }
 
@@ -705,6 +709,10 @@ impl SubmissionState {
                     .handle_permission_request_resolved(client, request_key, response)
                     .await
             }
+            Self::Rename(_) => {
+                warn!("Ignoring permission response for rename submission");
+                Ok(())
+            }
         }
     }
 
@@ -713,14 +721,18 @@ impl SubmissionState {
             Self::Prompt(state) => {
                 state.abort_pending_interactions();
             }
+            Self::Rename(_) => {}
         }
     }
 
     fn fail(&mut self, err: Error) {
-        if let Self::Prompt(state) = self
-            && let Some(response_tx) = state.response_tx.take()
-        {
-            drop(response_tx.send(Err(err)));
+        match self {
+            Self::Prompt(state) => {
+                if let Some(response_tx) = state.response_tx.take() {
+                    drop(response_tx.send(Err(err)));
+                }
+            }
+            Self::Rename(state) => state.fail(err),
         }
     }
 }
@@ -744,6 +756,71 @@ struct PromptState {
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
+}
+
+struct RenameState {
+    response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
+}
+
+impl RenameState {
+    fn new(response_tx: oneshot::Sender<Result<StopReason, Error>>) -> Self {
+        Self {
+            response_tx: Some(response_tx),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.response_tx
+            .as_ref()
+            .is_some_and(|response_tx| !response_tx.is_closed())
+    }
+
+    fn fail(&mut self, err: Error) {
+        if let Some(response_tx) = self.response_tx.take() {
+            drop(response_tx.send(Err(err)));
+        }
+    }
+
+    fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
+        match event {
+            EventMsg::ThreadNameUpdated(event) => {
+                if let Some(title) = event.thread_name {
+                    send_session_title_update(client, Some(title.clone()));
+                    client.send_agent_text(format!("Thread renamed to: {title}\n"));
+                    if let Some(response_tx) = self.response_tx.take() {
+                        drop(response_tx.send(Ok(StopReason::EndTurn)));
+                    }
+                }
+            }
+            EventMsg::Error(ErrorEvent {
+                message,
+                codex_error_info,
+            }) => {
+                if let Some(response_tx) = self.response_tx.take() {
+                    drop(response_tx.send(Err(Error::internal_error().data(
+                        json!({ "message": message, "codex_error_info": codex_error_info }),
+                    ))));
+                }
+            }
+            EventMsg::StreamError(StreamErrorEvent {
+                message,
+                codex_error_info,
+                additional_details,
+            }) => {
+                error!(
+                    "Rename failed during stream: {message} {codex_error_info:?} {additional_details:?}"
+                );
+                if let Some(response_tx) = self.response_tx.take() {
+                    drop(response_tx.send(Err(Error::internal_error().data(
+                        json!({ "message": message, "codex_error_info": codex_error_info }),
+                    ))));
+                }
+            }
+            event => {
+                debug!("Ignoring event for rename submission: {event:?}");
+            }
+        }
+    }
 }
 
 impl PromptState {
@@ -1063,11 +1140,11 @@ impl PromptState {
             }
             EventMsg::ThreadNameUpdated(event) => {
                 info!("Thread name updated: {:?}", event.thread_name);
-                if let Some(title) = event.thread_name {
-                    client.send_notification(SessionUpdate::SessionInfoUpdate(
-                        SessionInfoUpdate::new().title(title),
-                    ));
-                }
+                send_session_title_update(client, event.thread_name);
+            }
+            EventMsg::SessionConfigured(event) => {
+                info!("Session configured with thread name: {:?}", event.thread_name);
+                send_session_title_update(client, event.thread_name);
             }
             EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
                 // Send this to the client via session/update notification
@@ -1357,7 +1434,6 @@ impl PromptState {
             | EventMsg::AgentReasoningDelta(..)
             | EventMsg::AgentReasoningRawContentDelta(..)
             | EventMsg::RawResponseItem(..)
-            | EventMsg::SessionConfigured(..)
             // TODO: Subagent UI?
             | EventMsg::CollabAgentSpawnBegin(..)
             | EventMsg::CollabAgentSpawnEnd(..)
@@ -2761,6 +2837,9 @@ impl<A: Auth> ThreadActor<A> {
                 "compact",
                 "summarize conversation to prevent hitting the context limit",
             ),
+            AvailableCommand::new("rename", "rename the current thread").input(
+                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("new name")),
+            ),
             AvailableCommand::new("undo", "undo Codex’s most recent turn"),
             AvailableCommand::new("logout", "logout of Codex"),
         ]
@@ -3173,6 +3252,19 @@ impl<A: Auth> ThreadActor<A> {
                     self.auth.logout()?;
                     return Err(Error::auth_required());
                 }
+                "rename" if !rest.is_empty() => {
+                    let name = normalize_thread_name(rest).ok_or_else(Error::invalid_params)?;
+                    let submission_id = self
+                        .thread
+                        .submit(Op::SetThreadName { name })
+                        .await
+                        .map_err(|e| Error::internal_error().data(e.to_string()))?;
+                    self.submissions.insert(
+                        submission_id,
+                        SubmissionState::Rename(RenameState::new(response_tx)),
+                    );
+                    return Ok(response_rx);
+                }
                 _ => {
                     op = Op::UserInput {
                         items,
@@ -3375,6 +3467,12 @@ impl<A: Auth> ThreadActor<A> {
             }
             EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text }) => {
                 self.client.send_agent_thought(text.clone());
+            }
+            EventMsg::SessionConfigured(event) => {
+                send_session_title_update(&self.client, event.thread_name.clone());
+            }
+            EventMsg::ThreadNameUpdated(event) => {
+                send_session_title_update(&self.client, event.thread_name.clone());
             }
             // Skip other event types during replay - they either:
             // - Are transient (deltas, turn lifecycle)
@@ -3647,9 +3745,30 @@ impl<A: Auth> ThreadActor<A> {
     async fn handle_event(&mut self, Event { id, msg }: Event) {
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
+        } else if matches!(
+            &msg,
+            EventMsg::SessionConfigured(..) | EventMsg::ThreadNameUpdated(..)
+        ) {
+            match msg {
+                EventMsg::SessionConfigured(event) => {
+                    send_session_title_update(&self.client, event.thread_name);
+                }
+                EventMsg::ThreadNameUpdated(event) => {
+                    send_session_title_update(&self.client, event.thread_name);
+                }
+                _ => unreachable!(),
+            }
         } else {
             warn!("Received event for unknown submission ID: {id} {msg:?}");
         }
+    }
+}
+
+fn send_session_title_update(client: &SessionClient, title: Option<String>) {
+    if let Some(title) = title {
+        client.send_notification(SessionUpdate::SessionInfoUpdate(
+            SessionInfoUpdate::new().title(title),
+        ));
     }
 }
 
@@ -4031,7 +4150,7 @@ mod tests {
 
     use agent_client_protocol::schema::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
-    use codex_protocol::config_types::ModeKind;
+    use codex_protocol::{ThreadId, config_types::ModeKind, protocol::ThreadNameUpdatedEvent};
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
     use super::*;
@@ -4088,6 +4207,68 @@ mod tests {
         ));
         let ops = thread.ops.lock().unwrap();
         assert_eq!(ops.as_slice(), &[Op::Compact]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rename_sends_title_update() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/rename My New Thread".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.as_slice(),
+            [Op::SetThreadName { name }] if name == "My New Thread"
+        ));
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::SessionInfoUpdate(update)
+                    if update.title.value() == Some(&"My New Thread".to_string())
+            )
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_thread_name_sends_title_update() -> anyhow::Result<()> {
+        let (_session_id, client, _, message_tx, _handle) = setup().await?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::ReplayHistory {
+            history: vec![RolloutItem::EventMsg(EventMsg::ThreadNameUpdated(
+                ThreadNameUpdatedEvent {
+                    thread_id: ThreadId::new(),
+                    thread_name: Some("Persisted Thread Name".to_string()),
+                },
+            ))],
+            response_tx,
+        })?;
+
+        response_rx.await??;
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::SessionInfoUpdate(update)
+                    if update.title.value() == Some(&"Persisted Thread Name".to_string())
+            )
+        }));
 
         Ok(())
     }
@@ -4766,6 +4947,17 @@ mod tests {
                     | Op::RequestPermissionsResponse { .. }
                     | Op::PatchApproval { .. }
                     | Op::Interrupt => {}
+                    Op::SetThreadName { name } => {
+                        self.op_tx
+                            .send(Event {
+                                id: id.to_string(),
+                                msg: EventMsg::ThreadNameUpdated(ThreadNameUpdatedEvent {
+                                    thread_id: ThreadId::new(),
+                                    thread_name: Some(name),
+                                }),
+                            })
+                            .unwrap();
+                    }
                     Op::Shutdown => {
                         if let Some(active_prompt_id) = self.active_prompt_id.lock().unwrap().take()
                         {

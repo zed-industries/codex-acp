@@ -15,7 +15,7 @@ use agent_client_protocol as acp;
 use codex_config::{McpServerConfig, McpServerTransportConfig};
 use codex_core::{
     NewThread, RolloutRecorder, SortDirection, ThreadManager, ThreadSortKey, config::Config,
-    find_thread_path_by_id_str, parse_cursor,
+    find_thread_names_by_ids, find_thread_path_by_id_str, parse_cursor,
 };
 use codex_exec_server::{EnvironmentManager, EnvironmentManagerArgs, ExecServerRuntimePaths};
 use codex_login::{
@@ -28,11 +28,11 @@ use codex_protocol::{
     protocol::{InitialHistory, SessionSource},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::thread::Thread;
@@ -674,7 +674,7 @@ impl CodexAgent {
         .await
         .map_err(|err| Error::internal_error().data(format!("failed to list sessions: {err}")))?;
 
-        let sessions = page
+        let session_items = page
             .items
             .into_iter()
             .filter_map(|item| {
@@ -687,17 +687,36 @@ impl CodexAgent {
                     return None;
                 }
 
-                let title = item
-                    .first_user_message
-                    .as_deref()
-                    .and_then(format_session_title);
                 let updated_at = item.updated_at.or(item.created_at);
 
-                Some(
-                    SessionInfo::new(SessionId::new(thread_id.to_string()), item_cwd)
-                        .title(title)
-                        .updated_at(updated_at),
-                )
+                Some((thread_id, item_cwd, item.first_user_message, updated_at))
+            })
+            .collect::<Vec<_>>();
+
+        let thread_ids = session_items
+            .iter()
+            .map(|(thread_id, _, _, _)| *thread_id)
+            .collect::<HashSet<_>>();
+        let thread_names =
+            match find_thread_names_by_ids(&self.config.codex_home, &thread_ids).await {
+                Ok(thread_names) => thread_names,
+                Err(err) => {
+                    warn!("failed to read Codex thread names: {err}");
+                    HashMap::new()
+                }
+            };
+
+        let sessions = session_items
+            .into_iter()
+            .map(|(thread_id, item_cwd, first_user_message, updated_at)| {
+                let title = thread_names
+                    .get(&thread_id)
+                    .cloned()
+                    .or_else(|| first_user_message.as_deref().and_then(format_session_title));
+
+                SessionInfo::new(SessionId::new(thread_id.to_string()), item_cwd)
+                    .title(title)
+                    .updated_at(updated_at)
             })
             .collect::<Vec<_>>();
 
