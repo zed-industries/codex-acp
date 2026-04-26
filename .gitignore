@@ -3,3 +3,4 @@ node_modules
 npm-packages
 .DS_Store
 codex
+.idea
