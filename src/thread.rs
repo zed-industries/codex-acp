@@ -51,19 +51,22 @@ use codex_protocol::{
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
-        AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent,
-        ApplyPatchApprovalRequestEvent, DynamicToolCallResponseEvent, ElicitationAction,
-        ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
-        ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
-        FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ItemCompletedEvent,
-        ItemStartedEvent, McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent,
-        McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext,
-        NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
-        PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
-        ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SandboxPolicy,
-        StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent, TurnAbortedEvent,
-        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
-        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent, AgentStatus,
+        ApplyPatchApprovalRequestEvent, CollabAgentInteractionBeginEvent,
+        CollabAgentInteractionEndEvent, CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent,
+        CollabCloseBeginEvent, CollabCloseEndEvent, CollabResumeBeginEvent, CollabResumeEndEvent,
+        CollabWaitingBeginEvent, CollabWaitingEndEvent, DynamicToolCallResponseEvent,
+        ElicitationAction, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent,
+        ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus,
+        ExitedReviewModeEvent, FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus,
+        ItemCompletedEvent, ItemStartedEvent, McpInvocation, McpStartupCompleteEvent,
+        McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent,
+        NetworkApprovalContext, NetworkPolicyRuleAction, Op, PatchApplyBeginEvent,
+        PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent, ReasoningContentDeltaEvent,
+        ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
+        ReviewTarget, RolloutItem, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent,
+        TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -78,6 +81,7 @@ use itertools::Itertools;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
+use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
 /// Abstraction over the ACP connection for sending notifications and requests
@@ -675,6 +679,59 @@ fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
     }
 }
 
+fn truncate_for_title(text: &str) -> String {
+    const MAX_GRAPHEMES: usize = 80;
+    let single_line = text.split_whitespace().join(" ");
+    if single_line.graphemes(true).count() <= MAX_GRAPHEMES {
+        return single_line;
+    }
+
+    format!(
+        "{}...",
+        single_line
+            .graphemes(true)
+            .take(MAX_GRAPHEMES.saturating_sub(3))
+            .collect::<String>()
+    )
+}
+
+fn subagent_title(prefix: &str, nickname: Option<&str>, role: Option<&str>) -> String {
+    match (nickname, role) {
+        (Some(nickname), Some(role)) => format!("{prefix}: {nickname} ({role})"),
+        (Some(nickname), None) => format!("{prefix}: {nickname}"),
+        (None, Some(role)) => format!("{prefix}: {role}"),
+        (None, None) => prefix.to_string(),
+    }
+}
+
+fn agent_status_to_tool_status(status: &AgentStatus) -> ToolCallStatus {
+    match status {
+        AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted => {
+            ToolCallStatus::InProgress
+        }
+        AgentStatus::Completed(_) | AgentStatus::Shutdown => ToolCallStatus::Completed,
+        AgentStatus::Errored(_) | AgentStatus::NotFound => ToolCallStatus::Failed,
+    }
+}
+
+fn aggregate_agent_statuses<'a>(statuses: impl Iterator<Item = &'a AgentStatus>) -> ToolCallStatus {
+    let mut saw_in_progress = false;
+    for status in statuses {
+        match agent_status_to_tool_status(status) {
+            ToolCallStatus::Failed => return ToolCallStatus::Failed,
+            ToolCallStatus::InProgress | ToolCallStatus::Pending => saw_in_progress = true,
+            ToolCallStatus::Completed => {}
+            _ => saw_in_progress = true,
+        }
+    }
+
+    if saw_in_progress {
+        ToolCallStatus::InProgress
+    } else {
+        ToolCallStatus::Completed
+    }
+}
+
 enum SubmissionState {
     /// User prompts, including slash commands like /init, /review, /compact, /undo.
     Prompt(PromptState),
@@ -732,11 +789,19 @@ struct ActiveCommand {
     file_extension: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveSubagent {
+    tool_call_id: ToolCallId,
+    thread_id: Option<String>,
+}
+
 struct PromptState {
     submission_id: String,
     active_commands: HashMap<String, ActiveCommand>,
     active_web_search: Option<String>,
     active_guardian_assessments: HashSet<String>,
+    active_subagents_by_call: HashMap<String, ActiveSubagent>,
+    active_subagent_calls_by_thread: HashMap<String, ToolCallId>,
     thread: Arc<dyn CodexThreadImpl>,
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     pending_permission_interactions: HashMap<String, PendingPermissionInteraction>,
@@ -758,6 +823,8 @@ impl PromptState {
             active_commands: HashMap::new(),
             active_web_search: None,
             active_guardian_assessments: HashSet::new(),
+            active_subagents_by_call: HashMap::new(),
+            active_subagent_calls_by_thread: HashMap::new(),
             thread,
             resolution_tx,
             pending_permission_interactions: HashMap::new(),
@@ -1137,6 +1204,67 @@ impl PromptState {
                 );
                 self.end_dynamic_tool_call(client, event);
             }
+            EventMsg::CollabAgentSpawnBegin(event) => {
+                info!("Subagent spawn begin: call_id={}", event.call_id);
+                self.start_subagent_spawn(client, event);
+            }
+            EventMsg::CollabAgentSpawnEnd(event) => {
+                info!(
+                    "Subagent spawn end: call_id={}, new_thread_id={:?}, status={:?}",
+                    event.call_id, event.new_thread_id, event.status
+                );
+                self.end_subagent_spawn(client, event);
+            }
+            EventMsg::CollabAgentInteractionBegin(event) => {
+                info!(
+                    "Subagent interaction begin: call_id={}, receiver_thread_id={}",
+                    event.call_id, event.receiver_thread_id
+                );
+                self.start_subagent_interaction(client, event);
+            }
+            EventMsg::CollabAgentInteractionEnd(event) => {
+                info!(
+                    "Subagent interaction end: call_id={}, receiver_thread_id={}, status={:?}",
+                    event.call_id, event.receiver_thread_id, event.status
+                );
+                self.end_subagent_interaction(client, event);
+            }
+            EventMsg::CollabWaitingBegin(event) => {
+                info!("Subagent wait begin: call_id={}", event.call_id);
+                self.start_subagent_wait(client, event);
+            }
+            EventMsg::CollabWaitingEnd(event) => {
+                info!("Subagent wait end: call_id={}", event.call_id);
+                self.end_subagent_wait(client, event);
+            }
+            EventMsg::CollabResumeBegin(event) => {
+                info!(
+                    "Subagent resume begin: call_id={}, receiver_thread_id={}",
+                    event.call_id, event.receiver_thread_id
+                );
+                self.start_subagent_resume(client, event);
+            }
+            EventMsg::CollabResumeEnd(event) => {
+                info!(
+                    "Subagent resume end: call_id={}, receiver_thread_id={}, status={:?}",
+                    event.call_id, event.receiver_thread_id, event.status
+                );
+                self.end_subagent_resume(client, event);
+            }
+            EventMsg::CollabCloseBegin(event) => {
+                info!(
+                    "Subagent close begin: call_id={}, receiver_thread_id={}",
+                    event.call_id, event.receiver_thread_id
+                );
+                self.start_subagent_close(client, event);
+            }
+            EventMsg::CollabCloseEnd(event) => {
+                info!(
+                    "Subagent close end: call_id={}, receiver_thread_id={}, status={:?}",
+                    event.call_id, event.receiver_thread_id, event.status
+                );
+                self.end_subagent_close(client, event);
+            }
             EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
                 call_id,
                 invocation,
@@ -1358,21 +1486,10 @@ impl PromptState {
             | EventMsg::AgentReasoningRawContentDelta(..)
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..)
-            // TODO: Subagent UI?
-            | EventMsg::CollabAgentSpawnBegin(..)
-            | EventMsg::CollabAgentSpawnEnd(..)
-            | EventMsg::CollabAgentInteractionBegin(..)
-            | EventMsg::CollabAgentInteractionEnd(..)
             | EventMsg::RealtimeConversationStarted(..)
             | EventMsg::RealtimeConversationRealtime(..)
             | EventMsg::RealtimeConversationClosed(..)
             | EventMsg::RealtimeConversationSdp(..)
-            | EventMsg::CollabWaitingBegin(..)
-            | EventMsg::CollabWaitingEnd(..)
-            | EventMsg::CollabResumeBegin(..)
-            | EventMsg::CollabResumeEnd(..)
-            | EventMsg::CollabCloseBegin(..)
-            | EventMsg::CollabCloseEnd(..)
             | EventMsg::PlanDelta(..)=> {}
             e @ (EventMsg::McpListToolsResponse(..)
             | EventMsg::ListSkillsResponse(..)
@@ -1618,6 +1735,355 @@ impl PromptState {
                 .status(ToolCallStatus::InProgress)
                 .raw_input(serde_json::json!(&arguments)),
         );
+    }
+
+    fn start_subagent_spawn(&mut self, client: &SessionClient, event: CollabAgentSpawnBeginEvent) {
+        let raw_input = serde_json::json!(&event);
+        let CollabAgentSpawnBeginEvent {
+            call_id, prompt, ..
+        } = event;
+
+        let title = if prompt.is_empty() {
+            "Spawning subagent".to_string()
+        } else {
+            format!("Spawning subagent: {}", truncate_for_title(&prompt))
+        };
+
+        let tool_call_id = ToolCallId::new(call_id.clone());
+        self.active_subagents_by_call.insert(
+            call_id.clone(),
+            ActiveSubagent {
+                tool_call_id: tool_call_id.clone(),
+                thread_id: None,
+            },
+        );
+
+        client.send_tool_call(
+            ToolCall::new(tool_call_id, title)
+                .status(ToolCallStatus::InProgress)
+                .raw_input(raw_input),
+        );
+    }
+
+    fn end_subagent_spawn(&mut self, client: &SessionClient, event: CollabAgentSpawnEndEvent) {
+        let raw_output = serde_json::json!(&event);
+        let CollabAgentSpawnEndEvent {
+            call_id,
+            sender_thread_id: _,
+            new_thread_id,
+            new_agent_nickname,
+            new_agent_role,
+            prompt: _,
+            model: _,
+            reasoning_effort: _,
+            status,
+        } = event;
+
+        let thread_id = new_thread_id.map(|thread_id| thread_id.to_string());
+        let tool_call_id = if let Some(active) = self.active_subagents_by_call.get_mut(&call_id) {
+            active.thread_id.clone_from(&thread_id);
+            active.tool_call_id.clone()
+        } else {
+            ToolCallId::new(call_id.clone())
+        };
+
+        if let Some(thread_id) = thread_id {
+            self.active_subagent_calls_by_thread
+                .insert(thread_id, tool_call_id.clone());
+        }
+
+        client.send_tool_call_update(ToolCallUpdate::new(
+            tool_call_id,
+            ToolCallUpdateFields::new()
+                .status(agent_status_to_tool_status(&status))
+                .title(subagent_title(
+                    "Spawned subagent",
+                    new_agent_nickname.as_deref(),
+                    new_agent_role.as_deref(),
+                ))
+                .raw_output(raw_output),
+        ));
+    }
+
+    fn start_subagent_interaction(
+        &mut self,
+        client: &SessionClient,
+        event: CollabAgentInteractionBeginEvent,
+    ) {
+        let raw_input = serde_json::json!(&event);
+        let CollabAgentInteractionBeginEvent {
+            call_id,
+            sender_thread_id: _,
+            receiver_thread_id,
+            prompt,
+        } = event;
+        let receiver_thread_id = receiver_thread_id.to_string();
+        let tool_call_id = ToolCallId::new(call_id.clone());
+
+        self.active_subagents_by_call.insert(
+            call_id.clone(),
+            ActiveSubagent {
+                tool_call_id: tool_call_id.clone(),
+                thread_id: Some(receiver_thread_id.clone()),
+            },
+        );
+        self.active_subagent_calls_by_thread
+            .insert(receiver_thread_id, tool_call_id.clone());
+
+        client.send_tool_call(
+            ToolCall::new(
+                tool_call_id,
+                format!("Messaging subagent: {}", truncate_for_title(&prompt)),
+            )
+            .status(ToolCallStatus::InProgress)
+            .raw_input(raw_input),
+        );
+    }
+
+    fn end_subagent_interaction(
+        &mut self,
+        client: &SessionClient,
+        event: CollabAgentInteractionEndEvent,
+    ) {
+        let raw_output = serde_json::json!(&event);
+        let CollabAgentInteractionEndEvent {
+            call_id,
+            sender_thread_id: _,
+            receiver_thread_id,
+            receiver_agent_nickname,
+            receiver_agent_role,
+            prompt: _,
+            status,
+        } = event;
+        let receiver_thread_id = receiver_thread_id.to_string();
+        let tool_call_id = self
+            .active_subagents_by_call
+            .get(&call_id)
+            .map(|active| active.tool_call_id.clone())
+            .or_else(|| {
+                self.active_subagent_calls_by_thread
+                    .get(&receiver_thread_id)
+                    .cloned()
+            })
+            .unwrap_or_else(|| ToolCallId::new(call_id.clone()));
+
+        self.active_subagent_calls_by_thread
+            .insert(receiver_thread_id, tool_call_id.clone());
+
+        client.send_tool_call_update(ToolCallUpdate::new(
+            tool_call_id,
+            ToolCallUpdateFields::new()
+                .status(agent_status_to_tool_status(&status))
+                .title(subagent_title(
+                    "Subagent replied",
+                    receiver_agent_nickname.as_deref(),
+                    receiver_agent_role.as_deref(),
+                ))
+                .raw_output(raw_output),
+        ));
+    }
+
+    fn start_subagent_wait(&mut self, client: &SessionClient, event: CollabWaitingBeginEvent) {
+        let raw_input = serde_json::json!(&event);
+        let CollabWaitingBeginEvent {
+            sender_thread_id: _,
+            receiver_thread_ids,
+            receiver_agents,
+            call_id,
+        } = event;
+        let title = format!(
+            "Waiting for {} subagent{}",
+            receiver_thread_ids.len(),
+            if receiver_thread_ids.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+        let tool_call_id = ToolCallId::new(call_id.clone());
+
+        self.active_subagents_by_call.insert(
+            call_id,
+            ActiveSubagent {
+                tool_call_id: tool_call_id.clone(),
+                thread_id: None,
+            },
+        );
+        for thread_id in receiver_thread_ids {
+            self.active_subagent_calls_by_thread
+                .insert(thread_id.to_string(), tool_call_id.clone());
+        }
+        for agent in receiver_agents {
+            self.active_subagent_calls_by_thread
+                .insert(agent.thread_id.to_string(), tool_call_id.clone());
+        }
+
+        client.send_tool_call(
+            ToolCall::new(tool_call_id, title)
+                .status(ToolCallStatus::InProgress)
+                .raw_input(raw_input),
+        );
+    }
+
+    fn end_subagent_wait(&mut self, client: &SessionClient, event: CollabWaitingEndEvent) {
+        let raw_output = serde_json::json!(&event);
+        let CollabWaitingEndEvent {
+            sender_thread_id: _,
+            call_id,
+            agent_statuses,
+            statuses,
+        } = event;
+        let tool_call_id = self
+            .active_subagents_by_call
+            .get(&call_id)
+            .map(|active| active.tool_call_id.clone())
+            .unwrap_or_else(|| ToolCallId::new(call_id.clone()));
+        let status = aggregate_agent_statuses(
+            agent_statuses
+                .iter()
+                .map(|entry| &entry.status)
+                .chain(statuses.values()),
+        );
+
+        client.send_tool_call_update(ToolCallUpdate::new(
+            tool_call_id,
+            ToolCallUpdateFields::new()
+                .status(status)
+                .title("Subagent wait completed")
+                .raw_output(raw_output),
+        ));
+    }
+
+    fn start_subagent_close(&mut self, client: &SessionClient, event: CollabCloseBeginEvent) {
+        let raw_input = serde_json::json!(&event);
+        let CollabCloseBeginEvent {
+            call_id,
+            sender_thread_id: _,
+            receiver_thread_id,
+        } = event;
+        let receiver_thread_id = receiver_thread_id.to_string();
+        let tool_call_id = ToolCallId::new(call_id.clone());
+
+        self.active_subagents_by_call.insert(
+            call_id,
+            ActiveSubagent {
+                tool_call_id: tool_call_id.clone(),
+                thread_id: Some(receiver_thread_id.clone()),
+            },
+        );
+        self.active_subagent_calls_by_thread
+            .insert(receiver_thread_id, tool_call_id.clone());
+
+        client.send_tool_call(
+            ToolCall::new(tool_call_id, "Closing subagent")
+                .status(ToolCallStatus::InProgress)
+                .raw_input(raw_input),
+        );
+    }
+
+    fn end_subagent_close(&mut self, client: &SessionClient, event: CollabCloseEndEvent) {
+        let raw_output = serde_json::json!(&event);
+        let CollabCloseEndEvent {
+            call_id,
+            sender_thread_id: _,
+            receiver_thread_id,
+            receiver_agent_nickname,
+            receiver_agent_role,
+            status,
+        } = event;
+        let receiver_thread_id = receiver_thread_id.to_string();
+        let tool_call_id = self
+            .active_subagents_by_call
+            .remove(&call_id)
+            .map(|active| active.tool_call_id)
+            .or_else(|| {
+                self.active_subagent_calls_by_thread
+                    .remove(&receiver_thread_id)
+            })
+            .unwrap_or_else(|| ToolCallId::new(call_id));
+
+        client.send_tool_call_update(ToolCallUpdate::new(
+            tool_call_id,
+            ToolCallUpdateFields::new()
+                .status(agent_status_to_tool_status(&status))
+                .title(subagent_title(
+                    "Closed subagent",
+                    receiver_agent_nickname.as_deref(),
+                    receiver_agent_role.as_deref(),
+                ))
+                .raw_output(raw_output),
+        ));
+    }
+
+    fn start_subagent_resume(&mut self, client: &SessionClient, event: CollabResumeBeginEvent) {
+        let raw_input = serde_json::json!(&event);
+        let CollabResumeBeginEvent {
+            call_id,
+            sender_thread_id: _,
+            receiver_thread_id,
+            receiver_agent_nickname,
+            receiver_agent_role,
+        } = event;
+        let receiver_thread_id = receiver_thread_id.to_string();
+        let tool_call_id = ToolCallId::new(call_id.clone());
+
+        self.active_subagents_by_call.insert(
+            call_id,
+            ActiveSubagent {
+                tool_call_id: tool_call_id.clone(),
+                thread_id: Some(receiver_thread_id.clone()),
+            },
+        );
+        self.active_subagent_calls_by_thread
+            .insert(receiver_thread_id, tool_call_id.clone());
+
+        client.send_tool_call(
+            ToolCall::new(
+                tool_call_id,
+                subagent_title(
+                    "Resuming subagent",
+                    receiver_agent_nickname.as_deref(),
+                    receiver_agent_role.as_deref(),
+                ),
+            )
+            .status(ToolCallStatus::InProgress)
+            .raw_input(raw_input),
+        );
+    }
+
+    fn end_subagent_resume(&mut self, client: &SessionClient, event: CollabResumeEndEvent) {
+        let raw_output = serde_json::json!(&event);
+        let CollabResumeEndEvent {
+            call_id,
+            sender_thread_id: _,
+            receiver_thread_id,
+            receiver_agent_nickname,
+            receiver_agent_role,
+            status,
+        } = event;
+        let receiver_thread_id = receiver_thread_id.to_string();
+        let tool_call_id = self
+            .active_subagents_by_call
+            .get(&call_id)
+            .map(|active| active.tool_call_id.clone())
+            .or_else(|| {
+                self.active_subagent_calls_by_thread
+                    .get(&receiver_thread_id)
+                    .cloned()
+            })
+            .unwrap_or_else(|| ToolCallId::new(call_id));
+
+        client.send_tool_call_update(ToolCallUpdate::new(
+            tool_call_id,
+            ToolCallUpdateFields::new()
+                .status(agent_status_to_tool_status(&status))
+                .title(subagent_title(
+                    "Resumed subagent",
+                    receiver_agent_nickname.as_deref(),
+                    receiver_agent_role.as_deref(),
+                ))
+                .raw_output(raw_output),
+        ));
     }
 
     fn start_mcp_tool_call(
@@ -4032,6 +4498,7 @@ mod tests {
     use agent_client_protocol::schema::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
     use codex_protocol::config_types::ModeKind;
+    use codex_protocol::protocol::{CollabAgentRef, CollabAgentStatusEntry};
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
     use super::*;
@@ -4616,6 +5083,120 @@ mod tests {
                                     }),
                                 })
                                 .unwrap();
+                        } else if prompt == "subagents" {
+                            let turn_id = id.to_string();
+                            let sender_thread_id = codex_protocol::ThreadId::new();
+                            let receiver_thread_id = codex_protocol::ThreadId::new();
+                            let failed_thread_id = codex_protocol::ThreadId::new();
+                            let send = |msg| {
+                                self.op_tx
+                                    .send(Event {
+                                        id: id.to_string(),
+                                        msg,
+                                    })
+                                    .unwrap();
+                            };
+                            send(EventMsg::CollabAgentSpawnBegin(
+                                CollabAgentSpawnBeginEvent {
+                                    call_id: "spawn-a".to_string(),
+                                    sender_thread_id: sender_thread_id.clone(),
+                                    prompt: "Inspect the parser module".to_string(),
+                                    model: "gpt-test".to_string(),
+                                    reasoning_effort: ReasoningEffort::Medium,
+                                },
+                            ));
+                            send(EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                                call_id: "spawn-a".to_string(),
+                                sender_thread_id: sender_thread_id.clone(),
+                                new_thread_id: Some(receiver_thread_id.clone()),
+                                new_agent_nickname: Some("atlas".to_string()),
+                                new_agent_role: Some("explorer".to_string()),
+                                prompt: "Inspect the parser module".to_string(),
+                                model: "gpt-test".to_string(),
+                                reasoning_effort: ReasoningEffort::Medium,
+                                status: AgentStatus::Running,
+                            }));
+                            send(EventMsg::CollabAgentInteractionBegin(
+                                CollabAgentInteractionBeginEvent {
+                                    call_id: "message-a".to_string(),
+                                    sender_thread_id: sender_thread_id.clone(),
+                                    receiver_thread_id: receiver_thread_id.clone(),
+                                    prompt: "Check the failing path".to_string(),
+                                },
+                            ));
+                            send(EventMsg::CollabAgentInteractionEnd(
+                                CollabAgentInteractionEndEvent {
+                                    call_id: "message-a".to_string(),
+                                    sender_thread_id: sender_thread_id.clone(),
+                                    receiver_thread_id: receiver_thread_id.clone(),
+                                    receiver_agent_nickname: Some("atlas".to_string()),
+                                    receiver_agent_role: Some("explorer".to_string()),
+                                    prompt: "Check the failing path".to_string(),
+                                    status: AgentStatus::Completed(Some("done".to_string())),
+                                },
+                            ));
+                            send(EventMsg::CollabWaitingBegin(CollabWaitingBeginEvent {
+                                sender_thread_id: sender_thread_id.clone(),
+                                receiver_thread_ids: vec![
+                                    receiver_thread_id.clone(),
+                                    failed_thread_id.clone(),
+                                ],
+                                receiver_agents: vec![CollabAgentRef {
+                                    thread_id: receiver_thread_id.clone(),
+                                    agent_nickname: Some("atlas".to_string()),
+                                    agent_role: Some("explorer".to_string()),
+                                }],
+                                call_id: "wait-a".to_string(),
+                            }));
+                            send(EventMsg::CollabWaitingEnd(CollabWaitingEndEvent {
+                                sender_thread_id: sender_thread_id.clone(),
+                                call_id: "wait-a".to_string(),
+                                agent_statuses: vec![CollabAgentStatusEntry {
+                                    thread_id: receiver_thread_id.clone(),
+                                    agent_nickname: Some("atlas".to_string()),
+                                    agent_role: Some("explorer".to_string()),
+                                    status: AgentStatus::Completed(Some("done".to_string())),
+                                }],
+                                statuses: HashMap::from([(
+                                    failed_thread_id.clone(),
+                                    AgentStatus::Errored("boom".to_string()),
+                                )]),
+                            }));
+                            send(EventMsg::CollabResumeBegin(CollabResumeBeginEvent {
+                                call_id: "resume-a".to_string(),
+                                sender_thread_id: sender_thread_id.clone(),
+                                receiver_thread_id: receiver_thread_id.clone(),
+                                receiver_agent_nickname: Some("atlas".to_string()),
+                                receiver_agent_role: Some("explorer".to_string()),
+                            }));
+                            send(EventMsg::CollabResumeEnd(CollabResumeEndEvent {
+                                call_id: "resume-a".to_string(),
+                                sender_thread_id: sender_thread_id.clone(),
+                                receiver_thread_id: receiver_thread_id.clone(),
+                                receiver_agent_nickname: Some("atlas".to_string()),
+                                receiver_agent_role: Some("explorer".to_string()),
+                                status: AgentStatus::Running,
+                            }));
+                            send(EventMsg::CollabCloseBegin(CollabCloseBeginEvent {
+                                call_id: "close-a".to_string(),
+                                sender_thread_id: sender_thread_id.clone(),
+                                receiver_thread_id: receiver_thread_id.clone(),
+                            }));
+                            send(EventMsg::CollabCloseEnd(CollabCloseEndEvent {
+                                call_id: "close-a".to_string(),
+                                sender_thread_id,
+                                receiver_thread_id,
+                                receiver_agent_nickname: Some("atlas".to_string()),
+                                receiver_agent_role: Some("explorer".to_string()),
+                                status: AgentStatus::Shutdown,
+                            }));
+                            send(EventMsg::TurnComplete(TurnCompleteEvent {
+                                last_agent_message: None,
+                                turn_id,
+                                completed_at: None,
+                                duration_ms: None,
+                                time_to_first_token_ms: None,
+                            }));
                         } else {
                             self.op_tx
                                 .send(Event {
@@ -4937,6 +5518,151 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_subagent_events_surface_as_tool_calls() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["subagents".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        let tool_calls: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::ToolCall(tc) => Some(tc.clone()),
+                _ => None,
+            })
+            .collect();
+        let tool_updates: Vec<_> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::ToolCallUpdate(update) => Some(update.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            tool_calls.iter().any(|tool_call| {
+                tool_call.tool_call_id.0.as_ref() == "spawn-a"
+                    && tool_call.title.starts_with("Spawning subagent")
+                    && tool_call.status == ToolCallStatus::InProgress
+                    && tool_call.raw_input.is_some()
+            }),
+            "expected spawn ToolCall, got {tool_calls:?}"
+        );
+        assert!(
+            tool_calls.iter().any(|tool_call| {
+                tool_call.tool_call_id.0.as_ref() == "message-a"
+                    && tool_call.title.starts_with("Messaging subagent")
+            }),
+            "expected interaction ToolCall, got {tool_calls:?}"
+        );
+        assert!(
+            tool_calls.iter().any(|tool_call| {
+                tool_call.tool_call_id.0.as_ref() == "wait-a"
+                    && tool_call.title == "Waiting for 2 subagents"
+            }),
+            "expected wait ToolCall, got {tool_calls:?}"
+        );
+        assert!(
+            tool_calls.iter().any(|tool_call| {
+                tool_call.tool_call_id.0.as_ref() == "resume-a"
+                    && tool_call.title == "Resuming subagent: atlas (explorer)"
+            }),
+            "expected resume ToolCall, got {tool_calls:?}"
+        );
+        assert!(
+            tool_calls.iter().any(|tool_call| {
+                tool_call.tool_call_id.0.as_ref() == "close-a"
+                    && tool_call.title == "Closing subagent"
+            }),
+            "expected close ToolCall, got {tool_calls:?}"
+        );
+
+        assert!(
+            tool_updates.iter().any(|update| {
+                update.tool_call_id.0.as_ref() == "spawn-a"
+                    && update.fields.status == Some(ToolCallStatus::InProgress)
+                    && update.fields.title.as_deref() == Some("Spawned subagent: atlas (explorer)")
+                    && update.fields.raw_output.is_some()
+            }),
+            "expected spawn update, got {tool_updates:?}"
+        );
+        assert!(
+            tool_updates.iter().any(|update| {
+                update.tool_call_id.0.as_ref() == "message-a"
+                    && update.fields.status == Some(ToolCallStatus::Completed)
+                    && update.fields.title.as_deref() == Some("Subagent replied: atlas (explorer)")
+            }),
+            "expected interaction completion update, got {tool_updates:?}"
+        );
+        assert!(
+            tool_updates.iter().any(|update| {
+                update.tool_call_id.0.as_ref() == "wait-a"
+                    && update.fields.status == Some(ToolCallStatus::Failed)
+                    && update.fields.title.as_deref() == Some("Subagent wait completed")
+            }),
+            "expected failed wait update from errored subagent, got {tool_updates:?}"
+        );
+        assert!(
+            tool_updates.iter().any(|update| {
+                update.tool_call_id.0.as_ref() == "resume-a"
+                    && update.fields.status == Some(ToolCallStatus::InProgress)
+                    && update.fields.title.as_deref() == Some("Resumed subagent: atlas (explorer)")
+            }),
+            "expected resume update, got {tool_updates:?}"
+        );
+        assert!(
+            tool_updates.iter().any(|update| {
+                update.tool_call_id.0.as_ref() == "close-a"
+                    && update.fields.status == Some(ToolCallStatus::Completed)
+                    && update.fields.title.as_deref() == Some("Closed subagent: atlas (explorer)")
+            }),
+            "expected close update, got {tool_updates:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_agent_status_maps_to_tool_status() {
+        assert_eq!(
+            agent_status_to_tool_status(&AgentStatus::PendingInit),
+            ToolCallStatus::InProgress
+        );
+        assert_eq!(
+            agent_status_to_tool_status(&AgentStatus::Running),
+            ToolCallStatus::InProgress
+        );
+        assert_eq!(
+            agent_status_to_tool_status(&AgentStatus::Interrupted),
+            ToolCallStatus::InProgress
+        );
+        assert_eq!(
+            agent_status_to_tool_status(&AgentStatus::Completed(None)),
+            ToolCallStatus::Completed
+        );
+        assert_eq!(
+            agent_status_to_tool_status(&AgentStatus::Shutdown),
+            ToolCallStatus::Completed
+        );
+        assert_eq!(
+            agent_status_to_tool_status(&AgentStatus::Errored("boom".to_string())),
+            ToolCallStatus::Failed
+        );
+        assert_eq!(
+            agent_status_to_tool_status(&AgentStatus::NotFound),
+            ToolCallStatus::Failed
+        );
     }
 
     #[tokio::test]
