@@ -31,8 +31,9 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::thread::Thread;
@@ -277,6 +278,26 @@ impl CodexAgent {
             )
             .connect_to(transport)
             .await
+    }
+
+    pub async fn shutdown_sessions(&self) {
+        let sessions = {
+            let mut sessions = self.sessions.lock().unwrap();
+            sessions.drain().collect::<Vec<_>>()
+        };
+        self.session_roots.lock().unwrap().clear();
+
+        if sessions.is_empty() {
+            return;
+        }
+
+        for (session_id, thread) in &sessions {
+            if let Err(err) = thread.request_shutdown().await {
+                warn!("Error requesting session shutdown for {session_id}: {err:?}");
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
     fn session_id_from_thread_id(thread_id: ThreadId) -> SessionId {
