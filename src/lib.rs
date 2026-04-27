@@ -1,21 +1,16 @@
 //! Codex ACP - An Agent Client Protocol implementation for Codex.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
-use agent_client_protocol::AgentSideConnection;
+use agent_client_protocol::ByteStreams;
 use codex_core::config::{Config, ConfigOverrides};
 use codex_utils_cli::CliConfigOverrides;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
-use std::{io::Result as IoResult, rc::Rc};
-use tokio::task::LocalSet;
+use std::sync::Arc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
-mod prompt_args;
 mod thread;
-
-pub static ACP_CLIENT: OnceLock<Arc<AgentSideConnection>> = OnceLock::new();
 
 /// Run the Codex ACP agent.
 ///
@@ -28,7 +23,7 @@ pub static ACP_CLIENT: OnceLock<Arc<AgentSideConnection>> = OnceLock::new();
 pub async fn run_main(
     codex_linux_sandbox_exe: Option<PathBuf>,
     cli_config_overrides: CliConfigOverrides,
-) -> IoResult<()> {
+) -> std::io::Result<()> {
     // Install a simple subscriber so `tracing` output is visible.
     // Users can control the log level with `RUST_LOG`.
     tracing_subscriber::fmt()
@@ -45,7 +40,7 @@ pub async fn run_main(
     })?;
 
     let config_overrides = ConfigOverrides {
-        codex_linux_sandbox_exe,
+        codex_linux_sandbox_exe: codex_linux_sandbox_exe.clone(),
         ..ConfigOverrides::default()
     };
 
@@ -58,30 +53,24 @@ pub async fn run_main(
                     format!("error loading config: {e}"),
                 )
             })?;
+    // Apply residency requirement so the HTTP client sends the
+    // x-openai-internal-codex-residency header on all requests.
+    codex_login::default_client::set_default_client_residency_requirement(
+        config.enforce_residency.value(),
+    );
 
-    // Create our Agent implementation with notification channel
-    let agent = Rc::new(codex_agent::CodexAgent::new(config));
+    let agent = Arc::new(codex_agent::CodexAgent::new(
+        config,
+        codex_linux_sandbox_exe,
+    )?);
 
     let stdin = tokio::io::stdin().compat();
     let stdout = tokio::io::stdout().compat_write();
 
-    // Run the I/O task to handle the actual communication
-    LocalSet::new()
-        .run_until(async move {
-            // Create the ACP connection
-            let (client, io_task) = AgentSideConnection::new(agent.clone(), stdout, stdin, |fut| {
-                tokio::task::spawn_local(fut);
-            });
-
-            if ACP_CLIENT.set(Arc::new(client)).is_err() {
-                return Err(std::io::Error::other("ACP client already set"));
-            }
-
-            io_task
-                .await
-                .map_err(|e| std::io::Error::other(format!("ACP I/O error: {e}")))
-        })
-        .await?;
+    agent
+        .serve(ByteStreams::new(stdout, stdin))
+        .await
+        .map_err(|e| std::io::Error::other(format!("ACP error: {e}")))?;
 
     Ok(())
 }
