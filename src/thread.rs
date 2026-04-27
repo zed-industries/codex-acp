@@ -7,16 +7,16 @@ use std::{
     time::Duration,
 };
 
-use agent_client_protocol::schema::{ExtRequest, ExtResponse};
 use agent_client_protocol::{
     Client, ConnectionTo, Error,
     schema::{
-        AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ClientCapabilities,
-        ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
-        EmbeddedResourceResource, LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption,
-        PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-        RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-        ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
+        AgentNotification, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
+        ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff,
+        EmbeddedResource, EmbeddedResourceResource, ExtNotification, LoadSessionResponse, Meta,
+        ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+        PlanEntryPriority, PlanEntryStatus, PromptRequest, RawValue, RequestPermissionOutcome,
+        RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
+        SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
         SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
         SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
         SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason,
@@ -86,6 +86,7 @@ use uuid::Uuid;
 /// back to the client. This replaces the old `Client` trait usage.
 trait ClientSender: Send + Sync + 'static {
     fn send_session_notification(&self, notif: SessionNotification) -> Result<(), Error>;
+    fn send_ext_notification(&self, notif: ExtNotification) -> Result<(), Error>;
     fn request_permission(
         &self,
         req: RequestPermissionRequest,
@@ -98,6 +99,11 @@ struct AcpConnection(ConnectionTo<Client>);
 impl ClientSender for AcpConnection {
     fn send_session_notification(&self, notif: SessionNotification) -> Result<(), Error> {
         self.0.send_notification(notif)
+    }
+
+    fn send_ext_notification(&self, notif: ExtNotification) -> Result<(), Error> {
+        self.0
+            .send_notification(AgentNotification::ExtNotification(notif))
     }
 
     fn request_permission(
@@ -1053,12 +1059,7 @@ impl PromptState {
                     };
 
 
-                    let response =  client.ext_method(ExtRequest::new(
-                        USAGE_METHOD, Arc::from(raw_value)
-                     )).await;
-                     if let Err(err) = response && let Some(response_tx) = self.response_tx.take() {
-                        drop(response_tx.send(Err(err)));
-                    }
+                    client.send_ext_notification(USAGE_METHOD, Arc::from(raw_value));
                 }
 
                 if let Some(rate_limits) = rate_limits{
@@ -1073,7 +1074,7 @@ impl PromptState {
                         seven_day_reset_at: secondary.and_then(|r|r.resets_at),
                         plan_name: rate_limits.plan_type.map(|p|serde_json::to_string(&p).unwrap())
                     }).and_then(|json|{
-                        agent_client_protocol::schema::RawValue::from_string(json)
+                        RawValue::from_string(json)
                     }){
                         Ok(v)=>v,
                         Err(err)=>{
@@ -1083,10 +1084,7 @@ impl PromptState {
                             return;
                         }
                     };
-                    let response = client.ext_method(ExtRequest::new(RATE_LIMITS_METHOD, Arc::from(raw_value))).await;
-                    if let Err(err) = response && let Some(response_tx) = self.response_tx.take() {
-                        drop(response_tx.send(Err(err)));
-                    }
+                    client.send_ext_notification(RATE_LIMITS_METHOD, Arc::from(raw_value));
                 }
             }
             EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
@@ -2573,6 +2571,21 @@ impl SessionClient {
         }
     }
 
+    fn send_ext_notification(&self, method: &str, params: Arc<RawValue>) {
+        let method = if method.starts_with('_') {
+            Arc::from(method)
+        } else {
+            Arc::from(format!("_{method}"))
+        };
+
+        if let Err(e) = self
+            .client
+            .send_ext_notification(ExtNotification::new(method, params))
+        {
+            error!("Failed to send ext notification: {:?}", e);
+        }
+    }
+
     fn send_user_message(&self, text: impl Into<String>) {
         self.send_notification(SessionUpdate::UserMessageChunk(ContentChunk::new(
             text.into().into(),
@@ -2659,10 +2672,6 @@ impl SessionClient {
                 options,
             ))
             .await
-    }
-
-    async fn ext_method(&self, args: ExtRequest) -> Result<ExtResponse, Error> {
-        self.client.ext_method(args).await
     }
 }
 
@@ -4940,6 +4949,7 @@ mod tests {
 
     struct StubClient {
         notifications: std::sync::Mutex<Vec<SessionNotification>>,
+        ext_notifications: std::sync::Mutex<Vec<ExtNotification>>,
         permission_requests: std::sync::Mutex<Vec<RequestPermissionRequest>>,
         permission_responses: std::sync::Mutex<VecDeque<RequestPermissionResponse>>,
         block_permission_requests: Option<Arc<Notify>>,
@@ -4949,6 +4959,7 @@ mod tests {
         fn new() -> Self {
             StubClient {
                 notifications: std::sync::Mutex::default(),
+                ext_notifications: std::sync::Mutex::default(),
                 permission_requests: std::sync::Mutex::default(),
                 permission_responses: std::sync::Mutex::default(),
                 block_permission_requests: None,
@@ -4958,6 +4969,7 @@ mod tests {
         fn with_permission_responses(responses: Vec<RequestPermissionResponse>) -> Self {
             StubClient {
                 notifications: std::sync::Mutex::default(),
+                ext_notifications: std::sync::Mutex::default(),
                 permission_requests: std::sync::Mutex::default(),
                 permission_responses: std::sync::Mutex::new(responses.into()),
                 block_permission_requests: None,
@@ -4970,6 +4982,7 @@ mod tests {
         ) -> Self {
             StubClient {
                 notifications: std::sync::Mutex::default(),
+                ext_notifications: std::sync::Mutex::default(),
                 permission_requests: std::sync::Mutex::default(),
                 permission_responses: std::sync::Mutex::new(responses.into()),
                 block_permission_requests: Some(notify),
@@ -4980,6 +4993,11 @@ mod tests {
     impl ClientSender for StubClient {
         fn send_session_notification(&self, args: SessionNotification) -> Result<(), Error> {
             self.notifications.lock().unwrap().push(args);
+            Ok(())
+        }
+
+        fn send_ext_notification(&self, args: ExtNotification) -> Result<(), Error> {
+            self.ext_notifications.lock().unwrap().push(args);
             Ok(())
         }
 
