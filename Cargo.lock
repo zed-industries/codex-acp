@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "acp-extension-codex"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
