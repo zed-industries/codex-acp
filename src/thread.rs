@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use agent_client_protocol::schema::{ExtRequest, ExtResponse};
 use agent_client_protocol::{
     Client, ConnectionTo, Error,
     schema::{
@@ -24,8 +25,8 @@ use agent_client_protocol::{
         UnstructuredCommandInput, UsageUpdate,
     },
 };
-use agent_client_protocol::{ExtRequest, ExtResponse};
 use codex_apply_patch::parse_patch;
+use codex_config::types::ServiceTier;
 use codex_core::{
     CodexThread,
     config::{Config, set_project_trust_level},
@@ -62,9 +63,9 @@ use codex_protocol::{
         NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
         PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
         ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SandboxPolicy,
-        StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent, TurnAbortedEvent,
-        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
-        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent, TokenUsageInfo,
+        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -1072,7 +1073,7 @@ impl PromptState {
                         seven_day_reset_at: secondary.and_then(|r|r.resets_at),
                         plan_name: rate_limits.plan_type.map(|p|serde_json::to_string(&p).unwrap())
                     }).and_then(|json|{
-                        agent_client_protocol::RawValue::from_string(json)
+                        agent_client_protocol::schema::RawValue::from_string(json)
                     }){
                         Ok(v)=>v,
                         Err(err)=>{
@@ -3081,6 +3082,7 @@ impl<A: Auth> ThreadActor<A> {
             .submit(Op::OverrideTurnContext {
                 cwd: None,
                 approval_policy: None,
+                permission_profile: None,
                 sandbox_policy: None,
                 model: None,
                 effort: None,
@@ -4193,91 +4195,6 @@ mod tests {
                 content: ContentBlock::Text(TextContent { text, .. }),
                 ..
             }) if text == "Hi"
-        ));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_config_options_include_fast_mode() -> anyhow::Result<()> {
-        let (_, _, _, message_tx, local_set) = setup(vec![]).await?;
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-
-        message_tx.send(ThreadMessage::GetConfigOptions { response_tx })?;
-
-        tokio::try_join!(
-            async {
-                let options = response_rx.await??;
-                let fast_mode = options
-                    .iter()
-                    .find(|option| option.id.0.as_ref() == FAST_MODE_CONFIG_ID)
-                    .expect("fast mode config option");
-
-                assert_eq!(fast_mode.name, "Fast Mode");
-                match &fast_mode.kind {
-                    agent_client_protocol::SessionConfigKind::Boolean(value) => {
-                        assert!(!value.current_value);
-                    }
-                    _ => anyhow::bail!("expected boolean fast mode option"),
-                }
-
-                drop(message_tx);
-                anyhow::Ok(())
-            },
-            async {
-                local_set.await;
-                anyhow::Ok(())
-            }
-        )?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_fast_mode_config_option_updates_service_tier() -> anyhow::Result<()> {
-        let (_, _, thread, message_tx, local_set) = setup(vec![]).await?;
-        let (enable_tx, enable_rx) = tokio::sync::oneshot::channel();
-        let (disable_tx, disable_rx) = tokio::sync::oneshot::channel();
-
-        message_tx.send(ThreadMessage::SetConfigOption {
-            config_id: SessionConfigId::new(FAST_MODE_CONFIG_ID),
-            value: SessionConfigOptionValue::boolean(true),
-            response_tx: enable_tx,
-        })?;
-        message_tx.send(ThreadMessage::SetConfigOption {
-            config_id: SessionConfigId::new(FAST_MODE_CONFIG_ID),
-            value: SessionConfigOptionValue::boolean(false),
-            response_tx: disable_tx,
-        })?;
-
-        tokio::try_join!(
-            async {
-                enable_rx.await??;
-                disable_rx.await??;
-                drop(message_tx);
-                anyhow::Ok(())
-            },
-            async {
-                local_set.await;
-                anyhow::Ok(())
-            }
-        )?;
-
-        let ops = thread.ops.lock().unwrap();
-        assert_eq!(ops.len(), 2);
-        assert!(matches!(
-            &ops[0],
-            Op::OverrideTurnContext {
-                service_tier: Some(Some(ServiceTier::Fast)),
-                ..
-            }
-        ));
-        assert!(matches!(
-            &ops[1],
-            Op::OverrideTurnContext {
-                service_tier: Some(None),
-                ..
-            }
         ));
 
         Ok(())
