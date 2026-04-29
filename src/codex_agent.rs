@@ -863,35 +863,6 @@ impl From<CodexAuthMethod> for AuthMethod {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{AuthMethod, AuthMethodId, chatgpt_auth_method};
-
-    #[test]
-    fn headless_chatgpt_auth_uses_terminal_auth() {
-        match chatgpt_auth_method(true) {
-            AuthMethod::Terminal(method) => {
-                assert_eq!(method.id, AuthMethodId::new("chatgpt"));
-                assert_eq!(method.name, "Login with ChatGPT");
-                assert_eq!(method.args, vec!["/auth"]);
-                assert_eq!(method.env.get("NO_BROWSER").map(String::as_str), Some("1"));
-            }
-            other => panic!("expected terminal auth method, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn interactive_chatgpt_auth_uses_agent_auth() {
-        match chatgpt_auth_method(false) {
-            AuthMethod::Agent(method) => {
-                assert_eq!(method.id, AuthMethodId::new("chatgpt"));
-                assert_eq!(method.name, "Login with ChatGPT");
-            }
-            other => panic!("expected agent auth method, got {other:?}"),
-        }
-    }
-}
-
 impl TryFrom<AuthMethodId> for CodexAuthMethod {
     type Error = Error;
 
@@ -933,5 +904,34 @@ fn format_session_title(message: &str) -> Option<String> {
         None
     } else {
         Some(truncate_graphemes(trimmed, SESSION_TITLE_MAX_GRAPHEMES))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuthMethod, AuthMethodId, chatgpt_auth_method};
+
+    #[test]
+    fn headless_chatgpt_auth_uses_terminal_auth() {
+        match chatgpt_auth_method(true) {
+            AuthMethod::Terminal(method) => {
+                assert_eq!(method.id, AuthMethodId::new("chatgpt"));
+                assert_eq!(method.name, "Login with ChatGPT");
+                assert_eq!(method.args, vec!["/auth"]);
+                assert_eq!(method.env.get("NO_BROWSER").map(String::as_str), Some("1"));
+            }
+            other => panic!("expected terminal auth method, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interactive_chatgpt_auth_uses_agent_auth() {
+        match chatgpt_auth_method(false) {
+            AuthMethod::Agent(method) => {
+                assert_eq!(method.id, AuthMethodId::new("chatgpt"));
+                assert_eq!(method.name, "Login with ChatGPT");
+            }
+            other => panic!("expected agent auth method, got {other:?}"),
+        }
     }
 }
