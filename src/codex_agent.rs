@@ -1,14 +1,14 @@
 use acp::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthEnvVar, AuthMethod, AuthMethodAgent,
-    AuthMethodEnvVar, AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Implementation,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
-    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
-    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
-    SessionCapabilities, SessionCloseCapabilities, SessionId, SessionInfo, SessionListCapabilities,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
+    AuthMethodEnvVar, AuthMethodId, AuthMethodTerminal, AuthenticateRequest, AuthenticateResponse,
+    CancelNotification, ClientCapabilities, CloseSessionRequest, CloseSessionResponse,
+    Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, LogoutCapabilities,
+    LogoutRequest, LogoutResponse, McpCapabilities, McpServer, McpServerHttp, McpServerStdio,
+    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
+    ProtocolVersion, SessionCapabilities, SessionCloseCapabilities, SessionId, SessionInfo,
+    SessionListCapabilities, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
 use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
@@ -35,6 +35,7 @@ use std::{
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::run_device_code_auth;
 use crate::thread::Thread;
 
 /// The Codex implementation of the ACP Agent.
@@ -427,15 +428,11 @@ impl CodexAgent {
             .close(SessionCloseCapabilities::new())
             .list(SessionListCapabilities::new());
 
-        let mut auth_methods = vec![
-            CodexAuthMethod::ChatGpt.into(),
+        let auth_methods = vec![
+            chatgpt_auth_method(no_browser_mode()),
             CodexAuthMethod::CodexApiKey.into(),
             CodexAuthMethod::OpenAiApiKey.into(),
         ];
-        // Until codex device code auth works, we can't use this in remote ssh projects
-        if std::env::var("NO_BROWSER").is_ok() {
-            auth_methods.remove(0);
-        }
 
         Ok(InitializeResponse::new(protocol_version)
             .agent_capabilities(agent_capabilities)
@@ -465,7 +462,6 @@ impl CodexAgent {
 
         match auth_method {
             CodexAuthMethod::ChatGpt => {
-                // Perform browser/device login via codex-rs, then report success/failure to the client.
                 let opts = codex_login::ServerOptions::new(
                     self.config.codex_home.to_path_buf(),
                     codex_login::auth::CLIENT_ID.to_string(),
@@ -473,15 +469,21 @@ impl CodexAgent {
                     self.config.cli_auth_credentials_store_mode,
                 );
 
-                let server =
-                    codex_login::run_login_server(opts).map_err(Error::into_internal_error)?;
+                if no_browser_mode() {
+                    run_device_code_auth(opts)
+                        .await
+                        .map_err(Error::into_internal_error)?;
+                } else {
+                    let server =
+                        codex_login::run_login_server(opts).map_err(Error::into_internal_error)?;
 
-                server
-                    .block_until_done()
-                    .await
-                    .map_err(Error::into_internal_error)?;
+                    server
+                        .block_until_done()
+                        .await
+                        .map_err(Error::into_internal_error)?;
 
-                self.auth_manager.reload();
+                    self.auth_manager.reload();
+                }
             }
             CodexAuthMethod::CodexApiKey => {
                 let api_key = read_codex_api_key_from_env().ok_or_else(|| {
@@ -790,6 +792,28 @@ impl CodexAgent {
     }
 }
 
+fn no_browser_mode() -> bool {
+    std::env::var_os("NO_BROWSER").is_some()
+}
+
+fn chatgpt_auth_method(no_browser: bool) -> AuthMethod {
+    let method = CodexAuthMethod::ChatGpt;
+    if no_browser {
+        let description = "Use your ChatGPT login with Codex CLI via device code (works in remote/headless projects)";
+        AuthMethod::Terminal(
+            AuthMethodTerminal::new(method, "Login with ChatGPT")
+                .description(description)
+                .args(vec!["/auth".to_string()])
+                .env(HashMap::from_iter([(
+                    "NO_BROWSER".to_string(),
+                    "1".to_string(),
+                )])),
+        )
+    } else {
+        method.into()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexAuthMethod {
     ChatGpt,
@@ -880,5 +904,34 @@ fn format_session_title(message: &str) -> Option<String> {
         None
     } else {
         Some(truncate_graphemes(trimmed, SESSION_TITLE_MAX_GRAPHEMES))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuthMethod, AuthMethodId, chatgpt_auth_method};
+
+    #[test]
+    fn headless_chatgpt_auth_uses_terminal_auth() {
+        match chatgpt_auth_method(true) {
+            AuthMethod::Terminal(method) => {
+                assert_eq!(method.id, AuthMethodId::new("chatgpt"));
+                assert_eq!(method.name, "Login with ChatGPT");
+                assert_eq!(method.args, vec!["/auth"]);
+                assert_eq!(method.env.get("NO_BROWSER").map(String::as_str), Some("1"));
+            }
+            other => panic!("expected terminal auth method, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interactive_chatgpt_auth_uses_agent_auth() {
+        match chatgpt_auth_method(false) {
+            AuthMethod::Agent(method) => {
+                assert_eq!(method.id, AuthMethodId::new("chatgpt"));
+                assert_eq!(method.name, "Login with ChatGPT");
+            }
+            other => panic!("expected agent auth method, got {other:?}"),
+        }
     }
 }
