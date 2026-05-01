@@ -295,7 +295,10 @@ impl CodexAgent {
 
     async fn check_auth(&self) -> Result<(), Error> {
         if self.config.model_provider_id == "openai" && self.auth_manager.auth().await.is_none() {
-            return Err(Error::auth_required());
+            self.auth_manager.reload();
+            if self.auth_manager.auth().await.is_none() {
+                return Err(Error::auth_required());
+            }
         }
         Ok(())
     }
