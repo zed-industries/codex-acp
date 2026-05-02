@@ -32,15 +32,19 @@ use codex_core::{
     review_prompts::user_facing_hint,
 };
 use codex_login::auth::AuthManager;
-use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
+use codex_models_manager::{
+    collaboration_mode_presets::{CollaborationModesConfig, builtin_collaboration_mode_presets},
+    manager::{ModelsManager, RefreshStrategy},
+};
 use codex_protocol::{
     approvals::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
         GuardianCommandSource,
     },
-    config_types::TrustLevel,
+    config_types::{CollaborationMode, ModeKind, ServiceTier, Settings, TrustLevel},
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
+    items::TurnItem,
     mcp::CallToolResult,
     models::{PermissionProfile, ResponseItem, WebSearchAction},
     openai_models::{ModelPreset, ReasoningEffort},
@@ -59,15 +63,19 @@ use codex_protocol::{
         ItemStartedEvent, McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent,
         McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext,
         NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
-        PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
-        ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SandboxPolicy,
-        StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent, TurnAbortedEvent,
-        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
-        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        PatchApplyUpdatedEvent, PlanDeltaEvent, ReasoningContentDeltaEvent,
+        ReasoningRawContentDeltaEvent, RequestUserInputEvent, ReviewDecision, ReviewOutputEvent,
+        ReviewRequest, ReviewTarget, RolloutItem, SandboxPolicy, StreamErrorEvent,
+        TerminalInteractionEvent, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
+        TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
+        WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
         RequestPermissionsResponse,
+    },
+    request_user_input::{
+        RequestUserInputAnswer, RequestUserInputQuestion, RequestUserInputResponse,
     },
     user_input::UserInput,
 };
@@ -108,6 +116,7 @@ impl ClientSender for AcpConnection {
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
+const PROPOSED_PLAN_HEADER: &str = "\n\n### Proposed Plan\n\n";
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
 pub trait CodexThreadImpl: Send + Sync {
@@ -391,6 +400,14 @@ enum PendingPermissionRequest {
         request_id: codex_protocol::mcp::RequestId,
         option_map: HashMap<String, ResolvedMcpElicitation>,
     },
+    UserInput {
+        turn_id: String,
+        tool_call_id: ToolCallId,
+        question_id: String,
+        option_map: HashMap<String, String>,
+        answers: HashMap<String, RequestUserInputAnswer>,
+        remaining_requests: Vec<SupportedUserInputPermissionRequest>,
+    },
 }
 
 struct PendingPermissionInteraction {
@@ -450,6 +467,13 @@ fn mcp_elicitation_request_key(
     format!("mcp-elicitation:{server_name}:{request_id}")
 }
 
+fn user_input_request_key(turn_id: &str, call_id: &str, question_index: Option<usize>) -> String {
+    match question_index {
+        Some(question_index) => format!("user-input:{turn_id}:{call_id}:{question_index}"),
+        None => format!("user-input:{turn_id}:{call_id}"),
+    }
+}
+
 const MCP_TOOL_APPROVAL_KIND_KEY: &str = "codex_approval_kind";
 const MCP_TOOL_APPROVAL_KIND_MCP_TOOL_CALL: &str = "mcp_tool_call";
 const MCP_TOOL_APPROVAL_PERSIST_KEY: &str = "persist";
@@ -472,6 +496,132 @@ struct SupportedMcpElicitationPermissionRequest {
     tool_call: ToolCallUpdate,
     options: Vec<PermissionOption>,
     option_map: HashMap<String, ResolvedMcpElicitation>,
+}
+
+struct SupportedUserInputPermissionRequest {
+    request_key: String,
+    tool_call_id: ToolCallId,
+    tool_call: ToolCall,
+    permission_tool_call: ToolCallUpdate,
+    options: Vec<PermissionOption>,
+    question_id: String,
+    option_map: HashMap<String, String>,
+}
+
+fn build_supported_user_input_permission_requests(
+    event: &RequestUserInputEvent,
+) -> Option<Vec<SupportedUserInputPermissionRequest>> {
+    if event.questions.is_empty() {
+        return None;
+    }
+
+    let multiple_questions = event.questions.len() > 1;
+    event
+        .questions
+        .iter()
+        .enumerate()
+        .map(|(index, question)| {
+            build_supported_user_input_question_permission_request(
+                event,
+                question,
+                multiple_questions.then_some(index),
+            )
+        })
+        .collect()
+}
+
+fn build_supported_user_input_question_permission_request(
+    event: &RequestUserInputEvent,
+    question: &RequestUserInputQuestion,
+    question_index: Option<usize>,
+) -> Option<SupportedUserInputPermissionRequest> {
+    if question.is_secret {
+        return None;
+    }
+    let options = question
+        .options
+        .as_ref()
+        .filter(|options| !options.is_empty())?;
+
+    let mut permission_options = Vec::new();
+    let mut option_map = HashMap::new();
+    for (index, option) in options.iter().enumerate() {
+        let option_id = format!("option-{index}");
+        permission_options.push(PermissionOption::new(
+            option_id.clone(),
+            option.label.clone(),
+            PermissionOptionKind::AllowOnce,
+        ));
+        option_map.insert(option_id, option.label.clone());
+    }
+    permission_options.push(PermissionOption::new(
+        "cancel",
+        "Cancel",
+        PermissionOptionKind::RejectOnce,
+    ));
+
+    let tool_call_id = ToolCallId::new(match question_index {
+        Some(question_index) => format!("request-user-input:{}:{question_index}", event.call_id),
+        None => format!("request-user-input:{}", event.call_id),
+    });
+    let question_text = format_user_input_question(question);
+    let raw_input = serde_json::json!(event);
+
+    Some(SupportedUserInputPermissionRequest {
+        request_key: user_input_request_key(&event.turn_id, &event.call_id, question_index),
+        tool_call_id: tool_call_id.clone(),
+        tool_call: ToolCall::new(tool_call_id.clone(), question.header.clone())
+            .kind(ToolKind::Think)
+            .status(ToolCallStatus::Pending)
+            .content(vec![ToolCallContent::Content(Content::new(
+                ContentBlock::Text(TextContent::new(question_text.clone())),
+            ))])
+            .raw_input(raw_input.clone()),
+        permission_tool_call: ToolCallUpdate::new(
+            tool_call_id,
+            ToolCallUpdateFields::new()
+                .kind(ToolKind::Think)
+                .status(ToolCallStatus::Pending)
+                .title(question.header.clone())
+                .content(vec![ToolCallContent::Content(Content::new(
+                    ContentBlock::Text(TextContent::new(question_text)),
+                ))])
+                .raw_input(raw_input),
+        ),
+        options: permission_options,
+        question_id: question.id.clone(),
+        option_map,
+    })
+}
+
+fn format_user_input_question(question: &RequestUserInputQuestion) -> String {
+    let mut sections = vec![question.question.trim().to_string()];
+    if question.is_other {
+        sections.push(
+            "Custom free-form answers are not supported by Zed's ACP permission UI yet. Choose one of the fixed options, or cancel."
+                .to_string(),
+        );
+    }
+    if let Some(options) = &question.options {
+        let descriptions = options
+            .iter()
+            .filter(|option| !option.description.trim().is_empty())
+            .map(|option| format!("{}: {}", option.label, option.description.trim()))
+            .collect::<Vec<_>>();
+        if !descriptions.is_empty() {
+            sections.push(descriptions.join("\n"));
+        }
+    }
+    sections.join("\n\n")
+}
+
+fn format_unsupported_user_input_request(event: &RequestUserInputEvent) -> String {
+    let mut sections = vec![
+        "Codex requested user input, but this ACP adapter can only display fixed-option prompts without free-form or secret inputs in Zed right now."
+            .to_string(),
+    ];
+    sections.extend(event.questions.iter().map(format_user_input_question));
+    sections.join("\n\n")
 }
 
 fn build_supported_mcp_elicitation_permission_request(
@@ -744,6 +894,7 @@ struct PromptState {
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
+    proposed_plan_buffers: HashMap<String, String>,
 }
 
 impl PromptState {
@@ -765,6 +916,7 @@ impl PromptState {
             response_tx: Some(response_tx),
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
+            proposed_plan_buffers: HashMap::new(),
         }
     }
 
@@ -779,6 +931,7 @@ impl PromptState {
         for (_, interaction) in self.pending_permission_interactions.drain() {
             interaction.task.abort();
         }
+        self.proposed_plan_buffers.clear();
     }
 
     fn spawn_permission_request(
@@ -815,9 +968,35 @@ impl PromptState {
         }
     }
 
+    fn spawn_user_input_permission_request(
+        &mut self,
+        client: &SessionClient,
+        turn_id: String,
+        supported_request: SupportedUserInputPermissionRequest,
+        answers: HashMap<String, RequestUserInputAnswer>,
+        remaining_requests: Vec<SupportedUserInputPermissionRequest>,
+    ) {
+        let tool_call_id = supported_request.tool_call_id;
+        client.send_tool_call(supported_request.tool_call);
+        self.spawn_permission_request(
+            client,
+            supported_request.request_key,
+            PendingPermissionRequest::UserInput {
+                turn_id,
+                tool_call_id,
+                question_id: supported_request.question_id,
+                option_map: supported_request.option_map,
+                answers,
+                remaining_requests,
+            },
+            supported_request.permission_tool_call,
+            supported_request.options,
+        );
+    }
+
     async fn handle_permission_request_resolved(
         &mut self,
-        _client: &SessionClient,
+        client: &SessionClient,
         request_key: String,
         response: Result<RequestPermissionResponse, Error>,
     ) -> Result<(), Error> {
@@ -940,6 +1119,58 @@ impl PromptState {
                         decision: response.action,
                         content: response.content,
                         meta: response.meta,
+                    })
+                    .await
+                    .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+            }
+            PendingPermissionRequest::UserInput {
+                turn_id,
+                tool_call_id,
+                question_id,
+                option_map,
+                mut answers,
+                mut remaining_requests,
+            } => {
+                if let RequestPermissionOutcome::Selected(SelectedPermissionOutcome {
+                    option_id,
+                    ..
+                }) = response.outcome
+                    && let Some(answer) = option_map.get(option_id.0.as_ref()).cloned()
+                {
+                    answers.insert(
+                        question_id,
+                        RequestUserInputAnswer {
+                            answers: vec![answer],
+                        },
+                    );
+                } else {
+                    answers.clear();
+                    remaining_requests.clear();
+                }
+
+                client.send_tool_call_update(ToolCallUpdate::new(
+                    tool_call_id,
+                    ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+                ));
+
+                if !remaining_requests.is_empty() {
+                    let next_request = remaining_requests.remove(0);
+                    self.spawn_user_input_permission_request(
+                        client,
+                        turn_id,
+                        next_request,
+                        answers,
+                        remaining_requests,
+                    );
+                    return Ok(());
+                }
+
+                let response = RequestUserInputResponse { answers };
+
+                self.thread
+                    .submit(Op::UserInputAnswer {
+                        id: turn_id,
+                        response,
                     })
                     .await
                     .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -1074,6 +1305,13 @@ impl PromptState {
                 info!("Agent plan updated. Explanation: {:?}", explanation);
                 client.update_plan(plan);
             }
+            EventMsg::PlanDelta(event) => {
+                info!(
+                    "Proposed plan delta received: thread_id={}, turn_id={}, item_id={}, delta={:?}",
+                    event.thread_id, event.turn_id, event.item_id, event.delta
+                );
+                self.stream_proposed_plan_delta(client, event);
+            }
             EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id }) => {
                 info!("Web search started: call_id={}", call_id);
                 // Create a ToolCall notification for the search beginning
@@ -1200,12 +1438,16 @@ impl PromptState {
                 item,
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
+                if let TurnItem::Plan(plan_item) = item {
+                    self.complete_proposed_plan(client, plan_item.id, plan_item.text);
+                }
             }
             EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id, completed_at: _, duration_ms: _, time_to_first_token_ms: _, }) => {
                 info!(
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
                 );
+                self.proposed_plan_buffers.clear();
                 self.abort_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
@@ -1332,6 +1574,14 @@ impl PromptState {
                     drop(response_tx.send(Err(err)));
                 }
             }
+            EventMsg::RequestUserInput(event) => {
+                info!("Request user input: {} {}", event.call_id, event.turn_id);
+                if let Err(err) = self.request_user_input(client, event).await
+                    && let Some(response_tx) = self.response_tx.take()
+                {
+                    drop(response_tx.send(Err(err)));
+                }
+            }
             EventMsg::GuardianAssessment(event) => {
                 info!(
                     "Guardian assessment: id={}, status={:?}, turn_id={}",
@@ -1372,17 +1622,75 @@ impl PromptState {
             | EventMsg::CollabResumeBegin(..)
             | EventMsg::CollabResumeEnd(..)
             | EventMsg::CollabCloseBegin(..)
-            | EventMsg::CollabCloseEnd(..)
-            | EventMsg::PlanDelta(..)=> {}
+            | EventMsg::CollabCloseEnd(..) => {}
             e @ (EventMsg::McpListToolsResponse(..)
             | EventMsg::ListSkillsResponse(..)
             | EventMsg::RealtimeConversationListVoicesResponse(..)
             // Used for returning a single history entry
             | EventMsg::GetHistoryEntryResponse(..)
-            | EventMsg::DeprecationNotice(..)
-            | EventMsg::RequestUserInput(..)) => {
+            | EventMsg::DeprecationNotice(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
+        }
+    }
+
+    async fn request_user_input(
+        &mut self,
+        client: &SessionClient,
+        event: RequestUserInputEvent,
+    ) -> Result<(), Error> {
+        if let Some(mut supported_requests) = build_supported_user_input_permission_requests(&event)
+        {
+            info!(
+                "Routing request_user_input through ACP permission request: call_id={}, turn_id={}",
+                event.call_id, event.turn_id
+            );
+            let first_request = supported_requests.remove(0);
+            self.spawn_user_input_permission_request(
+                client,
+                event.turn_id,
+                first_request,
+                HashMap::new(),
+                supported_requests,
+            );
+            return Ok(());
+        }
+
+        client.send_agent_text(format_unsupported_user_input_request(&event));
+        self.thread
+            .submit(Op::UserInputAnswer {
+                id: event.turn_id,
+                response: RequestUserInputResponse {
+                    answers: HashMap::new(),
+                },
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        Ok(())
+    }
+
+    fn stream_proposed_plan_delta(&mut self, client: &SessionClient, event: PlanDeltaEvent) {
+        let is_first_delta = !self.proposed_plan_buffers.contains_key(&event.item_id);
+        self.proposed_plan_buffers
+            .entry(event.item_id)
+            .or_default()
+            .push_str(&event.delta);
+
+        if is_first_delta {
+            client.send_agent_text(PROPOSED_PLAN_HEADER);
+        }
+        client.send_agent_text(event.delta);
+    }
+
+    fn complete_proposed_plan(&mut self, client: &SessionClient, item_id: String, text: String) {
+        let streamed_text = self.proposed_plan_buffers.remove(&item_id);
+        if streamed_text
+            .as_deref()
+            .is_none_or(|streamed_text| streamed_text.trim().is_empty())
+            && !text.trim().is_empty()
+        {
+            client.send_agent_text(format!("{PROPOSED_PLAN_HEADER}{text}"));
         }
     }
 
@@ -2582,6 +2890,8 @@ struct ThreadActor<A> {
     config: Config,
     /// The models available for this thread.
     models_manager: Arc<dyn ModelsManagerImpl>,
+    /// Service tier that was active before /fast enabled Fast mode.
+    service_tier_before_fast: Option<Option<ServiceTier>>,
     /// Internal message sender used to route spawned interaction results back to the actor.
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     /// A sender for each interested `Op` submission that needs events routed.
@@ -2612,6 +2922,7 @@ impl<A: Auth> ThreadActor<A> {
             thread,
             config,
             models_manager,
+            service_tier_before_fast: None,
             resolution_tx,
             submissions: HashMap::new(),
             message_rx,
@@ -2762,6 +3073,16 @@ impl<A: Auth> ThreadActor<A> {
                 "summarize conversation to prevent hitting the context limit",
             ),
             AvailableCommand::new("undo", "undo Codex’s most recent turn"),
+            AvailableCommand::new("plan", "switch Plan mode on or off").input(
+                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                    "off, or optional planning prompt",
+                )),
+            ),
+            AvailableCommand::new("fast", "toggle Fast mode").input(
+                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                    "on, off, or status",
+                )),
+            ),
             AvailableCommand::new("logout", "logout of Codex"),
         ]
     }
@@ -3118,6 +3439,63 @@ impl<A: Auth> ThreadActor<A> {
             match name {
                 "compact" => op = Op::Compact,
                 "undo" => op = Op::Undo,
+                "plan" => {
+                    let prompt = rest.trim();
+                    let mut plan_parts = prompt.splitn(2, char::is_whitespace);
+                    let plan_subcommand = plan_parts.next().unwrap_or_default();
+                    let plan_rest = plan_parts.next().unwrap_or_default().trim_start();
+
+                    if prompt.is_empty() || (plan_subcommand == "on" && plan_rest.is_empty()) {
+                        let collaboration_mode =
+                            self.collaboration_mode_for(ModeKind::Plan).await?;
+                        self.submit_override_turn_context(Some(collaboration_mode), None)
+                            .await?;
+                        self.client.send_agent_text("Plan mode enabled.");
+                        drop(response_tx.send(Ok(StopReason::EndTurn)));
+                        return Ok(response_rx);
+                    }
+
+                    let (collaboration_mode, prompt) = if plan_subcommand == "off" {
+                        let collaboration_mode =
+                            self.collaboration_mode_for(ModeKind::Default).await?;
+                        if plan_rest.is_empty() {
+                            self.submit_override_turn_context(Some(collaboration_mode), None)
+                                .await?;
+                            self.client.send_agent_text("Plan mode disabled.");
+                            drop(response_tx.send(Ok(StopReason::EndTurn)));
+                            return Ok(response_rx);
+                        }
+                        self.submit_override_turn_context(Some(collaboration_mode.clone()), None)
+                            .await?;
+                        (collaboration_mode, plan_rest)
+                    } else {
+                        (self.collaboration_mode_for(ModeKind::Plan).await?, prompt)
+                    };
+
+                    op = Op::UserInputWithTurnContext {
+                        items: slash_command_items_with_text(&items, prompt),
+                        environments: None,
+                        final_output_json_schema: None,
+                        responsesapi_client_metadata: None,
+                        cwd: None,
+                        approval_policy: None,
+                        approvals_reviewer: None,
+                        sandbox_policy: None,
+                        permission_profile: None,
+                        windows_sandbox_level: None,
+                        model: None,
+                        effort: None,
+                        summary: None,
+                        service_tier: None,
+                        collaboration_mode: Some(collaboration_mode),
+                        personality: None,
+                    };
+                }
+                "fast" => {
+                    self.handle_fast_command(rest).await?;
+                    drop(response_tx.send(Ok(StopReason::EndTurn)));
+                    return Ok(response_rx);
+                }
                 "init" => {
                     op = Op::UserInput {
                         items: vec![UserInput::Text {
@@ -3210,6 +3588,109 @@ impl<A: Auth> ThreadActor<A> {
         self.submissions.insert(submission_id, state);
 
         Ok(response_rx)
+    }
+
+    async fn collaboration_mode_for(&self, mode: ModeKind) -> Result<CollaborationMode, Error> {
+        let base = CollaborationMode {
+            mode: ModeKind::Default,
+            settings: Settings {
+                model: self.get_current_model().await,
+                reasoning_effort: self.config.model_reasoning_effort,
+                developer_instructions: None,
+            },
+        };
+        let mask = builtin_collaboration_mode_presets(CollaborationModesConfig {
+            default_mode_request_user_input: false,
+        })
+        .into_iter()
+        .find(|mask| mask.mode == Some(mode))
+        .ok_or_else(|| Error::invalid_params().data("Unsupported collaboration mode"))?;
+
+        Ok(base.apply_mask(&mask))
+    }
+
+    async fn submit_override_turn_context(
+        &self,
+        collaboration_mode: Option<CollaborationMode>,
+        service_tier: Option<Option<ServiceTier>>,
+    ) -> Result<(), Error> {
+        self.thread
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                model: None,
+                effort: None,
+                summary: None,
+                collaboration_mode,
+                personality: None,
+                windows_sandbox_level: None,
+                service_tier,
+                approvals_reviewer: None,
+                permission_profile: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        Ok(())
+    }
+
+    async fn handle_fast_command(&mut self, rest: &str) -> Result<(), Error> {
+        match rest.trim().to_ascii_lowercase().as_str() {
+            "" => {
+                if matches!(self.config.service_tier, Some(ServiceTier::Fast)) {
+                    self.disable_fast_mode().await?;
+                } else {
+                    self.enable_fast_mode().await?;
+                }
+            }
+            "on" => self.enable_fast_mode().await?,
+            "off" => self.disable_fast_mode().await?,
+            "status" => {
+                let status = if matches!(self.config.service_tier, Some(ServiceTier::Fast)) {
+                    "on"
+                } else {
+                    "off"
+                };
+                self.client
+                    .send_agent_text(format!("Fast mode is {status}."));
+            }
+            _ => self.client.send_agent_text("Usage: /fast [on|off|status]"),
+        }
+
+        Ok(())
+    }
+
+    async fn enable_fast_mode(&mut self) -> Result<(), Error> {
+        if !matches!(self.config.service_tier, Some(ServiceTier::Fast)) {
+            self.service_tier_before_fast = Some(self.config.service_tier);
+        }
+        self.set_service_tier(Some(ServiceTier::Fast)).await
+    }
+
+    async fn disable_fast_mode(&mut self) -> Result<(), Error> {
+        let service_tier = if matches!(self.config.service_tier, Some(ServiceTier::Fast)) {
+            self.service_tier_before_fast.take().unwrap_or(None)
+        } else {
+            self.config.service_tier
+        };
+        self.set_service_tier(service_tier).await
+    }
+
+    async fn set_service_tier(&mut self, service_tier: Option<ServiceTier>) -> Result<(), Error> {
+        self.submit_override_turn_context(None, Some(service_tier))
+            .await?;
+        self.config.service_tier = service_tier;
+
+        let status = if matches!(service_tier, Some(ServiceTier::Fast)) {
+            "on"
+        } else {
+            "off"
+        };
+        self.client
+            .send_agent_text(format!("Fast mode is {status}."));
+
+        Ok(())
     }
 
     async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
@@ -4022,6 +4503,18 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
     Some((name, rest))
 }
 
+fn slash_command_items_with_text(content: &[UserInput], text: &str) -> Vec<UserInput> {
+    let mut items = Vec::new();
+    if !text.is_empty() {
+        items.push(UserInput::Text {
+            text: text.to_owned(),
+            text_elements: vec![],
+        });
+    }
+    items.extend(content.iter().skip(1).cloned());
+    items
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -4031,7 +4524,12 @@ mod tests {
 
     use agent_client_protocol::schema::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
-    use codex_protocol::config_types::ModeKind;
+    use codex_protocol::ThreadId;
+    use codex_protocol::config_types::{ModeKind, ServiceTier};
+    use codex_protocol::items::PlanItem;
+    use codex_protocol::request_user_input::{
+        RequestUserInputQuestion, RequestUserInputQuestionOption,
+    };
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
     use super::*;
@@ -4189,6 +4687,403 @@ mod tests {
             }],
             "ops don't match {ops:?}"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_command_enables_plan_mode() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/plan".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Plan mode enabled."
+        ));
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(
+            &ops[0],
+            Op::OverrideTurnContext {
+                collaboration_mode: Some(collaboration_mode),
+                ..
+            } if collaboration_mode.mode == ModeKind::Plan
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_command_with_prompt_submits_plan_turn() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["/plan draft a migration plan".into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "draft a migration plan"
+        ));
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(
+            &ops[0],
+            Op::UserInputWithTurnContext {
+                items,
+                collaboration_mode: Some(collaboration_mode),
+                ..
+            } if collaboration_mode.mode == ModeKind::Plan
+                && matches!(items.as_slice(), [UserInput::Text { text, .. }] if text == "draft a migration plan")
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_off_command_disables_plan_mode() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/plan off".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Plan mode disabled."
+        ));
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(
+            &ops[0],
+            Op::OverrideTurnContext {
+                collaboration_mode: Some(collaboration_mode),
+                ..
+            } if collaboration_mode.mode == ModeKind::Default
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_off_with_prompt_submits_default_turn() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/plan off implement it".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "implement it"
+        ));
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(
+            &ops[0],
+            Op::OverrideTurnContext {
+                collaboration_mode: Some(collaboration_mode),
+                ..
+            } if collaboration_mode.mode == ModeKind::Default
+        ));
+        assert!(matches!(
+            &ops[1],
+            Op::UserInputWithTurnContext {
+                items,
+                collaboration_mode: Some(collaboration_mode),
+                ..
+            } if collaboration_mode.mode == ModeKind::Default
+                && matches!(items.as_slice(), [UserInput::Text { text, .. }] if text == "implement it")
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_delta_streams_proposed_plan() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state =
+            PromptState::new("submission-id".to_string(), thread, message_tx, response_tx);
+
+        prompt_state
+            .handle_event(
+                &session_client,
+                EventMsg::PlanDelta(PlanDeltaEvent {
+                    thread_id: "thread-id".to_string(),
+                    turn_id: "turn-id".to_string(),
+                    item_id: "plan-id".to_string(),
+                    delta: "- Step 1\n".to_string(),
+                }),
+            )
+            .await;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 2);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == PROPOSED_PLAN_HEADER
+        ));
+        assert!(matches!(
+            &notifications[1].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "- Step 1\n"
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_completed_plan_item_without_delta_is_rendered() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state =
+            PromptState::new("submission-id".to_string(), thread, message_tx, response_tx);
+
+        prompt_state
+            .handle_event(
+                &session_client,
+                EventMsg::ItemCompleted(ItemCompletedEvent {
+                    thread_id: ThreadId::new(),
+                    turn_id: "turn-id".to_string(),
+                    item: TurnItem::Plan(PlanItem {
+                        id: "plan-id".to_string(),
+                        text: "## Summary\nImplement the demo.\n".to_string(),
+                    }),
+                }),
+            )
+            .await;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "\n\n### Proposed Plan\n\n## Summary\nImplement the demo.\n"
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_completed_plan_item_after_delta_is_not_duplicated() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state =
+            PromptState::new("submission-id".to_string(), thread, message_tx, response_tx);
+
+        prompt_state
+            .handle_event(
+                &session_client,
+                EventMsg::PlanDelta(PlanDeltaEvent {
+                    thread_id: "thread-id".to_string(),
+                    turn_id: "turn-id".to_string(),
+                    item_id: "plan-id".to_string(),
+                    delta: "- Step 1\n".to_string(),
+                }),
+            )
+            .await;
+        prompt_state
+            .handle_event(
+                &session_client,
+                EventMsg::ItemCompleted(ItemCompletedEvent {
+                    thread_id: ThreadId::new(),
+                    turn_id: "turn-id".to_string(),
+                    item: TurnItem::Plan(PlanItem {
+                        id: "plan-id".to_string(),
+                        text: "- Step 1\n".to_string(),
+                    }),
+                }),
+            )
+            .await;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fast_command_sets_fast_service_tier() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/fast on".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Fast mode is on."
+        ));
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(
+            &ops[0],
+            Op::OverrideTurnContext {
+                service_tier: Some(Some(ServiceTier::Fast)),
+                ..
+            }
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fast_off_restores_previous_non_fast_service_tier() -> anyhow::Result<()> {
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config.service_tier = Some(ServiceTier::Flex);
+        let (session_id, _client, thread, message_tx, _handle) = setup_with_config(config).await?;
+
+        let (on_response_tx, on_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/fast on".into()]),
+            response_tx: on_response_tx,
+        })?;
+        assert_eq!(on_response_rx.await??.await??, StopReason::EndTurn);
+
+        let (off_response_tx, off_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/fast off".into()]),
+            response_tx: off_response_tx,
+        })?;
+        assert_eq!(off_response_rx.await??.await??, StopReason::EndTurn);
+        drop(message_tx);
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(
+            &ops[0],
+            Op::OverrideTurnContext {
+                service_tier: Some(Some(ServiceTier::Fast)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &ops[1],
+            Op::OverrideTurnContext {
+                service_tier: Some(Some(ServiceTier::Flex)),
+                ..
+            }
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fast_status_reports_without_submitting_op() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/fast status".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Fast mode is on." || text == "Fast mode is off."
+        ));
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(ops.is_empty());
 
         Ok(())
     }
@@ -4418,17 +5313,29 @@ mod tests {
         UnboundedSender<ThreadMessage>,
         tokio::task::JoinHandle<()>,
     )> {
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        setup_with_config(config).await
+    }
+
+    async fn setup_with_config(
+        config: Config,
+    ) -> anyhow::Result<(
+        SessionId,
+        Arc<StubClient>,
+        Arc<StubCodexThread>,
+        UnboundedSender<ThreadMessage>,
+        tokio::task::JoinHandle<()>,
+    )> {
         let session_id = SessionId::new("test");
         let client = Arc::new(StubClient::new());
         let session_client =
             SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
         let conversation = Arc::new(StubCodexThread::new());
         let models_manager = Arc::new(StubModelsManager);
-        let config = Config::load_with_cli_overrides_and_harness_overrides(
-            vec![],
-            ConfigOverrides::default(),
-        )
-        .await?;
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -4504,7 +5411,7 @@ mod tests {
                 self.ops.lock().unwrap().push(op.clone());
 
                 match op {
-                    Op::UserInput { items, .. } => {
+                    Op::UserInput { items, .. } | Op::UserInputWithTurnContext { items, .. } => {
                         *self.active_prompt_id.lock().unwrap() = Some(id.to_string());
                         let prompt = items
                             .into_iter()
@@ -4764,8 +5671,10 @@ mod tests {
                     Op::ExecApproval { .. }
                     | Op::ResolveElicitation { .. }
                     | Op::RequestPermissionsResponse { .. }
+                    | Op::UserInputAnswer { .. }
                     | Op::PatchApproval { .. }
-                    | Op::Interrupt => {}
+                    | Op::Interrupt
+                    | Op::OverrideTurnContext { .. } => {}
                     Op::Shutdown => {
                         if let Some(active_prompt_id) = self.active_prompt_id.lock().unwrap().take()
                         {
@@ -5008,6 +5917,512 @@ mod tests {
                 turn_id,
                 decision: ReviewDecision::Denied,
             }) if id == "approval-id" && turn_id.as_deref() == Some("turn-id")
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_request_user_input_routes_to_permission_request() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::with_permission_responses(vec![
+            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                SelectedPermissionOutcome::new("option-1"),
+            )),
+        ]));
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state = PromptState::new(
+            "submission-id".to_string(),
+            thread.clone(),
+            message_tx,
+            response_tx,
+        );
+
+        prompt_state
+            .request_user_input(
+                &session_client,
+                RequestUserInputEvent {
+                    call_id: "call-id".to_string(),
+                    turn_id: "turn-id".to_string(),
+                    questions: vec![RequestUserInputQuestion {
+                        id: "target".to_string(),
+                        header: "Choose app type".to_string(),
+                        question: "What kind of app should I plan?".to_string(),
+                        is_other: false,
+                        is_secret: false,
+                        options: Some(vec![
+                            RequestUserInputQuestionOption {
+                                label: "CLI".to_string(),
+                                description: "Command-line demo".to_string(),
+                            },
+                            RequestUserInputQuestionOption {
+                                label: "Streamlit".to_string(),
+                                description: "Web UI demo".to_string(),
+                            },
+                        ]),
+                    }],
+                },
+            )
+            .await?;
+
+        let ThreadMessage::PermissionRequestResolved {
+            submission_id,
+            request_key,
+            response,
+        } = message_rx.recv().await.unwrap()
+        else {
+            panic!("expected permission resolution message");
+        };
+        assert_eq!(submission_id, "submission-id");
+        prompt_state
+            .handle_permission_request_resolved(&session_client, request_key, response)
+            .await?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let tool_calls = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCall(tool_call) => Some(tool_call),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(
+            tool_calls[0].tool_call_id,
+            ToolCallId::new("request-user-input:call-id")
+        );
+        assert_eq!(tool_calls[0].title, "Choose app type");
+        assert!(
+            matches!(
+                tool_calls[0].content.as_slice(),
+                [ToolCallContent::Content(Content {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                })] if text.contains("What kind of app should I plan?")
+                    && text.contains("CLI: Command-line demo")
+                    && text.contains("Streamlit: Web UI demo")
+            ),
+            "tool call content should include the question and options: {:?}",
+            tool_calls[0].content
+        );
+        let completed_updates = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCallUpdate(update)
+                    if update.fields.status == Some(ToolCallStatus::Completed) =>
+                {
+                    Some(update)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completed_updates.len(), 1);
+        assert_eq!(
+            completed_updates[0].tool_call_id,
+            ToolCallId::new("request-user-input:call-id")
+        );
+        drop(notifications);
+
+        let requests = client.permission_requests.lock().unwrap();
+        let request = requests.last().unwrap();
+        assert_eq!(
+            request.tool_call.tool_call_id,
+            ToolCallId::new("request-user-input:call-id")
+        );
+        let option_names = request
+            .options
+            .iter()
+            .map(|option| option.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(option_names, vec!["CLI", "Streamlit", "Cancel"]);
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.last(),
+            Some(Op::UserInputAnswer {
+                id,
+                response,
+            }) if id == "turn-id"
+                && response
+                    .answers
+                    .get("target")
+                    .is_some_and(|answer| answer.answers == vec!["Streamlit".to_string()])
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_request_user_input_routes_multiple_questions_sequentially() -> anyhow::Result<()>
+    {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::with_permission_responses(vec![
+            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                SelectedPermissionOutcome::new("option-0"),
+            )),
+            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                SelectedPermissionOutcome::new("option-1"),
+            )),
+            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                SelectedPermissionOutcome::new("option-0"),
+            )),
+        ]));
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state = PromptState::new(
+            "submission-id".to_string(),
+            thread.clone(),
+            message_tx,
+            response_tx,
+        );
+
+        prompt_state
+            .request_user_input(
+                &session_client,
+                RequestUserInputEvent {
+                    call_id: "call-id".to_string(),
+                    turn_id: "turn-id".to_string(),
+                    questions: vec![
+                        RequestUserInputQuestion {
+                            id: "view".to_string(),
+                            header: "Image view".to_string(),
+                            question: "Which image view should be used?".to_string(),
+                            is_other: false,
+                            is_secret: false,
+                            options: Some(vec![
+                                RequestUserInputQuestionOption {
+                                    label: "side".to_string(),
+                                    description: "Use side images only".to_string(),
+                                },
+                                RequestUserInputQuestionOption {
+                                    label: "side+top".to_string(),
+                                    description: "Use both image views".to_string(),
+                                },
+                            ]),
+                        },
+                        RequestUserInputQuestion {
+                            id: "split".to_string(),
+                            header: "Dataset split".to_string(),
+                            question: "How should the dataset be split?".to_string(),
+                            is_other: false,
+                            is_secret: false,
+                            options: Some(vec![
+                                RequestUserInputQuestionOption {
+                                    label: "provided".to_string(),
+                                    description: "Use the provided splits".to_string(),
+                                },
+                                RequestUserInputQuestionOption {
+                                    label: "merge-train-val".to_string(),
+                                    description: "Merge train and validation".to_string(),
+                                },
+                            ]),
+                        },
+                        RequestUserInputQuestion {
+                            id: "mapping".to_string(),
+                            header: "Name mapping".to_string(),
+                            question: "How should unmatched names be handled?".to_string(),
+                            is_other: false,
+                            is_secret: false,
+                            options: Some(vec![
+                                RequestUserInputQuestionOption {
+                                    label: "explicit".to_string(),
+                                    description: "Use an explicit mapping table".to_string(),
+                                },
+                                RequestUserInputQuestionOption {
+                                    label: "drop".to_string(),
+                                    description: "Drop unmatched names".to_string(),
+                                },
+                            ]),
+                        },
+                    ],
+                },
+            )
+            .await?;
+
+        for index in 0..3 {
+            let ThreadMessage::PermissionRequestResolved {
+                submission_id,
+                request_key,
+                response,
+            } = message_rx.recv().await.unwrap()
+            else {
+                panic!("expected permission resolution message");
+            };
+            assert_eq!(submission_id, "submission-id");
+            prompt_state
+                .handle_permission_request_resolved(&session_client, request_key, response)
+                .await?;
+            if index < 2 {
+                assert!(thread.ops.lock().unwrap().is_empty());
+            }
+        }
+
+        let requests = client.permission_requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let request_titles = requests
+            .iter()
+            .map(|request| request.tool_call.fields.title.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            request_titles,
+            vec![
+                Some("Image view"),
+                Some("Dataset split"),
+                Some("Name mapping")
+            ]
+        );
+        drop(requests);
+
+        let notifications = client.notifications.lock().unwrap();
+        let tool_call_ids = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCall(tool_call) => Some(tool_call.tool_call_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_call_ids,
+            vec![
+                ToolCallId::new("request-user-input:call-id:0"),
+                ToolCallId::new("request-user-input:call-id:1"),
+                ToolCallId::new("request-user-input:call-id:2"),
+            ]
+        );
+        let completed_update_count = notifications
+            .iter()
+            .filter(|notification| {
+                matches!(
+                    &notification.update,
+                    SessionUpdate::ToolCallUpdate(update)
+                        if update.fields.status == Some(ToolCallStatus::Completed)
+                )
+            })
+            .count();
+        assert_eq!(completed_update_count, 3);
+        drop(notifications);
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(
+            ops.last(),
+            Some(Op::UserInputAnswer {
+                id,
+                response,
+            }) if id == "turn-id"
+                && response
+                    .answers
+                    .get("view")
+                    .is_some_and(|answer| answer.answers == vec!["side".to_string()])
+                && response
+                    .answers
+                    .get("split")
+                    .is_some_and(|answer| answer.answers == vec!["merge-train-val".to_string()])
+                && response
+                    .answers
+                    .get("mapping")
+                    .is_some_and(|answer| answer.answers == vec!["explicit".to_string()])
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_request_user_input_keys_include_call_id() -> anyhow::Result<()> {
+        let event_a = RequestUserInputEvent {
+            call_id: "call-a".to_string(),
+            turn_id: "turn-id".to_string(),
+            questions: vec![RequestUserInputQuestion {
+                id: "target".to_string(),
+                header: "Choose app type".to_string(),
+                question: "What kind of app should I plan?".to_string(),
+                is_other: false,
+                is_secret: false,
+                options: Some(vec![RequestUserInputQuestionOption {
+                    label: "CLI".to_string(),
+                    description: "Command-line demo".to_string(),
+                }]),
+            }],
+        };
+        let event_b = RequestUserInputEvent {
+            call_id: "call-b".to_string(),
+            ..event_a.clone()
+        };
+
+        let mut requests_a = build_supported_user_input_permission_requests(&event_a).unwrap();
+        let mut requests_b = build_supported_user_input_permission_requests(&event_b).unwrap();
+        assert_eq!(requests_a.len(), 1);
+        assert_eq!(requests_b.len(), 1);
+        let request_a = requests_a.remove(0);
+        let request_b = requests_b.remove(0);
+
+        assert_eq!(request_a.request_key, "user-input:turn-id:call-a");
+        assert_eq!(request_b.request_key, "user-input:turn-id:call-b");
+        assert_ne!(request_a.request_key, request_b.request_key);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_request_user_input_with_other_falls_back() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state = PromptState::new(
+            "submission-id".to_string(),
+            thread.clone(),
+            message_tx,
+            response_tx,
+        );
+
+        prompt_state
+            .request_user_input(
+                &session_client,
+                RequestUserInputEvent {
+                    call_id: "call-id".to_string(),
+                    turn_id: "turn-id".to_string(),
+                    questions: vec![RequestUserInputQuestion {
+                        id: "target".to_string(),
+                        header: "Choose app type".to_string(),
+                        question: "What kind of app should I plan?".to_string(),
+                        is_other: true,
+                        is_secret: false,
+                        options: None,
+                    }],
+                },
+            )
+            .await?;
+
+        assert!(client.permission_requests.lock().unwrap().is_empty());
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(matches!(
+            notifications.last().map(|notification| &notification.update),
+            Some(SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            })) if text.contains("can only display fixed-option prompts")
+        ));
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.last(),
+            Some(Op::UserInputAnswer {
+                id,
+                response,
+            }) if id == "turn-id" && response.answers.is_empty()
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_request_user_input_with_other_and_fixed_options_routes_to_permission_request()
+    -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::with_permission_responses(vec![
+            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                SelectedPermissionOutcome::new("option-0"),
+            )),
+        ]));
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state = PromptState::new(
+            "submission-id".to_string(),
+            thread.clone(),
+            message_tx,
+            response_tx,
+        );
+
+        prompt_state
+            .request_user_input(
+                &session_client,
+                RequestUserInputEvent {
+                    call_id: "call-id".to_string(),
+                    turn_id: "turn-id".to_string(),
+                    questions: vec![RequestUserInputQuestion {
+                        id: "crop".to_string(),
+                        header: "Image crop".to_string(),
+                        question: "How should detected dish bounding boxes be used?".to_string(),
+                        is_other: true,
+                        is_secret: false,
+                        options: Some(vec![
+                            RequestUserInputQuestionOption {
+                                label: "Crop only".to_string(),
+                                description: "Crop train images only".to_string(),
+                            },
+                            RequestUserInputQuestionOption {
+                                label: "Draw rectangle".to_string(),
+                                description: "Use full images with overlays".to_string(),
+                            },
+                        ]),
+                    }],
+                },
+            )
+            .await?;
+
+        let ThreadMessage::PermissionRequestResolved {
+            submission_id,
+            request_key,
+            response,
+        } = message_rx.recv().await.unwrap()
+        else {
+            panic!("expected permission resolution message");
+        };
+        assert_eq!(submission_id, "submission-id");
+        prompt_state
+            .handle_permission_request_resolved(&session_client, request_key, response)
+            .await?;
+
+        let requests = client.permission_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let option_names = requests[0]
+            .options
+            .iter()
+            .map(|option| option.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(option_names, vec!["Crop only", "Draw rectangle", "Cancel"]);
+        drop(requests);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::ToolCall(ToolCall {
+                    content,
+                    ..
+                }) if matches!(
+                    content.as_slice(),
+                    [ToolCallContent::Content(Content {
+                        content: ContentBlock::Text(TextContent { text, .. }),
+                        ..
+                    })] if text.contains("Custom free-form answers are not supported")
+                )
+            )
+        }));
+        drop(notifications);
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.last(),
+            Some(Op::UserInputAnswer {
+                id,
+                response,
+            }) if id == "turn-id"
+                && response
+                    .answers
+                    .get("crop")
+                    .is_some_and(|answer| answer.answers == vec!["Crop only".to_string()])
         ));
 
         Ok(())
