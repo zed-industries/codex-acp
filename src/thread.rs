@@ -535,7 +535,7 @@ fn build_supported_user_input_question_permission_request(
     question: &RequestUserInputQuestion,
     question_index: Option<usize>,
 ) -> Option<SupportedUserInputPermissionRequest> {
-    if question.is_other || question.is_secret {
+    if question.is_secret {
         return None;
     }
     let options = question
@@ -596,6 +596,12 @@ fn build_supported_user_input_question_permission_request(
 
 fn format_user_input_question(question: &RequestUserInputQuestion) -> String {
     let mut sections = vec![question.question.trim().to_string()];
+    if question.is_other {
+        sections.push(
+            "Custom free-form answers are not supported by Zed's ACP permission UI yet. Choose one of the fixed options, or cancel."
+                .to_string(),
+        );
+    }
     if let Some(options) = &question.options {
         let descriptions = options
             .iter()
@@ -6289,10 +6295,7 @@ mod tests {
                         question: "What kind of app should I plan?".to_string(),
                         is_other: true,
                         is_secret: false,
-                        options: Some(vec![RequestUserInputQuestionOption {
-                            label: "Other".to_string(),
-                            description: "Provide a custom answer".to_string(),
-                        }]),
+                        options: None,
                     }],
                 },
             )
@@ -6316,6 +6319,110 @@ mod tests {
                 id,
                 response,
             }) if id == "turn-id" && response.answers.is_empty()
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_request_user_input_with_other_and_fixed_options_routes_to_permission_request()
+    -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::with_permission_responses(vec![
+            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                SelectedPermissionOutcome::new("option-0"),
+            )),
+        ]));
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state = PromptState::new(
+            "submission-id".to_string(),
+            thread.clone(),
+            message_tx,
+            response_tx,
+        );
+
+        prompt_state
+            .request_user_input(
+                &session_client,
+                RequestUserInputEvent {
+                    call_id: "call-id".to_string(),
+                    turn_id: "turn-id".to_string(),
+                    questions: vec![RequestUserInputQuestion {
+                        id: "crop".to_string(),
+                        header: "Image crop".to_string(),
+                        question: "How should detected dish bounding boxes be used?".to_string(),
+                        is_other: true,
+                        is_secret: false,
+                        options: Some(vec![
+                            RequestUserInputQuestionOption {
+                                label: "Crop only".to_string(),
+                                description: "Crop train images only".to_string(),
+                            },
+                            RequestUserInputQuestionOption {
+                                label: "Draw rectangle".to_string(),
+                                description: "Use full images with overlays".to_string(),
+                            },
+                        ]),
+                    }],
+                },
+            )
+            .await?;
+
+        let ThreadMessage::PermissionRequestResolved {
+            submission_id,
+            request_key,
+            response,
+        } = message_rx.recv().await.unwrap()
+        else {
+            panic!("expected permission resolution message");
+        };
+        assert_eq!(submission_id, "submission-id");
+        prompt_state
+            .handle_permission_request_resolved(&session_client, request_key, response)
+            .await?;
+
+        let requests = client.permission_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let option_names = requests[0]
+            .options
+            .iter()
+            .map(|option| option.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(option_names, vec!["Crop only", "Draw rectangle", "Cancel"]);
+        drop(requests);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::ToolCall(ToolCall {
+                    content,
+                    ..
+                }) if matches!(
+                    content.as_slice(),
+                    [ToolCallContent::Content(Content {
+                        content: ContentBlock::Text(TextContent { text, .. }),
+                        ..
+                    })] if text.contains("Custom free-form answers are not supported")
+                )
+            )
+        }));
+        drop(notifications);
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.last(),
+            Some(Op::UserInputAnswer {
+                id,
+                response,
+            }) if id == "turn-id"
+                && response
+                    .answers
+                    .get("crop")
+                    .is_some_and(|answer| answer.answers == vec!["Crop only".to_string()])
         ));
 
         Ok(())
