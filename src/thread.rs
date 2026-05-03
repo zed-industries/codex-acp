@@ -42,7 +42,10 @@ use codex_protocol::{
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
     mcp::CallToolResult,
-    models::{ActivePermissionProfile, AdditionalPermissionProfile, ResponseItem, WebSearchAction},
+    models::{
+        ActivePermissionProfile, AdditionalPermissionProfile, PermissionProfile, ResponseItem,
+        WebSearchAction,
+    },
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
     permissions::{
@@ -135,39 +138,73 @@ fn approval_matches_current_config(preset: &ApprovalPreset, config: &Config) -> 
         == std::mem::discriminant(config.permissions.approval_policy.get())
 }
 
-fn current_session_mode_id(config: &Config) -> Option<SessionModeId> {
-    if let Some(mode_id) = config
-        .permissions
-        .active_permission_profile()
-        .as_ref()
-        .and_then(|profile| session_mode_id_for_active_profile(&profile.id))
-        && let Some(preset) = APPROVAL_PRESETS
-            .iter()
-            .find(|preset| preset.id == mode_id && approval_matches_current_config(preset, config))
-    {
-        return Some(SessionModeId::new(preset.id));
-    }
-
+fn mode_id_if_approval_matches(mode_id: &'static str, config: &Config) -> Option<SessionModeId> {
     APPROVAL_PRESETS
         .iter()
-        .find(|preset| {
-            approval_matches_current_config(preset, config)
-                && &preset.permission_profile == config.permissions.permission_profile.get()
-        })
-        .or_else(|| {
-            // When the project is untrusted, the approval policy won't match
-            // since AskForApproval::UnlessTrusted is not part of the default
-            // presets. However, we still want to show the mode selector, which
-            // allows the user to choose a different mode and trust the project.
-            if config.active_project.is_untrusted() {
-                APPROVAL_PRESETS
-                    .iter()
-                    .find(|preset| preset.id == "read-only")
+        .find(|preset| preset.id == mode_id && approval_matches_current_config(preset, config))
+        .map(|preset| SessionModeId::new(preset.id))
+}
+
+fn untrusted_read_only_mode_id(config: &Config) -> Option<SessionModeId> {
+    // When the project is untrusted, the approval policy won't match since
+    // AskForApproval::UnlessTrusted is not part of the default presets.
+    // However, we still want to show the mode selector, which allows the user
+    // to choose a different mode and trust the project.
+    config
+        .active_project
+        .is_untrusted()
+        .then(|| SessionModeId::new("read-only"))
+}
+
+fn semantic_session_mode_id_for_permission_profile(config: &Config) -> Option<&'static str> {
+    let permission_profile = config.permissions.permission_profile.get();
+
+    match permission_profile {
+        PermissionProfile::Managed { .. } => {
+            let workspace_preset = APPROVAL_PRESETS.iter().find(|preset| preset.id == "auto")?;
+            if permission_profile.network_sandbox_policy()
+                != workspace_preset.permission_profile.network_sandbox_policy()
+            {
+                return None;
+            }
+
+            let file_system = permission_profile.file_system_sandbox_policy();
+            let cwd = config.cwd.as_path();
+            if file_system.has_full_disk_read_access()
+                && !file_system.has_full_disk_write_access()
+                && file_system.can_write_path_with_cwd(cwd, cwd)
+            {
+                Some("auto")
             } else {
                 None
             }
-        })
-        .map(|preset| SessionModeId::new(preset.id))
+        }
+        PermissionProfile::Disabled => Some("full-access"),
+        PermissionProfile::External { .. } => None,
+    }
+}
+
+fn current_session_mode_id(config: &Config) -> Option<SessionModeId> {
+    if let Some(active_profile) = config.permissions.active_permission_profile().as_ref() {
+        return session_mode_id_for_active_profile(&active_profile.id)
+            .and_then(|mode_id| mode_id_if_approval_matches(mode_id, config))
+            .or_else(|| untrusted_read_only_mode_id(config));
+    }
+
+    if let Some(preset) = APPROVAL_PRESETS.iter().find(|preset| {
+        approval_matches_current_config(preset, config)
+            && &preset.permission_profile == config.permissions.permission_profile.get()
+    }) {
+        return Some(SessionModeId::new(preset.id));
+    }
+
+    semantic_session_mode_id_for_permission_profile(config)
+        .and_then(|mode_id| mode_id_if_approval_matches(mode_id, config))
+        .or_else(|| untrusted_read_only_mode_id(config))
+}
+
+fn mode_trusts_project(mode_id: &str) -> bool {
+    matches!(mode_id, "auto" | "full-access")
 }
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
@@ -3310,11 +3347,13 @@ impl<A: Auth> ThreadActor<A> {
             )
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
-        set_project_trust_level(
-            &self.config.codex_home,
-            &self.config.cwd,
-            TrustLevel::Trusted,
-        )?;
+        if mode_trusts_project(preset.id) {
+            set_project_trust_level(
+                &self.config.codex_home,
+                &self.config.cwd,
+                TrustLevel::Trusted,
+            )?;
+        }
 
         Ok(())
     }
@@ -4208,12 +4247,12 @@ mod tests {
             .approval_policy
             .set(codex_protocol::protocol::AskForApproval::OnRequest)?;
 
-        let workspace_profile = codex_protocol::models::PermissionProfile::workspace_write();
+        let workspace_profile = PermissionProfile::workspace_write();
         let extra_roots = vec![config.codex_home.as_path().join("memories").try_into()?];
         let file_system_policy = workspace_profile
             .file_system_sandbox_policy()
             .with_additional_writable_roots(config.cwd.as_path(), &extra_roots);
-        let augmented_profile = codex_protocol::models::PermissionProfile::from_runtime_permissions(
+        let augmented_profile = PermissionProfile::from_runtime_permissions(
             &file_system_policy,
             workspace_profile.network_sandbox_policy(),
         );
@@ -4230,6 +4269,47 @@ mod tests {
         assert_eq!(mode_id.0.as_ref(), "auto");
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn modes_match_legacy_augmented_workspace_permission_profile() -> anyhow::Result<()> {
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config
+            .permissions
+            .approval_policy
+            .set(codex_protocol::protocol::AskForApproval::OnRequest)?;
+
+        let workspace_profile = PermissionProfile::workspace_write();
+        let extra_roots = vec![config.codex_home.as_path().join("memories").try_into()?];
+        let file_system_policy = workspace_profile
+            .file_system_sandbox_policy()
+            .with_additional_writable_roots(config.cwd.as_path(), &extra_roots);
+        let augmented_profile = PermissionProfile::from_runtime_permissions(
+            &file_system_policy,
+            workspace_profile.network_sandbox_policy(),
+        );
+        assert_ne!(augmented_profile, workspace_profile);
+
+        config
+            .permissions
+            .set_permission_profile(augmented_profile)?;
+        assert!(config.permissions.active_permission_profile().is_none());
+
+        let mode_id = current_session_mode_id(&config).expect("mode should be recognized");
+        assert_eq!(mode_id.0.as_ref(), "auto");
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_mode_does_not_trust_project() {
+        assert!(!mode_trusts_project("read-only"));
+        assert!(mode_trusts_project("auto"));
+        assert!(mode_trusts_project("full-access"));
     }
 
     #[tokio::test]
