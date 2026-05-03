@@ -42,7 +42,7 @@ use codex_protocol::{
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
     mcp::CallToolResult,
-    models::{AdditionalPermissionProfile, ResponseItem, WebSearchAction},
+    models::{ActivePermissionProfile, AdditionalPermissionProfile, ResponseItem, WebSearchAction},
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
     permissions::{
@@ -108,6 +108,67 @@ impl ClientSender for AcpConnection {
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
+const CODEX_READ_ONLY_PROFILE_ID: &str = ":read-only";
+const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
+const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
+
+fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> {
+    match profile_id {
+        CODEX_READ_ONLY_PROFILE_ID => Some("read-only"),
+        CODEX_WORKSPACE_PROFILE_ID => Some("auto"),
+        CODEX_DANGER_NO_SANDBOX_PROFILE_ID => Some("full-access"),
+        _ => None,
+    }
+}
+
+fn active_profile_id_for_session_mode(mode_id: &str) -> Option<&'static str> {
+    match mode_id {
+        "read-only" => Some(CODEX_READ_ONLY_PROFILE_ID),
+        "auto" => Some(CODEX_WORKSPACE_PROFILE_ID),
+        "full-access" => Some(CODEX_DANGER_NO_SANDBOX_PROFILE_ID),
+        _ => None,
+    }
+}
+
+fn approval_matches_current_config(preset: &ApprovalPreset, config: &Config) -> bool {
+    std::mem::discriminant(&preset.approval)
+        == std::mem::discriminant(config.permissions.approval_policy.get())
+}
+
+fn current_session_mode_id(config: &Config) -> Option<SessionModeId> {
+    if let Some(mode_id) = config
+        .permissions
+        .active_permission_profile()
+        .as_ref()
+        .and_then(|profile| session_mode_id_for_active_profile(&profile.id))
+        && let Some(preset) = APPROVAL_PRESETS
+            .iter()
+            .find(|preset| preset.id == mode_id && approval_matches_current_config(preset, config))
+    {
+        return Some(SessionModeId::new(preset.id));
+    }
+
+    APPROVAL_PRESETS
+        .iter()
+        .find(|preset| {
+            approval_matches_current_config(preset, config)
+                && &preset.permission_profile == config.permissions.permission_profile.get()
+        })
+        .or_else(|| {
+            // When the project is untrusted, the approval policy won't match
+            // since AskForApproval::UnlessTrusted is not part of the default
+            // presets. However, we still want to show the mode selector, which
+            // allows the user to choose a different mode and trust the project.
+            if config.active_project.is_untrusted() {
+                APPROVAL_PRESETS
+                    .iter()
+                    .find(|preset| preset.id == "read-only")
+            } else {
+                None
+            }
+        })
+        .map(|preset| SessionModeId::new(preset.id))
+}
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
 pub trait CodexThreadImpl: Send + Sync {
@@ -2790,30 +2851,7 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     fn modes(&self) -> Option<SessionModeState> {
-        let current_mode_id = APPROVAL_PRESETS
-            .iter()
-            .find(|preset| {
-                std::mem::discriminant(&preset.approval)
-                    == std::mem::discriminant(self.config.permissions.approval_policy.get())
-                    && &preset.permission_profile
-                        == self.config.permissions.permission_profile.get()
-            })
-            .or_else(|| {
-                // When the project is untrusted, the above code won't match
-                // since AskForApproval::UnlessTrusted is not part of the
-                // default presets. However, in this case we still want to show
-                // the mode selector, which allows the user to choose a
-                // different mode (which will set the project to be trusted)
-                // See https://github.com/zed-industries/zed/issues/48132
-                if self.config.active_project.is_untrusted() {
-                    APPROVAL_PRESETS
-                        .iter()
-                        .find(|preset| preset.id == "read-only")
-                } else {
-                    None
-                }
-            })
-            .map(|preset| SessionModeId::new(preset.id))?;
+        let current_mode_id = current_session_mode_id(&self.config)?;
 
         Some(SessionModeState::new(
             current_mode_id,
@@ -3266,7 +3304,10 @@ impl<A: Auth> ThreadActor<A> {
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
         self.config
             .permissions
-            .set_permission_profile(preset.permission_profile.clone())
+            .set_permission_profile_with_active_profile(
+                preset.permission_profile.clone(),
+                active_profile_id_for_session_mode(preset.id).map(ActivePermissionProfile::new),
+            )
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
         set_project_trust_level(
@@ -4151,6 +4192,42 @@ mod tests {
             guardian_action_summary(&action),
             Some("exec /bin/ls -l".to_string())
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn modes_match_augmented_workspace_permission_profile() -> anyhow::Result<()> {
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config
+            .permissions
+            .approval_policy
+            .set(codex_protocol::protocol::AskForApproval::OnRequest)?;
+
+        let workspace_profile = codex_protocol::models::PermissionProfile::workspace_write();
+        let extra_roots = vec![config.codex_home.as_path().join("memories").try_into()?];
+        let file_system_policy = workspace_profile
+            .file_system_sandbox_policy()
+            .with_additional_writable_roots(config.cwd.as_path(), &extra_roots);
+        let augmented_profile = codex_protocol::models::PermissionProfile::from_runtime_permissions(
+            &file_system_policy,
+            workspace_profile.network_sandbox_policy(),
+        );
+        assert_ne!(augmented_profile, workspace_profile);
+
+        config
+            .permissions
+            .set_permission_profile_with_active_profile(
+                augmented_profile,
+                Some(ActivePermissionProfile::new(CODEX_WORKSPACE_PROFILE_ID)),
+            )?;
+
+        let mode_id = current_session_mode_id(&config).expect("mode should be recognized");
+        assert_eq!(mode_id.0.as_ref(), "auto");
 
         Ok(())
     }
