@@ -300,7 +300,7 @@ impl CodexAgent {
         if self.config.model_provider_id == "openai"
             && self.auth_manager.auth().await.is_none()
             // Check if anything changed on disk since the last reload
-            && !self.auth_manager.reload()
+            && !self.auth_manager.reload().await
         {
             return Err(Error::auth_required());
         }
