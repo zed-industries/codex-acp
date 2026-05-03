@@ -61,9 +61,9 @@ use codex_protocol::{
         NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
         PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
         ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem,
-        StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent, TurnAbortedEvent,
-        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
-        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
+        TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -678,6 +678,22 @@ fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
     }
 }
 
+fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> String {
+    let status = match event.goal.status {
+        ThreadGoalStatus::Active => "active",
+        ThreadGoalStatus::Paused => "paused",
+        ThreadGoalStatus::BudgetLimited => "budget limited",
+        ThreadGoalStatus::Complete => "complete",
+    };
+
+    let objective = event.goal.objective.trim();
+    if objective.contains('\n') {
+        format!("Goal updated ({status}):\n{objective}")
+    } else {
+        format!("Goal updated ({status}): {objective}")
+    }
+}
+
 enum SubmissionState {
     /// User prompts, including slash commands like /init, /review, /compact, /undo.
     Prompt(PromptState),
@@ -1074,6 +1090,7 @@ impl PromptState {
             }
             EventMsg::ThreadGoalUpdated(event) => {
                 info!("Thread goal updated: {:?}", event.goal.objective);
+                client.send_agent_text(format_thread_goal_update(&event));
             }
             EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
                 // Send this to the client via session/update notification
@@ -3373,6 +3390,10 @@ impl<A: Auth> ThreadActor<A> {
             EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text }) => {
                 self.client.send_agent_thought(text.clone());
             }
+            EventMsg::ThreadGoalUpdated(event) => {
+                self.client
+                    .send_agent_text(format_thread_goal_update(event));
+            }
             // Skip other event types during replay - they either:
             // - Are transient (deltas, turn lifecycle)
             // - Don't have direct ACP equivalents
@@ -4028,6 +4049,7 @@ mod tests {
     use agent_client_protocol::schema::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
     use codex_protocol::config_types::ModeKind;
+    use codex_protocol::{ThreadId, protocol::ThreadGoal};
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
     use super::*;
@@ -4055,6 +4077,34 @@ mod tests {
                 ..
             }) if text == "Hi"
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_thread_goal_updated_is_sent_as_agent_message() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["thread-goal-update".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text == "Goal updated (active): Ship the goal update"
+            )
+        }));
 
         Ok(())
     }
@@ -4587,6 +4637,40 @@ mod tests {
                                 duration_ms: None,
                                 time_to_first_token_ms: None,
                             }));
+                        } else if prompt == "thread-goal-update" {
+                            let turn_id = id.to_string();
+                            let thread_id = ThreadId::default();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
+                                        thread_id,
+                                        turn_id: Some(turn_id.clone()),
+                                        goal: ThreadGoal {
+                                            thread_id,
+                                            objective: "Ship the goal update".to_string(),
+                                            status: ThreadGoalStatus::Active,
+                                            token_budget: Some(100),
+                                            tokens_used: 10,
+                                            time_used_seconds: 2,
+                                            created_at: 1,
+                                            updated_at: 2,
+                                        },
+                                    }),
+                                })
+                                .unwrap();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                                        last_agent_message: None,
+                                        turn_id,
+                                        completed_at: None,
+                                        duration_ms: None,
+                                        time_to_first_token_ms: None,
+                                    }),
+                                })
+                                .unwrap();
                         } else if prompt == "approval-block" {
                             self.op_tx
                                 .send(Event {
