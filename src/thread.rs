@@ -150,7 +150,9 @@ impl ModelsManagerImpl for Arc<dyn ModelsManager> {
     }
 
     fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
-        Box::pin(async move { self.list_models().await })
+        Box::pin(async move {
+            ModelsManager::list_models(self.as_ref(), RefreshStrategy::OnlineIfUncached).await
+        })
     }
 }
 
