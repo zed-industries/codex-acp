@@ -15,14 +15,13 @@ use agent_client_protocol as acp;
 use codex_config::{McpServerConfig, McpServerTransportConfig};
 use codex_core::{
     NewThread, RolloutRecorder, SortDirection, ThreadManager, ThreadSortKey, config::Config,
-    find_thread_path_by_id_str, parse_cursor,
+    find_thread_path_by_id_str, parse_cursor, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, EnvironmentManagerArgs, ExecServerRuntimePaths};
 use codex_login::{
     CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
     auth::{AuthManager, CodexAuth, read_codex_api_key_from_env, read_openai_api_key_from_env},
 };
-use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_protocol::{
     ThreadId,
     protocol::{InitialHistory, SessionSource},
@@ -61,13 +60,17 @@ const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
-    pub fn new(config: Config, codex_linux_sandbox_exe: Option<PathBuf>) -> std::io::Result<Self> {
+    pub async fn new(
+        config: Config,
+        codex_linux_sandbox_exe: Option<PathBuf>,
+    ) -> std::io::Result<Self> {
         let auth_manager = AuthManager::shared(
             config.codex_home.to_path_buf(),
             false,
             config.cli_auth_credentials_store_mode,
             Some(config.chatgpt_base_url.clone()),
-        );
+        )
+        .await;
 
         let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
         let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
@@ -75,13 +78,13 @@ impl CodexAgent {
             &config,
             auth_manager.clone(),
             SessionSource::Unknown,
-            CollaborationModesConfig {
-                // False for now
-                default_mode_request_user_input: false,
-            },
-            Arc::new(EnvironmentManager::new(EnvironmentManagerArgs::from_env(
-                ExecServerRuntimePaths::new(std::env::current_exe()?, codex_linux_sandbox_exe)?,
-            ))),
+            Arc::new(
+                EnvironmentManager::new(EnvironmentManagerArgs::new(ExecServerRuntimePaths::new(
+                    std::env::current_exe()?,
+                    codex_linux_sandbox_exe,
+                )?))
+                .await,
+            ),
             None,
         );
         Ok(Self {
@@ -480,8 +483,6 @@ impl CodexAgent {
                     .block_until_done()
                     .await
                     .map_err(Error::into_internal_error)?;
-
-                self.auth_manager.reload();
             }
             CodexAuthMethod::CodexApiKey => {
                 let api_key = read_codex_api_key_from_env().ok_or_else(|| {
@@ -507,7 +508,7 @@ impl CodexAgent {
             }
         }
 
-        self.auth_manager.reload();
+        self.auth_manager.reload().await;
 
         Ok(AuthenticateResponse::new())
     }
@@ -515,6 +516,7 @@ impl CodexAgent {
     async fn logout(&self, _request: LogoutRequest) -> Result<LogoutResponse, Error> {
         self.auth_manager
             .logout()
+            .await
             .map_err(Error::into_internal_error)?;
         Ok(LogoutResponse::new())
     }
@@ -539,9 +541,12 @@ impl CodexAgent {
             thread_id,
             thread,
             session_configured: _,
-        } = Box::pin(self.thread_manager.start_thread(config.clone()))
-            .await
-            .map_err(|_e| Error::internal_error())?;
+        } = Box::pin(
+            self.thread_manager
+                .start_thread(config.clone(), thread_store_from_config(&config)),
+        )
+        .await
+        .map_err(|_e| Error::internal_error())?;
 
         let session_id = Self::session_id_from_thread_id(thread_id);
         // Record the session root for filesystem sandboxing.
@@ -553,7 +558,7 @@ impl CodexAgent {
             session_id.clone(),
             thread,
             self.auth_manager.clone(),
-            self.thread_manager.get_models_manager(),
+            Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
             config.clone(),
             cx,
@@ -613,6 +618,7 @@ impl CodexAgent {
             session_configured: _,
         } = Box::pin(self.thread_manager.resume_thread_from_rollout(
             config.clone(),
+            thread_store_from_config(&config),
             rollout_path,
             self.auth_manager.clone(),
             None,
@@ -624,7 +630,7 @@ impl CodexAgent {
             session_id.clone(),
             thread,
             self.auth_manager.clone(),
-            self.thread_manager.get_models_manager(),
+            Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
             config.clone(),
             cx,
