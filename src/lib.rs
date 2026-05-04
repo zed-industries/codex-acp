@@ -59,10 +59,7 @@ pub async fn run_main(
         config.enforce_residency.value(),
     );
 
-    let agent = Arc::new(codex_agent::CodexAgent::new(
-        config,
-        codex_linux_sandbox_exe,
-    )?);
+    let agent = Arc::new(codex_agent::CodexAgent::new(config, codex_linux_sandbox_exe).await?);
 
     let stdin = tokio::io::stdin().compat();
     let stdout = tokio::io::stdout().compat_write();
