@@ -34,10 +34,7 @@ pub async fn run_main(
 
     let config = load_config(cli_config_overrides, codex_linux_sandbox_exe.clone()).await?;
 
-    let agent = Arc::new(codex_agent::CodexAgent::new(
-        config,
-        codex_linux_sandbox_exe,
-    )?);
+    let agent = Arc::new(codex_agent::CodexAgent::new(config, codex_linux_sandbox_exe).await?);
 
     let stdin = tokio::io::stdin().compat();
     let stdout = tokio::io::stdout().compat_write();
