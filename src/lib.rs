@@ -4,6 +4,7 @@
 use agent_client_protocol::ByteStreams;
 use codex_core::config::{Config, ConfigOverrides};
 use codex_utils_cli::CliConfigOverrides;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -31,33 +32,7 @@ pub async fn run_main(
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    // Parse CLI overrides and load configuration
-    let cli_kv_overrides = cli_config_overrides.parse_overrides().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("error parsing -c overrides: {e}"),
-        )
-    })?;
-
-    let config_overrides = ConfigOverrides {
-        codex_linux_sandbox_exe: codex_linux_sandbox_exe.clone(),
-        ..ConfigOverrides::default()
-    };
-
-    let config =
-        Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, config_overrides)
-            .await
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("error loading config: {e}"),
-                )
-            })?;
-    // Apply residency requirement so the HTTP client sends the
-    // x-openai-internal-codex-residency header on all requests.
-    codex_login::default_client::set_default_client_residency_requirement(
-        config.enforce_residency.value(),
-    );
+    let config = load_config(cli_config_overrides, codex_linux_sandbox_exe.clone()).await?;
 
     let agent = Arc::new(codex_agent::CodexAgent::new(config, codex_linux_sandbox_exe).await?);
 
@@ -70,6 +45,73 @@ pub async fn run_main(
         .map_err(|e| std::io::Error::other(format!("ACP error: {e}")))?;
 
     Ok(())
+}
+
+pub async fn run_auth_command(cli_config_overrides: CliConfigOverrides) -> std::io::Result<()> {
+    let config = load_config(cli_config_overrides, None).await?;
+
+    let opts = codex_login::ServerOptions::new(
+        config.codex_home.to_path_buf(),
+        codex_login::auth::CLIENT_ID.to_string(),
+        None,
+        config.cli_auth_credentials_store_mode,
+    );
+
+    run_device_code_auth(opts).await
+}
+
+async fn load_config(
+    cli_config_overrides: CliConfigOverrides,
+    codex_linux_sandbox_exe: Option<PathBuf>,
+) -> std::io::Result<Config> {
+    let cli_kv_overrides = cli_config_overrides.parse_overrides().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("error parsing -c overrides: {e}"),
+        )
+    })?;
+
+    let config_overrides = ConfigOverrides {
+        codex_linux_sandbox_exe,
+        ..ConfigOverrides::default()
+    };
+
+    let config =
+        Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, config_overrides)
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("error loading config: {e}"),
+                )
+            })?;
+
+    codex_login::default_client::set_default_client_residency_requirement(
+        config.enforce_residency.value(),
+    );
+
+    Ok(config)
+}
+
+pub(crate) async fn run_device_code_auth(opts: codex_login::ServerOptions) -> std::io::Result<()> {
+    let device_code = codex_login::request_device_code(&opts).await?;
+    {
+        let mut stderr = std::io::stderr().lock();
+        writeln!(
+            stderr,
+            "Open this link in your browser and sign in to your ChatGPT account:\n{}\n",
+            device_code.verification_url
+        )?;
+        writeln!(
+            stderr,
+            "Then enter this one-time code (expires in 15 minutes):\n{}\n",
+            device_code.user_code
+        )?;
+        writeln!(stderr, "Waiting for login to complete in the browser...")?;
+        stderr.flush()?;
+    }
+
+    codex_login::complete_device_code_login(opts, device_code).await
 }
 
 // Re-export the MCP server types for compatibility
