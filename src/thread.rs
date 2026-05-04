@@ -125,6 +125,8 @@ const USAGE_METHOD: &str = "acp_ext:session_usage_update";
 const RATE_LIMITS_METHOD: &str = "acp_ext:session_rate_limits";
 const THREAD_GOAL_UPDATED_METHOD: &str = "acp_ext:thread_goal_updated";
 const THREAD_GOAL_CLEARED_METHOD: &str = "acp_ext:thread_goal_cleared";
+const IMAGE_GENERATION_BEGIN_METHOD: &str = "acp_ext:image_generation_begin";
+const IMAGE_GENERATION_END_METHOD: &str = "acp_ext:image_generation_end";
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -153,6 +155,23 @@ pub struct RaceLimitUpdate {
     seven_day: Option<f64>,
     five_hour_reset_at: Option<i64>,
     seven_day_reset_at: Option<i64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageGenerationBeginPayload {
+    session_id: String,
+    call_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageGenerationEndPayload {
+    session_id: String,
+    call_id: String,
+    status: String,
+    revised_prompt: Option<String>,
+    saved_path: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1612,11 +1631,25 @@ impl PromptState {
                 );
                 client.send_thread_goal_updated(&thread_id, turn_id, &goal);
             }
+            EventMsg::ImageGenerationBegin(event) => {
+                info!("Image generation started: call_id={}", event.call_id);
+                client.send_image_generation_begin(event.call_id);
+            }
+            EventMsg::ImageGenerationEnd(event) => {
+                info!(
+                    "Image generation ended: call_id={}, status={}, saved_path={:?}",
+                    event.call_id, event.status, event.saved_path
+                );
+                client.send_image_generation_end(
+                    event.call_id,
+                    event.status,
+                    event.revised_prompt,
+                    event.saved_path.map(|path| path.display().to_string()),
+                );
+            }
 
             // Ignore these events
-            EventMsg::ImageGenerationBegin(..)
-            | EventMsg::ImageGenerationEnd(..)
-            | EventMsg::AgentReasoningRawContent(..)
+            EventMsg::AgentReasoningRawContent(..)
             | EventMsg::ThreadRolledBack(..)
             | EventMsg::HookStarted(..)
             | EventMsg::HookCompleted(..)
@@ -2780,6 +2813,35 @@ impl SessionClient {
         };
 
         self.send_ext_notification(method, Arc::from(raw_value));
+    }
+
+    fn send_image_generation_begin(&self, call_id: String) {
+        self.send_json_ext_notification(
+            IMAGE_GENERATION_BEGIN_METHOD,
+            &ImageGenerationBeginPayload {
+                session_id: self.session_id.0.to_string(),
+                call_id,
+            },
+        );
+    }
+
+    fn send_image_generation_end(
+        &self,
+        call_id: String,
+        status: String,
+        revised_prompt: Option<String>,
+        saved_path: Option<String>,
+    ) {
+        self.send_json_ext_notification(
+            IMAGE_GENERATION_END_METHOD,
+            &ImageGenerationEndPayload {
+                session_id: self.session_id.0.to_string(),
+                call_id,
+                status,
+                revised_prompt,
+                saved_path,
+            },
+        );
     }
 
     fn send_thread_goal_updated(
@@ -5032,6 +5094,70 @@ mod tests {
         assert_eq!(params["goal"]["tokenBudget"], 42_000);
         assert_eq!(params["goal"]["tokensUsed"], 21_000);
         assert_eq!(params["goal"]["timeUsedSeconds"], 123);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_image_generation_events_send_ext_notifications() -> anyhow::Result<()> {
+        let thread_id = ThreadId::new();
+        let session_id = SessionId::new(thread_id.to_string());
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (resolution_tx, _resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let mut state =
+            PromptState::new("submission".to_string(), thread, resolution_tx, response_tx);
+
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::ImageGenerationBegin(
+                    codex_protocol::protocol::ImageGenerationBeginEvent {
+                        call_id: "ig_1".to_string(),
+                    },
+                ),
+            )
+            .await;
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::ImageGenerationEnd(codex_protocol::protocol::ImageGenerationEndEvent {
+                    call_id: "ig_1".to_string(),
+                    status: "completed".to_string(),
+                    revised_prompt: Some("diagram".to_string()),
+                    result: "base64-result-should-not-be-forwarded".to_string(),
+                    saved_path: Some("/tmp/codex-image.png".try_into()?),
+                }),
+            )
+            .await;
+
+        let ext_notifications = client.ext_notifications.lock().unwrap();
+        assert_eq!(ext_notifications.len(), 2);
+        assert_eq!(
+            ext_notifications[0].method.as_ref(),
+            "_acp_ext:image_generation_begin"
+        );
+        assert_eq!(
+            ext_notifications[1].method.as_ref(),
+            "_acp_ext:image_generation_end"
+        );
+
+        let begin_params: serde_json::Value =
+            serde_json::from_str(ext_notifications[0].params.get())?;
+        assert_eq!(begin_params["sessionId"], session_id.0.as_ref());
+        assert_eq!(begin_params["callId"], "ig_1");
+
+        let end_params: serde_json::Value =
+            serde_json::from_str(ext_notifications[1].params.get())?;
+        assert_eq!(end_params["sessionId"], session_id.0.as_ref());
+        assert_eq!(end_params["callId"], "ig_1");
+        assert_eq!(end_params["status"], "completed");
+        assert_eq!(end_params["revisedPrompt"], "diagram");
+        assert_eq!(end_params["savedPath"], "/tmp/codex-image.png");
+        assert!(end_params.get("result").is_none());
 
         Ok(())
     }
