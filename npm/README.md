@@ -36,6 +36,52 @@ To use Codex, open the Agent Panel and click "New Codex Thread" from the `+` but
 
 Read the docs on [External Agent](https://zed.dev/docs/ai/external-agents) support.
 
+### JetBrains IDEs
+
+JetBrains IDEs expose ACP agents through the JetBrains AI Assistant agent registry. That registry is separate from Zed's registry, so Codex may not appear in the built-in JetBrains agent list even though this adapter is available in Zed.
+
+Add Codex manually by creating or updating `~/.jetbrains/acp.json`:
+
+```json
+{
+  "default_mcp_settings": {
+    "use_custom_mcp": true,
+    "use_idea_mcp": true
+  },
+  "agent_servers": {
+    "Codex": {
+      "command": "npx",
+      "args": ["-y", "@zed-industries/codex-acp"],
+      "env": {}
+    }
+  }
+}
+```
+
+If you installed a release binary instead of using npm, set `command` to the absolute path of the `codex-acp` binary and remove `args`.
+
+Some JetBrains AI Assistant builds still expect the older ACP `env_var.varName` auth field and may fail to initialize when the agent advertises API-key auth methods. If you already authenticate Codex through the regular Codex CLI or have a `CODEX_HOME` with valid credentials, you can hide those env-var auth methods for JetBrains:
+
+```json
+{
+  "default_mcp_settings": {
+    "use_custom_mcp": true,
+    "use_idea_mcp": true
+  },
+  "agent_servers": {
+    "Codex": {
+      "command": "npx",
+      "args": ["-y", "@zed-industries/codex-acp"],
+      "env": {
+        "CODEX_ACP_DISABLE_ENV_AUTH_METHODS": "1"
+      }
+    }
+  }
+}
+```
+
+Restart the IDE or start a new AI Assistant chat after changing `~/.jetbrains/acp.json`.
+
 ### Other clients
 
 [Submit a PR](https://github.com/zed-industries/codex-acp/pulls) to add yours!
