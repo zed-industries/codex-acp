@@ -9,6 +9,7 @@ This tool implements an ACP adapter around the Codex CLI, supporting:
 - Tool calls (with permission requests)
 - Following
 - Edit review
+- Plan mode
 - TODO lists
 - Slash commands:
   - /review (with optional instructions)
