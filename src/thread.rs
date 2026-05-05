@@ -4,7 +4,6 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, LazyLock, Mutex},
-    time::Duration,
 };
 
 use agent_client_protocol::{
@@ -59,13 +58,14 @@ use codex_protocol::{
         ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
         FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ItemCompletedEvent,
-        ItemStartedEvent, McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent,
-        McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext,
-        NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
-        PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
-        ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem,
-        StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
-        TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        ItemStartedEvent, ListSkillsResponseEvent, McpInvocation, McpStartupCompleteEvent,
+        McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent,
+        NetworkApprovalContext, NetworkPolicyRuleAction, Op, PatchApplyBeginEvent,
+        PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent, ReasoningContentDeltaEvent,
+        ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
+        ReviewTarget, RolloutItem, SkillMetadata, SkillsListEntry, StreamErrorEvent,
+        TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent, TokenCountEvent,
+        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
         ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
@@ -207,6 +207,39 @@ fn mode_trusts_project(mode_id: &str) -> bool {
     matches!(mode_id, "auto" | "full-access")
 }
 
+fn skill_commands(skills: &[SkillMetadata]) -> Vec<AvailableCommand> {
+    skills
+        .iter()
+        .filter(|skill| skill.enabled)
+        .map(|skill| {
+            AvailableCommand::new(
+                format!("skills:{}", skill.name),
+                skill
+                    .short_description
+                    .clone()
+                    .or_else(|| {
+                        skill
+                            .interface
+                            .as_ref()
+                            .and_then(|interface| interface.short_description.clone())
+                    })
+                    .unwrap_or_else(|| skill.description.clone()),
+            )
+            .input(AvailableCommandInput::Unstructured(
+                UnstructuredCommandInput::new("optional additional instructions"),
+            ))
+        })
+        .collect()
+}
+
+fn skills_for_cwd(cwd: &Path, entries: &[SkillsListEntry]) -> Vec<SkillMetadata> {
+    entries
+        .iter()
+        .find(|entry| entry.cwd.as_path() == cwd)
+        .map(|entry| entry.skills.clone())
+        .unwrap_or_default()
+}
+
 /// Trait for abstracting over the `CodexThread` to make testing easier.
 pub trait CodexThreadImpl: Send + Sync {
     fn submit(&self, op: Op)
@@ -270,6 +303,9 @@ impl Auth for Arc<AuthManager> {
 enum ThreadMessage {
     Load {
         response_tx: oneshot::Sender<Result<LoadSessionResponse, Error>>,
+    },
+    SkillsLoaded {
+        skills: Option<Vec<SkillMetadata>>,
     },
     GetConfigOptions {
         response_tx: oneshot::Sender<Result<Vec<SessionConfigOption>, Error>>,
@@ -792,7 +828,10 @@ fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> String {
     }
 }
 
+#[expect(clippy::large_enum_variant)]
 enum SubmissionState {
+    /// Loading skills for the current workspace.
+    Skills(SkillsState),
     /// User prompts, including slash commands like /init, /review, /compact, /undo.
     Prompt(PromptState),
 }
@@ -800,12 +839,14 @@ enum SubmissionState {
 impl SubmissionState {
     fn is_active(&self) -> bool {
         match self {
+            Self::Skills(state) => state.is_active(),
             Self::Prompt(state) => state.is_active(),
         }
     }
 
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         match self {
+            Self::Skills(state) => state.handle_event(event),
             Self::Prompt(state) => state.handle_event(client, event).await,
         }
     }
@@ -817,6 +858,7 @@ impl SubmissionState {
         response: Result<RequestPermissionResponse, Error>,
     ) -> Result<(), Error> {
         match self {
+            Self::Skills(..) => Ok(()),
             Self::Prompt(state) => {
                 state
                     .handle_permission_request_resolved(client, request_key, response)
@@ -826,10 +868,8 @@ impl SubmissionState {
     }
 
     fn abort_pending_interactions(&mut self) {
-        match self {
-            Self::Prompt(state) => {
-                state.abort_pending_interactions();
-            }
+        if let Self::Prompt(state) = self {
+            state.abort_pending_interactions();
         }
     }
 
@@ -838,6 +878,38 @@ impl SubmissionState {
             && let Some(response_tx) = state.response_tx.take()
         {
             drop(response_tx.send(Err(err)));
+        }
+    }
+}
+
+struct SkillsState {
+    response_tx: Option<oneshot::Sender<Result<Vec<SkillsListEntry>, Error>>>,
+}
+
+impl SkillsState {
+    fn new(response_tx: oneshot::Sender<Result<Vec<SkillsListEntry>, Error>>) -> Self {
+        Self {
+            response_tx: Some(response_tx),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        let Some(response_tx) = &self.response_tx else {
+            return false;
+        };
+        !response_tx.is_closed()
+    }
+
+    fn handle_event(&mut self, event: EventMsg) {
+        match event {
+            EventMsg::ListSkillsResponse(ListSkillsResponseEvent { skills }) => {
+                if let Some(tx) = self.response_tx.take() {
+                    drop(tx.send(Ok(skills)));
+                }
+            }
+            event => {
+                warn!("Unexpected event: {event:?}");
+            }
         }
     }
 }
@@ -2713,6 +2785,8 @@ struct ThreadActor<A> {
     resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     /// Last config options state we emitted to the client, used for deduping updates.
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
+    /// Skills discovered for the current working directory.
+    skills: Vec<SkillMetadata>,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -2738,6 +2812,7 @@ impl<A: Auth> ThreadActor<A> {
             message_rx,
             resolution_rx,
             last_sent_config_options: None,
+            skills: Vec::new(),
         }
     }
 
@@ -2776,15 +2851,13 @@ impl<A: Auth> ThreadActor<A> {
             ThreadMessage::Load { response_tx } => {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
-                let client = self.client.clone();
-                // Have this happen after the session is loaded by putting it
-                // in a separate task
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    client.send_notification(SessionUpdate::AvailableCommandsUpdate(
-                        AvailableCommandsUpdate::new(Self::builtin_commands()),
-                    ));
-                });
+                self.refresh_skills(true).await;
+            }
+            ThreadMessage::SkillsLoaded { skills } => {
+                if let Some(skills) = skills {
+                    self.skills = skills;
+                }
+                self.send_available_commands_update();
             }
             ThreadMessage::GetConfigOptions { response_tx } => {
                 let result = self.config_options().await;
@@ -2885,6 +2958,77 @@ impl<A: Auth> ThreadActor<A> {
             AvailableCommand::new("undo", "undo Codex’s most recent turn"),
             AvailableCommand::new("logout", "logout of Codex"),
         ]
+    }
+
+    fn available_commands(&self) -> Vec<AvailableCommand> {
+        let mut commands = Self::builtin_commands();
+        commands.extend(skill_commands(&self.skills));
+        commands
+    }
+
+    fn send_available_commands_update(&self) {
+        self.client
+            .send_notification(SessionUpdate::AvailableCommandsUpdate(
+                AvailableCommandsUpdate::new(self.available_commands()),
+            ));
+    }
+
+    async fn load_skills(
+        &mut self,
+        force_reload: bool,
+    ) -> oneshot::Receiver<Result<Vec<SkillsListEntry>, Error>> {
+        let (response_tx, response_rx) = oneshot::channel();
+        let submission_id = match self
+            .thread
+            .submit(Op::ListSkills {
+                cwds: Vec::new(),
+                force_reload,
+            })
+            .await
+        {
+            Ok(id) => id,
+            Err(error) => {
+                drop(response_tx.send(Err(Error::internal_error().data(error.to_string()))));
+                return response_rx;
+            }
+        };
+
+        self.submissions.insert(
+            submission_id,
+            SubmissionState::Skills(SkillsState::new(response_tx)),
+        );
+
+        response_rx
+    }
+
+    async fn refresh_skills(&mut self, force_reload: bool) {
+        let load_skills = self.load_skills(force_reload).await;
+        let resolution_tx = self.resolution_tx.clone();
+        let cwd = self.config.cwd.clone();
+
+        tokio::spawn(async move {
+            let skills = match load_skills.await {
+                Ok(Ok(entries)) => Some(skills_for_cwd(cwd.as_path(), &entries)),
+                Ok(Err(error)) => {
+                    error!("Failed to refresh skills: {error:?}");
+                    None
+                }
+                Err(error) => {
+                    error!("Failed to receive skills response: {error:?}");
+                    None
+                }
+            };
+
+            drop(resolution_tx.send(ThreadMessage::SkillsLoaded { skills }));
+        });
+    }
+
+    fn resolve_skill_command(&self, name: &str) -> Option<SkillMetadata> {
+        let skill_name = name.strip_prefix("skills:")?;
+        self.skills
+            .iter()
+            .find(|skill| skill.name == skill_name)
+            .cloned()
     }
 
     fn modes(&self) -> Option<SessionModeState> {
@@ -3213,70 +3357,90 @@ impl<A: Auth> ThreadActor<A> {
         let items = build_prompt_items(request.prompt);
         let op;
         if let Some((name, rest)) = extract_slash_command(&items) {
-            match name {
-                "compact" => op = Op::Compact,
-                "undo" => op = Op::Undo,
-                "init" => {
-                    op = Op::UserInput {
-                        items: vec![UserInput::Text {
-                            text: INIT_COMMAND_PROMPT.into(),
-                            text_elements: vec![],
-                        }],
-                        final_output_json_schema: None,
-                        environments: None,
-                        responsesapi_client_metadata: None,
-                    }
+            if let Some(skill) = self.resolve_skill_command(name) {
+                let mut skill_items = vec![UserInput::Skill {
+                    name: skill.name,
+                    path: skill.path.to_path_buf(),
+                }];
+                let instructions = rest.trim();
+                if !instructions.is_empty() {
+                    skill_items.push(UserInput::Text {
+                        text: instructions.to_owned(),
+                        text_elements: vec![],
+                    });
                 }
-                "review" => {
-                    let instructions = rest.trim();
-                    let target = if instructions.is_empty() {
-                        ReviewTarget::UncommittedChanges
-                    } else {
-                        ReviewTarget::Custom {
-                            instructions: instructions.to_owned(),
+                op = Op::UserInput {
+                    items: skill_items,
+                    final_output_json_schema: None,
+                    environments: None,
+                    responsesapi_client_metadata: None,
+                };
+            } else {
+                match name {
+                    "compact" => op = Op::Compact,
+                    "undo" => op = Op::Undo,
+                    "init" => {
+                        op = Op::UserInput {
+                            items: vec![UserInput::Text {
+                                text: INIT_COMMAND_PROMPT.into(),
+                                text_elements: vec![],
+                            }],
+                            final_output_json_schema: None,
+                            environments: None,
+                            responsesapi_client_metadata: None,
                         }
-                    };
+                    }
+                    "review" => {
+                        let instructions = rest.trim();
+                        let target = if instructions.is_empty() {
+                            ReviewTarget::UncommittedChanges
+                        } else {
+                            ReviewTarget::Custom {
+                                instructions: instructions.to_owned(),
+                            }
+                        };
 
-                    op = Op::Review {
-                        review_request: ReviewRequest {
-                            user_facing_hint: Some(user_facing_hint(&target)),
-                            target,
-                        },
+                        op = Op::Review {
+                            review_request: ReviewRequest {
+                                user_facing_hint: Some(user_facing_hint(&target)),
+                                target,
+                            },
+                        }
                     }
-                }
-                "review-branch" if !rest.is_empty() => {
-                    let target = ReviewTarget::BaseBranch {
-                        branch: rest.trim().to_owned(),
-                    };
-                    op = Op::Review {
-                        review_request: ReviewRequest {
-                            user_facing_hint: Some(user_facing_hint(&target)),
-                            target,
-                        },
+                    "review-branch" if !rest.is_empty() => {
+                        let target = ReviewTarget::BaseBranch {
+                            branch: rest.trim().to_owned(),
+                        };
+                        op = Op::Review {
+                            review_request: ReviewRequest {
+                                user_facing_hint: Some(user_facing_hint(&target)),
+                                target,
+                            },
+                        }
                     }
-                }
-                "review-commit" if !rest.is_empty() => {
-                    let target = ReviewTarget::Commit {
-                        sha: rest.trim().to_owned(),
-                        title: None,
-                    };
-                    op = Op::Review {
-                        review_request: ReviewRequest {
-                            user_facing_hint: Some(user_facing_hint(&target)),
-                            target,
-                        },
+                    "review-commit" if !rest.is_empty() => {
+                        let target = ReviewTarget::Commit {
+                            sha: rest.trim().to_owned(),
+                            title: None,
+                        };
+                        op = Op::Review {
+                            review_request: ReviewRequest {
+                                user_facing_hint: Some(user_facing_hint(&target)),
+                                target,
+                            },
+                        }
                     }
-                }
-                "logout" => {
-                    self.auth.logout().await?;
-                    return Err(Error::auth_required());
-                }
-                _ => {
-                    op = Op::UserInput {
-                        items,
-                        final_output_json_schema: None,
-                        environments: None,
-                        responsesapi_client_metadata: None,
+                    "logout" => {
+                        self.auth.logout().await?;
+                        return Err(Error::auth_required());
+                    }
+                    _ => {
+                        op = Op::UserInput {
+                            items,
+                            final_output_json_schema: None,
+                            environments: None,
+                            responsesapi_client_metadata: None,
+                        }
                     }
                 }
             }
@@ -3743,6 +3907,11 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_event(&mut self, Event { id, msg }: Event) {
+        if matches!(msg, EventMsg::SkillsUpdateAvailable) {
+            self.refresh_skills(true).await;
+            return;
+        }
+
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
         } else {
@@ -4122,6 +4291,7 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -4583,38 +4753,250 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delta_deduplication() -> anyhow::Result<()> {
-        let (session_id, client, _, message_tx, _handle) = setup().await?;
-        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+    async fn test_load_publishes_skills_as_namespaced_commands() -> anyhow::Result<()> {
+        let skill = SkillMetadata {
+            name: "demo".to_string(),
+            description: "Demo skill".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            path: PathBuf::from("/tmp/demo/SKILL.md").try_into()?,
+            scope: codex_protocol::protocol::SkillScope::Repo,
+            enabled: true,
+        };
+        let (_session_id, client, _thread, message_tx, handle) =
+            setup_with_skills(vec![skill]).await?;
+        let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
 
+        message_tx.send(ThreadMessage::Load {
+            response_tx: load_response_tx,
+        })?;
+
+        drop(load_response_rx.await??);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(message_tx);
+        handle.await?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(notifications.iter().any(|notification| matches!(
+            &notification.update,
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate { available_commands, .. })
+                if available_commands.iter().any(|command| command.name == "skills:demo")
+        )));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_load_does_not_publish_disabled_skills() -> anyhow::Result<()> {
+        let skill = SkillMetadata {
+            name: "disabled-demo".to_string(),
+            description: "Disabled demo skill".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            path: PathBuf::from("/tmp/disabled-demo/SKILL.md").try_into()?,
+            scope: codex_protocol::protocol::SkillScope::Repo,
+            enabled: false,
+        };
+        let (_session_id, client, _thread, message_tx, handle) =
+            setup_with_skills(vec![skill]).await?;
+        let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Load {
+            response_tx: load_response_tx,
+        })?;
+
+        drop(load_response_rx.await??);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(message_tx);
+        handle.await?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications
+                .iter()
+                .all(|notification| match &notification.update {
+                    SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate {
+                        available_commands,
+                        ..
+                    }) => {
+                        !available_commands
+                            .iter()
+                            .any(|command| command.name == "skills:disabled-demo")
+                    }
+                    _ => true,
+                })
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_load_does_not_publish_skills_for_other_cwd() -> anyhow::Result<()> {
+        let skill = SkillMetadata {
+            name: "other-cwd".to_string(),
+            description: "Other cwd skill".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            path: PathBuf::from("/tmp/other-cwd/SKILL.md").try_into()?,
+            scope: codex_protocol::protocol::SkillScope::Repo,
+            enabled: true,
+        };
+        let (_session_id, client, thread, message_tx, handle) =
+            setup_with_skills(vec![skill]).await?;
+        thread.skills_entries.lock().unwrap()[0].cwd = PathBuf::from("/tmp/not-the-session-cwd");
+        let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Load {
+            response_tx: load_response_tx,
+        })?;
+
+        drop(load_response_rx.await??);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(message_tx);
+        handle.await?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications
+                .iter()
+                .all(|notification| match &notification.update {
+                    SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate {
+                        available_commands,
+                        ..
+                    }) => {
+                        !available_commands
+                            .iter()
+                            .any(|command| command.name == "skills:other-cwd")
+                    }
+                    _ => true,
+                })
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_skill_command_creates_skill_user_input() -> anyhow::Result<()> {
+        let skill = SkillMetadata {
+            name: "demo".to_string(),
+            description: "Demo skill".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            path: PathBuf::from("/tmp/demo/SKILL.md").try_into()?,
+            scope: codex_protocol::protocol::SkillScope::Repo,
+            enabled: true,
+        };
+        let (session_id, _client, thread, message_tx, handle) =
+            setup_with_skills(vec![skill.clone()]).await?;
+        let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Load {
+            response_tx: load_response_tx,
+        })?;
+        drop(load_response_rx.await??);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
         message_tx.send(ThreadMessage::Prompt {
-            request: PromptRequest::new(session_id.clone(), vec!["test delta".into()]),
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["/skills:demo use it well".into()],
+            ),
             response_tx: prompt_response_tx,
         })?;
 
         let stop_reason = prompt_response_rx.await??.await??;
         assert_eq!(stop_reason, StopReason::EndTurn);
         drop(message_tx);
+        handle.await?;
 
-        // We should only get ONE notification, not duplicates from both delta and non-delta
+        let ops = thread.ops.lock().unwrap();
+        let skill_input = ops
+            .iter()
+            .find_map(|op| match op {
+                Op::UserInput { items, .. } => Some(items),
+                _ => None,
+            })
+            .expect("expected user input op");
+
+        assert!(skill_input.iter().any(|item| matches!(
+            item,
+            UserInput::Skill { name, path } if name == "demo" && path == &skill.path.to_path_buf()
+        )));
+        assert!(skill_input.iter().any(|item| matches!(
+            item,
+            UserInput::Text { text, .. } if text == "use it well"
+        )));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_skills_update_available_refreshes_commands() -> anyhow::Result<()> {
+        let initial_skill = SkillMetadata {
+            name: "demo".to_string(),
+            description: "Demo skill".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            path: PathBuf::from("/tmp/demo/SKILL.md").try_into()?,
+            scope: codex_protocol::protocol::SkillScope::Repo,
+            enabled: true,
+        };
+        let refreshed_skill = SkillMetadata {
+            name: "second".to_string(),
+            description: "Second skill".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            path: PathBuf::from("/tmp/second/SKILL.md").try_into()?,
+            scope: codex_protocol::protocol::SkillScope::Repo,
+            enabled: true,
+        };
+        let (_session_id, client, thread, message_tx, handle) =
+            setup_with_skills(vec![initial_skill]).await?;
+        let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Load {
+            response_tx: load_response_tx,
+        })?;
+
+        drop(load_response_rx.await??);
+        thread.skills_entries.lock().unwrap()[0].skills = vec![refreshed_skill];
+        thread.op_tx.send(Event {
+            id: "skill-update".to_string(),
+            msg: EventMsg::SkillsUpdateAvailable,
+        })?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(message_tx);
+        handle.await?;
+
         let notifications = client.notifications.lock().unwrap();
-        assert_eq!(
-            notifications.len(),
-            1,
-            "Should only receive delta event, not duplicate non-delta. Got: {notifications:?}"
-        );
-        assert!(matches!(
-            &notifications[0].update,
-            SessionUpdate::AgentMessageChunk(ContentChunk {
-                content: ContentBlock::Text(TextContent { text, .. }),
-                ..
-            }) if text == "test delta"
-        ));
+        assert!(notifications.iter().any(|notification| matches!(
+            &notification.update,
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate { available_commands, .. })
+                if available_commands.iter().any(|command| command.name == "skills:second")
+        )));
 
         Ok(())
     }
 
     async fn setup() -> anyhow::Result<(
+        SessionId,
+        Arc<StubClient>,
+        Arc<StubCodexThread>,
+        UnboundedSender<ThreadMessage>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        setup_with_skills(Vec::new()).await
+    }
+
+    async fn setup_with_skills(
+        skills: Vec<SkillMetadata>,
+    ) -> anyhow::Result<(
         SessionId,
         Arc<StubClient>,
         Arc<StubCodexThread>,
@@ -4632,6 +5014,15 @@ mod tests {
             ConfigOverrides::default(),
         )
         .await?;
+        conversation
+            .skills_entries
+            .lock()
+            .unwrap()
+            .push(SkillsListEntry {
+                cwd: config.cwd.clone().to_path_buf(),
+                skills,
+                errors: Vec::new(),
+            });
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -4677,6 +5068,7 @@ mod tests {
         current_id: AtomicUsize,
         active_prompt_id: std::sync::Mutex<Option<String>>,
         ops: std::sync::Mutex<Vec<Op>>,
+        skills_entries: std::sync::Mutex<Vec<SkillsListEntry>>,
         op_tx: mpsc::UnboundedSender<Event>,
         op_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
     }
@@ -4688,6 +5080,7 @@ mod tests {
                 current_id: AtomicUsize::new(0),
                 active_prompt_id: std::sync::Mutex::default(),
                 ops: std::sync::Mutex::default(),
+                skills_entries: std::sync::Mutex::default(),
                 op_tx,
                 op_rx: Mutex::new(op_rx),
             }
@@ -4713,6 +5106,7 @@ mod tests {
                             .into_iter()
                             .map(|i| match i {
                                 UserInput::Text { text, .. } => text,
+                                UserInput::Skill { name, .. } => format!("${name}"),
                                 _ => unimplemented!(),
                             })
                             .join("\n");
@@ -4994,6 +5388,16 @@ mod tests {
                                     completed_at: None,
                                     duration_ms: None,
                                     time_to_first_token_ms: None,
+                                }),
+                            })
+                            .unwrap();
+                    }
+                    Op::ListSkills { .. } => {
+                        self.op_tx
+                            .send(Event {
+                                id: id.to_string(),
+                                msg: EventMsg::ListSkillsResponse(ListSkillsResponseEvent {
+                                    skills: self.skills_entries.lock().unwrap().clone(),
                                 }),
                             })
                             .unwrap();
