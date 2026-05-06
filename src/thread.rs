@@ -12,16 +12,16 @@ use agent_client_protocol::{
     schema::{
         AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ClientCapabilities,
         ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
-        EmbeddedResourceResource, LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption,
-        PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-        RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-        ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-        SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-        SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
-        SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason,
-        Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId,
-        ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-        UnstructuredCommandInput, UsageUpdate,
+        EmbeddedResourceResource, Implementation, LoadSessionResponse, Meta, ModelId, ModelInfo,
+        PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+        PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+        RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionConfigId,
+        SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+        SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode,
+        SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate,
+        StopReason, Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent,
+        ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        ToolKind, UnstructuredCommandInput, UsageUpdate,
     },
 };
 use codex_apply_patch::parse_patch;
@@ -82,6 +82,28 @@ use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+static DISABLE_TERMINAL_OUTPUT: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("CODEX_ACP_DISABLE_TERMINAL_OUTPUT")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+});
+
+static ENABLE_EXPERIMENTAL_TERMINAL_OUTPUT: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("CODEX_ACP_ENABLE_EXPERIMENTAL_TERMINAL_OUTPUT")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+});
 
 /// Abstraction over the ACP connection for sending notifications and requests
 /// back to the client. This replaces the old `Client` trait usage.
@@ -324,6 +346,7 @@ impl Thread {
         auth: Arc<AuthManager>,
         models_manager: Arc<dyn ModelsManagerImpl>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
+        client_info: Arc<Mutex<Option<Implementation>>>,
         config: Config,
         cx: ConnectionTo<Client>,
     ) -> Self {
@@ -332,7 +355,7 @@ impl Thread {
 
         let actor = ThreadActor::new(
             auth,
-            SessionClient::new(session_id, cx, client_capabilities),
+            SessionClient::new(session_id, cx, client_capabilities, client_info),
             thread.clone(),
             models_manager,
             config,
@@ -844,9 +867,144 @@ impl SubmissionState {
 
 struct ActiveCommand {
     tool_call_id: ToolCallId,
+    title: String,
+    kind: ToolKind,
     terminal_output: bool,
     output: String,
     file_extension: Option<String>,
+}
+
+impl ActiveCommand {
+    fn render_pending_content(&self) -> Vec<ToolCallContent> {
+        vec!["Waiting for command output...".into()]
+    }
+
+    fn render_empty_completion_content(
+        &self,
+        exit_code: i32,
+        status: ToolCallStatus,
+    ) -> Vec<ToolCallContent> {
+        let message = match status {
+            ToolCallStatus::Completed => "Command completed with no output.".to_string(),
+            ToolCallStatus::Failed if exit_code != 0 => {
+                format!("Command exited with code {exit_code} and produced no output.")
+            }
+            _ => "Command finished with no output.".to_string(),
+        };
+        vec![message.into()]
+    }
+
+    fn render_output_content(&self, output: &str) -> Vec<ToolCallContent> {
+        let content = match self.file_extension.as_deref() {
+            Some("md") => output.to_string(),
+            Some(ext) => format!("```{ext}\n{}\n```\n", output.trim_end_matches('\n')),
+            None => format!("```sh\n{}\n```\n", output.trim_end_matches('\n')),
+        };
+        vec![content.into()]
+    }
+
+    fn render_initial_content(
+        &self,
+        terminal_id: &str,
+        cwd: &Path,
+        supports_terminal_output: bool,
+    ) -> (Vec<ToolCallContent>, Option<Meta>) {
+        if supports_terminal_output {
+            let content = vec![ToolCallContent::Terminal(Terminal::new(
+                terminal_id.to_owned(),
+            ))];
+            let meta = Some(Meta::from_iter([(
+                "terminal_info".to_owned(),
+                serde_json::json!({
+                    "terminal_id": terminal_id,
+                    "cwd": cwd
+                }),
+            )]));
+            (content, meta)
+        } else {
+            (self.render_pending_content(), None)
+        }
+    }
+
+    fn render_streaming_update(
+        &self,
+        terminal_id: &str,
+        supports_terminal_output: bool,
+        data: &str,
+    ) -> ToolCallUpdate {
+        let fields = if supports_terminal_output {
+            ToolCallUpdateFields::new()
+        } else {
+            ToolCallUpdateFields::new()
+                .kind(self.kind)
+                .status(ToolCallStatus::InProgress)
+                .title(self.title.clone())
+                .content(self.render_output_content(&self.output))
+        };
+
+        let update = ToolCallUpdate::new(self.tool_call_id.clone(), fields);
+        if supports_terminal_output {
+            update.meta(Meta::from_iter([(
+                "terminal_output".to_owned(),
+                serde_json::json!({
+                    "terminal_id": terminal_id,
+                    "data": data
+                }),
+            )]))
+        } else {
+            update
+        }
+    }
+
+    fn render_completion_content(
+        &self,
+        terminal_id: &str,
+        supports_terminal_output: bool,
+        output_snapshot: &str,
+        exit_code: i32,
+        status: ToolCallStatus,
+    ) -> Option<Vec<ToolCallContent>> {
+        if output_snapshot.is_empty() {
+            return Some(self.render_empty_completion_content(exit_code, status));
+        }
+
+        if supports_terminal_output {
+            let mut content = vec![ToolCallContent::Terminal(Terminal::new(
+                terminal_id.to_owned(),
+            ))];
+            content.extend(self.render_output_content(output_snapshot));
+            Some(content)
+        } else {
+            Some(self.render_output_content(output_snapshot))
+        }
+    }
+
+    fn completion_terminal_output_delta(&self, output_snapshot: &str) -> Option<String> {
+        if output_snapshot.is_empty() {
+            return None;
+        }
+
+        if self.output.is_empty() {
+            return Some(output_snapshot.to_string());
+        }
+
+        if let Some(suffix) = output_snapshot.strip_prefix(&self.output) {
+            return (!suffix.is_empty()).then(|| suffix.to_string());
+        }
+
+        (output_snapshot != self.output).then(|| output_snapshot.to_string())
+    }
+
+    fn render_terminal_exit_meta(terminal_id: &str, exit_code: i32) -> Meta {
+        Meta::from_iter([(
+            "terminal_exit".into(),
+            serde_json::json!({
+                "terminal_id": terminal_id,
+                "exit_code": exit_code,
+                "signal": null
+            }),
+        )])
+    }
 }
 
 struct PromptState {
@@ -864,6 +1022,16 @@ struct PromptState {
 }
 
 impl PromptState {
+    fn stream_active_command_output(&mut self, client: &SessionClient, call_id: &str, data: &str) {
+        if let Some(active_command) = self.active_commands.get_mut(call_id) {
+            active_command.output.push_str(data);
+            let supports_terminal_output = client.supports_terminal_output(active_command);
+            let update =
+                active_command.render_streaming_update(call_id, supports_terminal_output, data);
+            client.send_tool_call_update(update);
+        }
+    }
+
     fn new(
         submission_id: String,
         thread: Arc<dyn CodexThreadImpl>,
@@ -1875,6 +2043,8 @@ impl PromptState {
             ActiveCommand {
                 terminal_output,
                 tool_call_id: tool_call_id.clone(),
+                title: title.clone(),
+                kind,
                 output: String::new(),
                 file_extension,
             },
@@ -1984,23 +2154,15 @@ impl PromptState {
 
         let active_command = ActiveCommand {
             tool_call_id: tool_call_id.clone(),
+            title: title.clone(),
+            kind,
             output: String::new(),
             file_extension,
             terminal_output,
         };
-        let (content, meta) = if client.supports_terminal_output(&active_command) {
-            let content = vec![ToolCallContent::Terminal(Terminal::new(call_id.clone()))];
-            let meta = Some(Meta::from_iter([(
-                "terminal_info".to_owned(),
-                serde_json::json!({
-                    "terminal_id": call_id,
-                    "cwd": cwd
-                }),
-            )]));
-            (content, meta)
-        } else {
-            (vec![], None)
-        };
+        let supports_terminal_output = client.supports_terminal_output(&active_command);
+        let (content, meta) =
+            active_command.render_initial_content(&call_id, &cwd, supports_terminal_output);
 
         self.active_commands.insert(call_id.clone(), active_command);
 
@@ -2025,43 +2187,8 @@ impl PromptState {
             chunk,
             stream: _,
         } = event;
-        // Stream output bytes to the display-only terminal via ToolCallUpdate meta.
-        if let Some(active_command) = self.active_commands.get_mut(&call_id) {
-            let data_str = String::from_utf8_lossy(&chunk).to_string();
-
-            let update = if client.supports_terminal_output(active_command) {
-                ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new(),
-                )
-                .meta(Meta::from_iter([(
-                    "terminal_output".to_owned(),
-                    serde_json::json!({
-                        "terminal_id": call_id,
-                        "data": data_str
-                    }),
-                )]))
-            } else {
-                active_command.output.push_str(&data_str);
-                let content = match active_command.file_extension.as_deref() {
-                    Some("md") => active_command.output.clone(),
-                    Some(ext) => format!(
-                        "```{ext}\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                    None => format!(
-                        "```sh\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                };
-                ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new().content(vec![content.into()]),
-                )
-            };
-
-            client.send_tool_call_update(update);
-        }
+        let data_str = String::from_utf8_lossy(&chunk).to_string();
+        self.stream_active_command_output(client, &call_id, &data_str);
     }
 
     fn exec_command_end(&mut self, client: &SessionClient, event: ExecCommandEndEvent) {
@@ -2077,9 +2204,9 @@ impl PromptState {
             exit_code,
             stdout: _,
             stderr: _,
-            aggregated_output: _,
+            aggregated_output,
             duration: _,
-            formatted_output: _,
+            formatted_output,
             process_id: _,
             status,
         } = event;
@@ -2091,26 +2218,46 @@ impl PromptState {
                 _ if is_success => ToolCallStatus::Completed,
                 ExecCommandStatus::Failed | ExecCommandStatus::Declined => ToolCallStatus::Failed,
             };
+            let supports_terminal_output = client.supports_terminal_output(&active_command);
+            let output_snapshot = if !formatted_output.is_empty() {
+                formatted_output
+            } else if !active_command.output.is_empty() {
+                active_command.output.clone()
+            } else {
+                aggregated_output
+            };
+            if supports_terminal_output
+                && let Some(data) =
+                    active_command.completion_terminal_output_delta(&output_snapshot)
+            {
+                client.send_tool_call_update(active_command.render_streaming_update(
+                    &call_id,
+                    supports_terminal_output,
+                    &data,
+                ));
+            }
+            let content = active_command.render_completion_content(
+                &call_id,
+                supports_terminal_output,
+                &output_snapshot,
+                exit_code,
+                status,
+            );
 
             client.send_tool_call_update(
                 ToolCallUpdate::new(
                     active_command.tool_call_id.clone(),
                     ToolCallUpdateFields::new()
+                        .kind(active_command.kind)
                         .status(status)
+                        .title(active_command.title.clone())
+                        .content(content)
                         .raw_output(raw_output),
                 )
-                .meta(client.supports_terminal_output(&active_command).then(
-                    || {
-                        Meta::from_iter([(
-                            "terminal_exit".into(),
-                            serde_json::json!({
-                                "terminal_id": call_id,
-                                "exit_code": exit_code,
-                                "signal": null
-                            }),
-                        )])
-                    },
-                )),
+                .meta(
+                    supports_terminal_output
+                        .then(|| ActiveCommand::render_terminal_exit_meta(&call_id, exit_code)),
+                ),
             );
         }
     }
@@ -2123,41 +2270,7 @@ impl PromptState {
         } = event;
 
         let stdin = format!("\n{stdin}\n");
-        // Stream output bytes to the display-only terminal via ToolCallUpdate meta.
-        if let Some(active_command) = self.active_commands.get_mut(&call_id) {
-            let update = if client.supports_terminal_output(active_command) {
-                ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new(),
-                )
-                .meta(Meta::from_iter([(
-                    "terminal_output".to_owned(),
-                    serde_json::json!({
-                        "terminal_id": call_id,
-                        "data": stdin
-                    }),
-                )]))
-            } else {
-                active_command.output.push_str(&stdin);
-                let content = match active_command.file_extension.as_deref() {
-                    Some("md") => active_command.output.clone(),
-                    Some(ext) => format!(
-                        "```{ext}\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                    None => format!(
-                        "```sh\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                };
-                ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new().content(vec![content.into()]),
-                )
-            };
-
-            client.send_tool_call_update(update);
-        }
+        self.stream_active_command_output(client, &call_id, &stdin);
     }
 
     fn start_web_search(&mut self, client: &SessionClient, call_id: String) {
@@ -2552,6 +2665,7 @@ struct SessionClient {
     session_id: SessionId,
     client: Arc<dyn ClientSender>,
     client_capabilities: Arc<Mutex<ClientCapabilities>>,
+    client_info: Arc<Mutex<Option<Implementation>>>,
 }
 
 impl SessionClient {
@@ -2559,11 +2673,13 @@ impl SessionClient {
         session_id: SessionId,
         cx: ConnectionTo<Client>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
+        client_info: Arc<Mutex<Option<Implementation>>>,
     ) -> Self {
         Self {
             session_id,
             client: Arc::new(AcpConnection(cx)),
             client_capabilities,
+            client_info,
         }
     }
 
@@ -2573,25 +2689,59 @@ impl SessionClient {
         client: Arc<dyn ClientSender>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
     ) -> Self {
+        Self::with_client_info(session_id, client, client_capabilities, Arc::default())
+    }
+
+    #[cfg(test)]
+    fn with_client_info(
+        session_id: SessionId,
+        client: Arc<dyn ClientSender>,
+        client_capabilities: Arc<Mutex<ClientCapabilities>>,
+        client_info: Arc<Mutex<Option<Implementation>>>,
+    ) -> Self {
         Self {
             session_id,
             client,
             client_capabilities,
+            client_info,
         }
     }
 
+    fn is_zed_client(&self) -> bool {
+        let client_info = self.client_info.lock().unwrap();
+        let Some(client_info) = client_info.as_ref() else {
+            return false;
+        };
+
+        let title_is_zed = client_info
+            .title
+            .as_deref()
+            .is_some_and(|title| title.to_ascii_lowercase().contains("zed"));
+
+        client_info.name.eq_ignore_ascii_case("zed") || title_is_zed
+    }
+
     fn supports_terminal_output(&self, active_command: &ActiveCommand) -> bool {
-        active_command.terminal_output
-            && self
-                .client_capabilities
-                .lock()
-                .unwrap()
-                .meta
-                .as_ref()
-                .is_some_and(|v| {
-                    v.get("terminal_output")
-                        .is_some_and(|v| v.as_bool().unwrap_or_default())
-                })
+        if *DISABLE_TERMINAL_OUTPUT || !active_command.terminal_output {
+            return false;
+        }
+
+        let client_supports_terminal_output = self
+            .client_capabilities
+            .lock()
+            .unwrap()
+            .meta
+            .as_ref()
+            .is_some_and(|v| {
+                v.get("terminal_output")
+                    .is_some_and(|v| v.as_bool().unwrap_or_default())
+            });
+
+        if !client_supports_terminal_output {
+            return false;
+        }
+
+        self.is_zed_client() || *ENABLE_EXPERIMENTAL_TERMINAL_OUTPUT
     }
 
     fn send_notification(&self, update: SessionUpdate) {
@@ -5172,6 +5322,288 @@ mod tests {
             begin_ids, end_ids,
             "completed update tool_call_ids should match begin tool_call_ids"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_zed_client_replays_completion_output_without_delta() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let client_capabilities = Arc::new(std::sync::Mutex::new(ClientCapabilities::new().meta(
+            Meta::from_iter([("terminal_output".to_string(), serde_json::json!(true))]),
+        )));
+        let client_info = Arc::new(std::sync::Mutex::new(Some(
+            Implementation::new("zed", "0.0.0").title("Zed"),
+        )));
+        let session_client = SessionClient::with_client_info(
+            session_id,
+            client.clone(),
+            client_capabilities,
+            client_info,
+        );
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state =
+            PromptState::new("submission-id".to_string(), thread, message_tx, response_tx);
+
+        prompt_state.exec_command_begin(
+            &session_client,
+            ExecCommandBeginEvent {
+                call_id: "call-id".to_string(),
+                process_id: None,
+                turn_id: "turn-id".to_string(),
+                command: vec!["date".to_string()],
+                cwd: std::env::current_dir()?.try_into()?,
+                parsed_cmd: vec![ParsedCommand::Unknown {
+                    cmd: "date".to_string(),
+                }],
+                source: Default::default(),
+                interaction_input: None,
+            },
+        );
+        prompt_state.exec_command_end(
+            &session_client,
+            ExecCommandEndEvent {
+                call_id: "call-id".to_string(),
+                process_id: None,
+                turn_id: "turn-id".to_string(),
+                command: vec!["date".to_string()],
+                cwd: std::env::current_dir()?.try_into()?,
+                parsed_cmd: vec![],
+                source: Default::default(),
+                interaction_input: None,
+                stdout: "hello\n".to_string(),
+                stderr: String::new(),
+                aggregated_output: "hello\n".to_string(),
+                exit_code: 0,
+                duration: Duration::from_millis(1),
+                formatted_output: "hello\n".to_string(),
+                status: ExecCommandStatus::Completed,
+            },
+        );
+
+        let notifications = client.notifications.lock().unwrap();
+        let tool_updates: Vec<_> = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCallUpdate(update) => Some(update.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(tool_updates.len(), 2);
+        assert_eq!(
+            tool_updates[0]
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("terminal_output"))
+                .and_then(|value| value.get("data"))
+                .and_then(|value| value.as_str()),
+            Some("hello\n")
+        );
+        assert_eq!(
+            tool_updates[1]
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("terminal_exit"))
+                .and_then(|value| value.get("terminal_id"))
+                .and_then(|value| value.as_str()),
+            Some("call-id")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_terminal_capability_falls_back_to_content_snapshots() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let client_capabilities = Arc::new(std::sync::Mutex::new(ClientCapabilities::new().meta(
+            Meta::from_iter([("terminal_output".to_string(), serde_json::json!(true))]),
+        )));
+        let session_client = SessionClient::with_client_info(
+            session_id,
+            client.clone(),
+            client_capabilities,
+            Arc::default(),
+        );
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state =
+            PromptState::new("submission-id".to_string(), thread, message_tx, response_tx);
+        let cwd = std::env::current_dir()?;
+
+        prompt_state.exec_command_begin(
+            &session_client,
+            ExecCommandBeginEvent {
+                call_id: "call-id".to_string(),
+                process_id: None,
+                turn_id: "turn-id".to_string(),
+                command: vec!["echo".to_string(), "hello".to_string()],
+                cwd: cwd.clone().try_into()?,
+                parsed_cmd: vec![ParsedCommand::Unknown {
+                    cmd: "echo hello".to_string(),
+                }],
+                source: Default::default(),
+                interaction_input: None,
+            },
+        );
+        prompt_state.exec_command_output_delta(
+            &session_client,
+            ExecCommandOutputDeltaEvent {
+                call_id: "call-id".to_string(),
+                chunk: b"hello\n".to_vec(),
+                stream: codex_protocol::protocol::ExecOutputStream::Stdout,
+            },
+        );
+        prompt_state.exec_command_end(
+            &session_client,
+            ExecCommandEndEvent {
+                call_id: "call-id".to_string(),
+                process_id: None,
+                turn_id: "turn-id".to_string(),
+                command: vec!["echo".to_string(), "hello".to_string()],
+                cwd: cwd.try_into()?,
+                parsed_cmd: vec![],
+                source: Default::default(),
+                interaction_input: None,
+                stdout: "hello\n".to_string(),
+                stderr: String::new(),
+                aggregated_output: "hello\n".to_string(),
+                exit_code: 0,
+                duration: Duration::from_millis(1),
+                formatted_output: "hello\n".to_string(),
+                status: ExecCommandStatus::Completed,
+            },
+        );
+
+        let notifications = client.notifications.lock().unwrap();
+        let tool_call = notifications
+            .iter()
+            .find_map(|notification| match &notification.update {
+                SessionUpdate::ToolCall(tool_call) => Some(tool_call.clone()),
+                _ => None,
+            })
+            .expect("expected initial tool call");
+        assert!(matches!(
+            tool_call.content.first(),
+            Some(ToolCallContent::Content(Content {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            })) if text.contains("Waiting for command output")
+        ));
+
+        let tool_updates: Vec<_> = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCallUpdate(update) => Some(update.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(tool_updates.len(), 2);
+        assert!(tool_updates.iter().all(|update| update.meta.is_none()));
+        assert_eq!(
+            tool_updates[0].fields.status,
+            Some(ToolCallStatus::InProgress)
+        );
+        assert!(matches!(
+            tool_updates[0]
+                .fields
+                .content
+                .as_ref()
+                .and_then(|content| content.first()),
+            Some(ToolCallContent::Content(Content {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            })) if text.contains("hello")
+        ));
+        assert_eq!(
+            tool_updates[1].fields.status,
+            Some(ToolCallStatus::Completed)
+        );
+        assert!(matches!(
+            tool_updates[1]
+                .fields
+                .content
+                .as_ref()
+                .and_then(|content| content.first()),
+            Some(ToolCallContent::Content(Content {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            })) if text.contains("hello")
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_exec_completion_without_output_keeps_visible_snapshot() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state =
+            PromptState::new("submission-id".to_string(), thread, message_tx, response_tx);
+
+        prompt_state.exec_command_begin(
+            &session_client,
+            ExecCommandBeginEvent {
+                call_id: "call-id".to_string(),
+                process_id: None,
+                turn_id: "turn-id".to_string(),
+                command: vec!["true".to_string()],
+                cwd: std::env::current_dir()?.try_into()?,
+                parsed_cmd: vec![ParsedCommand::Unknown {
+                    cmd: "true".to_string(),
+                }],
+                source: Default::default(),
+                interaction_input: None,
+            },
+        );
+        prompt_state.exec_command_end(
+            &session_client,
+            ExecCommandEndEvent {
+                call_id: "call-id".to_string(),
+                process_id: None,
+                turn_id: "turn-id".to_string(),
+                command: vec!["true".to_string()],
+                cwd: std::env::current_dir()?.try_into()?,
+                parsed_cmd: vec![],
+                source: Default::default(),
+                interaction_input: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                aggregated_output: String::new(),
+                exit_code: 0,
+                duration: Duration::from_millis(1),
+                formatted_output: String::new(),
+                status: ExecCommandStatus::Completed,
+            },
+        );
+
+        let notifications = client.notifications.lock().unwrap();
+        let update = notifications
+            .iter()
+            .find_map(|notification| match &notification.update {
+                SessionUpdate::ToolCallUpdate(update) => Some(update.clone()),
+                _ => None,
+            })
+            .expect("expected tool call completion update");
+
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Completed));
+        assert!(matches!(
+            update.fields.content.as_ref().and_then(|content| content.first()),
+            Some(ToolCallContent::Content(Content {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            })) if text.contains("completed with no output")
+        ));
 
         Ok(())
     }

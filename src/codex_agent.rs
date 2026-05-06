@@ -45,6 +45,8 @@ pub struct CodexAgent {
     auth_manager: Arc<AuthManager>,
     /// Capabilities of the connected client
     client_capabilities: Arc<Mutex<ClientCapabilities>>,
+    /// Information about the connected client implementation
+    client_info: Arc<Mutex<Option<Implementation>>>,
     /// The underlying codex configuration
     config: Config,
     /// Thread manager for handling sessions
@@ -73,6 +75,7 @@ impl CodexAgent {
         .await;
 
         let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
+        let client_info: Arc<Mutex<Option<Implementation>>> = Arc::default();
         let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
         let thread_manager = ThreadManager::new(
             &config,
@@ -90,6 +93,7 @@ impl CodexAgent {
         Ok(Self {
             auth_manager,
             client_capabilities,
+            client_info,
             config,
             thread_manager,
             sessions: Arc::default(),
@@ -416,13 +420,14 @@ impl CodexAgent {
         let InitializeRequest {
             protocol_version,
             client_capabilities,
-            client_info: _, // TODO: save and pass into Codex somehow
+            client_info,
             ..
         } = request;
         debug!("Received initialize request with protocol version {protocol_version:?}",);
         let protocol_version = ProtocolVersion::V1;
 
         *self.client_capabilities.lock().unwrap() = client_capabilities;
+        *self.client_info.lock().unwrap() = client_info;
 
         let mut agent_capabilities = AgentCapabilities::new()
             .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
@@ -564,6 +569,7 @@ impl CodexAgent {
             self.auth_manager.clone(),
             Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
+            self.client_info.clone(),
             config.clone(),
             cx,
         ));
@@ -636,6 +642,7 @@ impl CodexAgent {
             self.auth_manager.clone(),
             Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
+            self.client_info.clone(),
             config.clone(),
             cx,
         ));
