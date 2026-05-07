@@ -218,6 +218,12 @@ jobs:
           # build does the same (see MODULE.bazel).
           echo "AWS_LC_SYS_NO_JITTER_ENTROPY=1" >> "$GITHUB_ENV"
 
+      - name: Install bundled bwrap (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-bundled-bwrap.sh"
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -262,7 +268,14 @@ jobs:
             echo "archive_name=${ARCHIVE_NAME}.zip" >> $GITHUB_OUTPUT
             mv "${ARCHIVE_NAME}.zip" ../../../
           else
-            tar czf "${ARCHIVE_NAME}.tar.gz" "${BINARY_NAME}"
+            archive_items=("${BINARY_NAME}")
+            if [[ "${{ runner.os }}" == "Linux" ]]; then
+              mkdir -p codex-resources
+              cp bwrap codex-resources/bwrap
+              chmod 0755 codex-resources/bwrap
+              archive_items+=(codex-resources/bwrap)
+            fi
+            tar czf "${ARCHIVE_NAME}.tar.gz" "${archive_items[@]}"
             echo "archive_path=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_OUTPUT
             echo "archive_name=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_OUTPUT
             mv "${ARCHIVE_NAME}.tar.gz" ../../../

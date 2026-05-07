@@ -75,7 +75,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: target
-          key: ${{ matrix.os }}-${{ matrix.target }}-cargo-target-${{ hashFiles('**/Cargo.lock', '.github/scripts/install-musl-build-tools.sh') }}
+          key: ${{ matrix.os }}-${{ matrix.target }}-cargo-target-${{ hashFiles('**/Cargo.lock', '.github/scripts/install-musl-build-tools.sh', '.github/scripts/install-bundled-bwrap.sh') }}
 
       - name: Install Linux build dependencies
         if: ${{ runner.os == 'Linux' }}
@@ -190,6 +190,12 @@ jobs:
           # suppress.  Disable jitterentropy entirely — the codex Bazel
           # build does the same (see MODULE.bazel).
           echo "AWS_LC_SYS_NO_JITTER_ENTROPY=1" >> "$GITHUB_ENV"
+
+      - name: Install bundled bwrap (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-bundled-bwrap.sh"
 
       - name: Run tests
         run: cargo test --release --target ${{ matrix.target }}
