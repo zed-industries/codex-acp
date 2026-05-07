@@ -14,8 +14,9 @@ use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
 use codex_config::{McpServerConfig, McpServerTransportConfig};
 use codex_core::{
-    NewThread, RolloutRecorder, SortDirection, ThreadManager, ThreadSortKey, config::Config,
-    find_thread_path_by_id_str, parse_cursor, thread_store_from_config,
+    NewThread, RolloutRecorder, SortDirection, StateDbHandle, ThreadManager, ThreadSortKey,
+    config::Config, find_thread_path_by_id_str, init_state_db, parse_cursor,
+    resolve_installation_id, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, EnvironmentManagerArgs, ExecServerRuntimePaths};
 use codex_login::{
@@ -49,6 +50,8 @@ pub struct CodexAgent {
     config: Config,
     /// Thread manager for handling sessions
     thread_manager: ThreadManager,
+    /// SQLite-backed Codex state index, when initialization succeeds
+    state_db: Option<StateDbHandle>,
     /// Active sessions mapped by `SessionId`
     sessions: Arc<Mutex<HashMap<SessionId, Arc<Thread>>>>,
     /// Session working directories for filesystem sandboxing
@@ -74,24 +77,32 @@ impl CodexAgent {
 
         let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
         let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
+        let state_db = init_state_db(&config).await;
+        let environment_manager = Arc::new(
+            EnvironmentManager::new(EnvironmentManagerArgs::new(ExecServerRuntimePaths::new(
+                std::env::current_exe()?,
+                codex_linux_sandbox_exe,
+            )?))
+            .await,
+        );
+        let thread_store = thread_store_from_config(&config, state_db.clone());
+        let installation_id = resolve_installation_id(&config.codex_home).await?;
         let thread_manager = ThreadManager::new(
             &config,
             auth_manager.clone(),
             SessionSource::Unknown,
-            Arc::new(
-                EnvironmentManager::new(EnvironmentManagerArgs::new(ExecServerRuntimePaths::new(
-                    std::env::current_exe()?,
-                    codex_linux_sandbox_exe,
-                )?))
-                .await,
-            ),
+            environment_manager,
             None,
+            thread_store,
+            state_db.clone(),
+            installation_id,
         );
         Ok(Self {
             auth_manager,
             client_capabilities,
             config,
             thread_manager,
+            state_db,
             sessions: Arc::default(),
             session_roots,
         })
@@ -545,12 +556,9 @@ impl CodexAgent {
             thread_id,
             thread,
             session_configured: _,
-        } = Box::pin(
-            self.thread_manager
-                .start_thread(config.clone(), thread_store_from_config(&config)),
-        )
-        .await
-        .map_err(|_e| Error::internal_error())?;
+        } = Box::pin(self.thread_manager.start_thread(config.clone()))
+            .await
+            .map_err(|_e| Error::internal_error())?;
 
         let session_id = Self::session_id_from_thread_id(thread_id);
         // Record the session root for filesystem sandboxing.
@@ -598,11 +606,14 @@ impl CodexAgent {
             ..
         } = request;
 
-        let rollout_path =
-            find_thread_path_by_id_str(&self.config.codex_home, session_id.0.as_ref())
-                .await
-                .map_err(|e| Error::internal_error().data(e.to_string()))?
-                .ok_or_else(|| Error::resource_not_found(None))?;
+        let rollout_path = find_thread_path_by_id_str(
+            &self.config.codex_home,
+            session_id.0.as_ref(),
+            self.state_db.as_deref(),
+        )
+        .await
+        .map_err(|e| Error::internal_error().data(e.to_string()))?
+        .ok_or_else(|| Error::resource_not_found(None))?;
 
         let history = RolloutRecorder::get_rollout_history(&rollout_path)
             .await
@@ -622,7 +633,6 @@ impl CodexAgent {
             session_configured: _,
         } = Box::pin(self.thread_manager.resume_thread_from_rollout(
             config.clone(),
-            thread_store_from_config(&config),
             rollout_path,
             self.auth_manager.clone(),
             None,
@@ -666,6 +676,7 @@ impl CodexAgent {
         let cursor_obj = cursor.as_deref().and_then(parse_cursor);
 
         let page = RolloutRecorder::list_threads(
+            self.state_db.clone(),
             &self.config,
             SESSION_LIST_PAGE_SIZE,
             cursor_obj.as_ref(),

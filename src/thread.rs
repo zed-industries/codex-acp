@@ -17,11 +17,11 @@ use agent_client_protocol::{
         RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
         ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
         SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-        SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
-        SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason,
-        Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId,
-        ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-        UnstructuredCommandInput, UsageUpdate,
+        SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
+        SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
+        TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
+        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+        UsageUpdate,
     },
 };
 use codex_apply_patch::parse_patch;
@@ -793,7 +793,7 @@ fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> String {
 }
 
 enum SubmissionState {
-    /// User prompts, including slash commands like /init, /review, /compact, /undo.
+    /// User prompts, including slash commands like /init, /review, /compact.
     Prompt(PromptState),
 }
 
@@ -1116,7 +1116,7 @@ impl PromptState {
                         )));
                     }
             }
-            EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
+            EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item , started_at_ms: _}) => {
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
             }
             EventMsg::UserMessage(UserMessageEvent {
@@ -1176,14 +1176,6 @@ impl PromptState {
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_reasoning_deltas) {
                     client.send_agent_thought(text);
-                }
-            }
-            EventMsg::ThreadNameUpdated(event) => {
-                info!("Thread name updated: {:?}", event.thread_name);
-                if let Some(title) = event.thread_name {
-                    client.send_notification(SessionUpdate::SessionInfoUpdate(
-                        SessionInfoUpdate::new().title(title),
-                    ));
                 }
             }
             EventMsg::ThreadGoalUpdated(event) => {
@@ -1247,7 +1239,7 @@ impl PromptState {
                 );
                 self.terminal_interaction(client, event);
             }
-            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, namespace, tool, arguments }) => {
+            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, namespace, tool, arguments, started_at_ms: _ }) => {
                 info!("Dynamic tool call request: call_id={call_id}, turn_id={turn_id}, namespace={namespace:?}, tool={tool}");
                 self.start_dynamic_tool_call(client, call_id, tool, arguments);
             }
@@ -1319,6 +1311,7 @@ impl PromptState {
                 thread_id,
                 turn_id,
                 item,
+                completed_at_ms: _,
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
             }
@@ -1331,21 +1324,6 @@ impl PromptState {
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
-            }
-            EventMsg::UndoStarted(event) => {
-                client.send_agent_text(
-                    event
-                        .message
-                        .unwrap_or_else(|| "Undo in progress...".to_string()),
-                );
-            }
-            EventMsg::UndoCompleted(event) => {
-                let fallback = if event.success {
-                    "Undo completed.".to_string()
-                } else {
-                    "Undo failed.".to_string()
-                };
-                client.send_agent_text(event.message.unwrap_or(fallback));
             }
             EventMsg::StreamError(StreamErrorEvent {
                 message,
@@ -1470,13 +1448,8 @@ impl PromptState {
             | EventMsg::HookCompleted(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
-            // Revisit when we can emit status updates
-            | EventMsg::BackgroundEvent(..)
             | EventMsg::SkillsUpdateAvailable
             // Old events
-            | EventMsg::AgentMessageDelta(..)
-            | EventMsg::AgentReasoningDelta(..)
-            | EventMsg::AgentReasoningRawContentDelta(..)
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..)
             // TODO: Subagent UI?
@@ -1495,11 +1468,7 @@ impl PromptState {
             | EventMsg::CollabCloseBegin(..)
             | EventMsg::CollabCloseEnd(..)
             | EventMsg::PlanDelta(..)=> {}
-            e @ (EventMsg::McpListToolsResponse(..)
-            | EventMsg::ListSkillsResponse(..)
-            | EventMsg::RealtimeConversationListVoicesResponse(..)
-            // Used for returning a single history entry
-            | EventMsg::GetHistoryEntryResponse(..)
+            e @ (EventMsg::RealtimeConversationListVoicesResponse(..)
             | EventMsg::DeprecationNotice(..)
             | EventMsg::RequestUserInput(..)) => {
                 warn!("Unexpected event: {:?}", e);
@@ -1762,6 +1731,7 @@ impl PromptState {
             turn_id: _,
             tool: _,
             arguments: _,
+            completed_at_ms: _,
             namespace: _,
             content_items,
             success,
@@ -1968,6 +1938,7 @@ impl PromptState {
             interaction_input: _,
             call_id,
             command: _,
+            started_at_ms: _,
             cwd,
             parsed_cmd,
             process_id: _,
@@ -2081,6 +2052,7 @@ impl PromptState {
             duration: _,
             formatted_output: _,
             process_id: _,
+            completed_at_ms: _,
             status,
         } = event;
         if let Some(active_command) = self.active_commands.remove(&call_id) {
@@ -2882,7 +2854,6 @@ impl<A: Auth> ThreadActor<A> {
                 "compact",
                 "summarize conversation to prevent hitting the context limit",
             ),
-            AvailableCommand::new("undo", "undo Codex’s most recent turn"),
             AvailableCommand::new("logout", "logout of Codex"),
         ]
     }
@@ -3215,7 +3186,6 @@ impl<A: Auth> ThreadActor<A> {
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
                 "compact" => op = Op::Compact,
-                "undo" => op = Op::Undo,
                 "init" => {
                     op = Op::UserInput {
                         items: vec![UserInput::Text {
@@ -4313,47 +4283,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_undo() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, _handle) = setup().await?;
-        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
-
-        message_tx.send(ThreadMessage::Prompt {
-            request: PromptRequest::new(session_id.clone(), vec!["/undo".into()]),
-            response_tx: prompt_response_tx,
-        })?;
-
-        let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
-        drop(message_tx);
-
-        let notifications = client.notifications.lock().unwrap();
-        assert_eq!(
-            notifications.len(),
-            2,
-            "notifications don't match {notifications:?}"
-        );
-        assert!(matches!(
-            &notifications[0].update,
-            SessionUpdate::AgentMessageChunk(ContentChunk {
-                content: ContentBlock::Text(TextContent { text, .. }),
-                ..
-            }) if text == "Undo in progress..."
-        ));
-        assert!(matches!(
-            &notifications[1].update,
-            SessionUpdate::AgentMessageChunk(ContentChunk {
-                content: ContentBlock::Text(TextContent { text, .. }),
-                ..
-            }) if text == "Undo completed."
-        ));
-
-        let ops = thread.ops.lock().unwrap();
-        assert_eq!(ops.as_slice(), &[Op::Undo]);
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_init() -> anyhow::Result<()> {
         let (session_id, client, thread, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -4740,6 +4669,7 @@ mod tests {
                                 }],
                                 source: Default::default(),
                                 interaction_input: None,
+                                started_at_ms: 0,
                             }));
                             send(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                                 call_id: "call-b".into(),
@@ -4752,6 +4682,7 @@ mod tests {
                                 }],
                                 source: Default::default(),
                                 interaction_input: None,
+                                started_at_ms: 0,
                             }));
                             send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                                 call_id: "call-a".into(),
@@ -4769,6 +4700,7 @@ mod tests {
                                 duration: std::time::Duration::from_millis(10),
                                 formatted_output: "a\n".into(),
                                 status: ExecCommandStatus::Completed,
+                                completed_at_ms: 0,
                             }));
                             send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                                 call_id: "call-b".into(),
@@ -4786,6 +4718,7 @@ mod tests {
                                 duration: std::time::Duration::from_millis(10),
                                 formatted_output: "b\n".into(),
                                 status: ExecCommandStatus::Completed,
+                                completed_at_ms: 0,
                             }));
                             send(EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
@@ -4912,41 +4845,6 @@ mod tests {
                                     phase: None,
                                     memory_citation: None,
                                 }),
-                            })
-                            .unwrap();
-                        self.op_tx
-                            .send(Event {
-                                id: id.to_string(),
-                                msg: EventMsg::TurnComplete(TurnCompleteEvent {
-                                    last_agent_message: None,
-                                    turn_id: id.to_string(),
-                                    completed_at: None,
-                                    duration_ms: None,
-                                    time_to_first_token_ms: None,
-                                }),
-                            })
-                            .unwrap();
-                    }
-                    Op::Undo => {
-                        self.op_tx
-                            .send(Event {
-                                id: id.to_string(),
-                                msg: EventMsg::UndoStarted(
-                                    codex_protocol::protocol::UndoStartedEvent {
-                                        message: Some("Undo in progress...".to_string()),
-                                    },
-                                ),
-                            })
-                            .unwrap();
-                        self.op_tx
-                            .send(Event {
-                                id: id.to_string(),
-                                msg: EventMsg::UndoCompleted(
-                                    codex_protocol::protocol::UndoCompletedEvent {
-                                        success: true,
-                                        message: Some("Undo completed.".to_string()),
-                                    },
-                                ),
                             })
                             .unwrap();
                         self.op_tx

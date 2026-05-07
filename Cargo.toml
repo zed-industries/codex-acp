@@ -21,18 +21,18 @@ path = "src/lib.rs"
 agent-client-protocol = { version = "=0.11.1", features = ["unstable"] }
 anyhow = "1"
 clap = "4"
-codex-apply-patch = { git = "https://github.com/openai/codex", tag = "rust-v0.128.0" }
-codex-arg0 = { git = "https://github.com/openai/codex", tag = "rust-v0.128.0" }
-codex-config = { git = "https://github.com/openai/codex", tag = "rust-v0.128.0" }
-codex-core = { git = "https://github.com/openai/codex", tag = "rust-v0.128.0" }
-codex-exec-server = { git = "https://github.com/openai/codex", tag = "rust-v0.128.0" }
-codex-mcp-server = { git = "https://github.com/openai/codex", tag = "rust-v0.128.0" }
-codex-models-manager = { git = "https://github.com/openai/codex", tag = "rust-v0.128.0" }
-codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.128.0" }
-codex-login = { git = "https://github.com/openai/codex", tag = "rust-v0.128.0" }
-codex-shell-command = { git = "https://github.com/openai/codex", tag = "rust-v0.128.0" }
-codex-utils-approval-presets = { git = "https://github.com/openai/codex", tag = "rust-v0.128.0" }
-codex-utils-cli = { git = "https://github.com/openai/codex", tag = "rust-v0.128.0" }
+codex-apply-patch = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
+codex-arg0 = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
+codex-config = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
+codex-core = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
+codex-exec-server = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
+codex-mcp-server = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
+codex-models-manager = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
+codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
+codex-login = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
+codex-shell-command = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
+codex-utils-approval-presets = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
+codex-utils-cli = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
 diffy = { version = "0.5.0", features = ["std"] }
 # Pin gix-actor to 0.40.0 because 0.40.1 bumped winnow to 1.0 in what is
 # technically a patch release, which makes it incompatible with gix-object
