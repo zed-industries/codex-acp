@@ -1519,7 +1519,7 @@ checksum = "e9b18233253483ce2f65329a24072ec414db782531bdbb7d0bbc4bd2ce6b7e21"
 
 [[package]]
 name = "codex-acp"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
