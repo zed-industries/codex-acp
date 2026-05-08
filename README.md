@@ -16,6 +16,7 @@ This tool implements an ACP adapter around the Codex CLI, supporting:
   - /review-commit
   - /init
   - /compact
+  - /fast
   - /logout
   - Custom Prompts
 - Client MCP servers
