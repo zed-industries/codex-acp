@@ -12,16 +12,16 @@ use agent_client_protocol::{
     schema::{
         AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ClientCapabilities,
         ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
-        EmbeddedResourceResource, LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption,
-        PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-        RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-        ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-        SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-        SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
-        SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
-        TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
-        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
-        UsageUpdate,
+        EmbeddedResourceResource, ImageContent, LoadSessionResponse, Meta, ModelId, ModelInfo,
+        PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+        PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+        RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionConfigId,
+        SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+        SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionMode, SessionModeId,
+        SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason,
+        Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId,
+        ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+        UnstructuredCommandInput, UsageUpdate,
     },
 };
 use codex_apply_patch::parse_patch;
@@ -58,14 +58,15 @@ use codex_protocol::{
         ApplyPatchApprovalRequestEvent, DynamicToolCallResponseEvent, ElicitationAction,
         ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
-        FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ItemCompletedEvent,
-        ItemStartedEvent, McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent,
-        McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext,
-        NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
-        PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
-        ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem,
-        StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
-        TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ImageGenerationBeginEvent,
+        ImageGenerationEndEvent, ItemCompletedEvent, ItemStartedEvent, McpInvocation,
+        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
+        ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
+        PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
+        ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
+        ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, StreamErrorEvent,
+        TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent, TokenCountEvent,
+        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
         ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
@@ -853,6 +854,7 @@ struct PromptState {
     submission_id: String,
     active_commands: HashMap<String, ActiveCommand>,
     active_web_search: Option<String>,
+    active_image_generations: HashSet<String>,
     active_guardian_assessments: HashSet<String>,
     thread: Arc<dyn CodexThreadImpl>,
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
@@ -874,6 +876,7 @@ impl PromptState {
             submission_id,
             active_commands: HashMap::new(),
             active_web_search: None,
+            active_image_generations: HashSet::new(),
             active_guardian_assessments: HashSet::new(),
             thread,
             resolution_tx,
@@ -1077,6 +1080,8 @@ impl PromptState {
             | EventMsg::WebSearchBegin(..)
             | EventMsg::UserMessage(..)
             | EventMsg::ExecApprovalRequest(..)
+            | EventMsg::ImageGenerationBegin(..)
+            | EventMsg::ImageGenerationEnd(..)
             | EventMsg::ExecCommandBegin(..)
             | EventMsg::ExecCommandOutputDelta(..)
             | EventMsg::ExecCommandEnd(..)
@@ -1203,6 +1208,17 @@ impl PromptState {
                 self.update_web_search_query(client, call_id, query, action);
                 // The actual search results will come through AgentMessage events
                 // We mark as completed when a new tool call begins
+            }
+            EventMsg::ImageGenerationBegin(event) => {
+                info!("Image generation started: call_id={}", event.call_id);
+                self.start_image_generation(client, event);
+            }
+            EventMsg::ImageGenerationEnd(event) => {
+                info!(
+                    "Image generation ended: call_id={}, status={}",
+                    event.call_id, event.status
+                );
+                self.end_image_generation(client, event);
             }
             EventMsg::ExecApprovalRequest(event) => {
                 info!(
@@ -1440,9 +1456,7 @@ impl PromptState {
             }
 
             // Ignore these events
-            EventMsg::ImageGenerationBegin(..)
-            | EventMsg::ImageGenerationEnd(..)
-            | EventMsg::AgentReasoningRawContent(..)
+            EventMsg::AgentReasoningRawContent(..)
             | EventMsg::ThreadRolledBack(..)
             | EventMsg::HookStarted(..)
             | EventMsg::HookCompleted(..)
@@ -2135,6 +2149,50 @@ impl PromptState {
     fn start_web_search(&mut self, client: &SessionClient, call_id: String) {
         self.active_web_search = Some(call_id.clone());
         client.send_tool_call(ToolCall::new(call_id, "Searching the Web").kind(ToolKind::Fetch));
+    }
+
+    fn start_image_generation(&mut self, client: &SessionClient, event: ImageGenerationBeginEvent) {
+        let raw_input = serde_json::json!(&event);
+        let ImageGenerationBeginEvent { call_id } = event;
+        self.active_image_generations.insert(call_id.clone());
+        client.send_tool_call(
+            ToolCall::new(call_id, "Image generation")
+                .kind(ToolKind::Other)
+                .status(ToolCallStatus::InProgress)
+                .raw_input(raw_input),
+        );
+    }
+
+    fn end_image_generation(&mut self, client: &SessionClient, event: ImageGenerationEndEvent) {
+        let raw_output = serde_json::json!(&event);
+        let ImageGenerationEndEvent {
+            call_id,
+            status,
+            revised_prompt,
+            result,
+            saved_path,
+        } = event;
+        let tool_status = image_generation_tool_status(&status);
+        let saved_path = saved_path.map(|path| path.to_string_lossy().into_owned());
+        let content = image_generation_content(revised_prompt, result, saved_path);
+
+        if self.active_image_generations.remove(&call_id) {
+            client.send_tool_call_update(ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(tool_status)
+                    .content(content)
+                    .raw_output(raw_output),
+            ));
+        } else {
+            client.send_tool_call(
+                ToolCall::new(call_id, "Image generation")
+                    .kind(ToolKind::Other)
+                    .status(tool_status)
+                    .content(content)
+                    .raw_output(raw_output),
+            );
+        }
     }
 
     fn update_web_search_query(
@@ -3707,6 +3765,28 @@ impl<A: Auth> ThreadActor<A> {
                         .status(ToolCallStatus::Completed),
                 );
             }
+            ResponseItem::ImageGenerationCall {
+                id,
+                status,
+                revised_prompt,
+                result,
+            } => {
+                self.client.send_tool_call(
+                    ToolCall::new(id.clone(), "Image generation")
+                        .kind(ToolKind::Other)
+                        .status(image_generation_tool_status(status))
+                        .content(image_generation_content(
+                            revised_prompt.clone(),
+                            result.clone(),
+                            None,
+                        ))
+                        .raw_output(serde_json::json!({
+                            "status": status,
+                            "revised_prompt": revised_prompt,
+                            "result": result,
+                        })),
+                );
+            }
             // Skip GhostSnapshot, Compaction, Other, LocalShellCall without call_id
             _ => {}
         }
@@ -4059,6 +4139,45 @@ fn web_search_action_to_title_and_id(
     }
 }
 
+fn image_generation_tool_status(status: &str) -> ToolCallStatus {
+    match status {
+        "completed" => ToolCallStatus::Completed,
+        "generating" | "in_progress" | "incomplete" => ToolCallStatus::InProgress,
+        "failed" => ToolCallStatus::Failed,
+        _ => ToolCallStatus::Completed,
+    }
+}
+
+fn image_generation_content(
+    revised_prompt: Option<String>,
+    result: String,
+    saved_path: Option<String>,
+) -> Vec<ToolCallContent> {
+    let mut content = Vec::new();
+
+    if let Some(revised_prompt) = revised_prompt.filter(|prompt| !prompt.trim().is_empty()) {
+        content.push(ToolCallContent::Content(Content::new(ContentBlock::Text(
+            TextContent::new(format!("Revised prompt: {revised_prompt}")),
+        ))));
+    }
+
+    if !result.is_empty() {
+        let mut image = ImageContent::new(result, "image/png");
+        if let Some(saved_path) = saved_path
+            .as_ref()
+            .filter(|saved_path| !saved_path.trim().is_empty())
+        {
+            image = image.uri(saved_path.clone());
+        }
+
+        content.push(ToolCallContent::Content(Content::new(ContentBlock::Image(
+            image,
+        ))));
+    }
+
+    content
+}
+
 /// Generate a fallback ID using UUID (used when id is missing)
 fn generate_fallback_id(prefix: &str) -> String {
     format!("{}_{}", prefix, Uuid::new_v4())
@@ -4155,6 +4274,76 @@ mod tests {
                 }) if text == "Goal updated (active): Ship the goal update"
             )
         }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_image_generation_emits_image_content() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["image-generation".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        let tool_call = notifications
+            .iter()
+            .find_map(|notification| match &notification.update {
+                SessionUpdate::ToolCall(tool_call)
+                    if tool_call.tool_call_id.0.as_ref() == "ig-1" =>
+                {
+                    Some(tool_call)
+                }
+                _ => None,
+            })
+            .expect("image generation tool call should be sent");
+        assert_eq!(tool_call.title, "Image generation");
+        assert_eq!(tool_call.status, ToolCallStatus::InProgress);
+
+        let update = notifications
+            .iter()
+            .find_map(|notification| match &notification.update {
+                SessionUpdate::ToolCallUpdate(update)
+                    if update.tool_call_id.0.as_ref() == "ig-1" =>
+                {
+                    Some(update)
+                }
+                _ => None,
+            })
+            .expect("image generation tool call update should be sent");
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Completed));
+        let content = update
+            .fields
+            .content
+            .as_ref()
+            .expect("image generation update should include content");
+        assert_eq!(content.len(), 2);
+        assert!(matches!(
+            &content[0],
+            ToolCallContent::Content(Content {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Revised prompt: A tiny blue square"
+        ));
+        assert!(matches!(
+            &content[1],
+            ToolCallContent::Content(Content {
+                content: ContentBlock::Image(ImageContent {
+                    data,
+                    mime_type,
+                    uri,
+                    ..
+                }),
+                ..
+            }) if data == "Zm9v" && mime_type == "image/png" && uri.as_deref() == Some("/tmp/ig-1.png")
+        ));
 
         Ok(())
     }
@@ -4719,6 +4908,33 @@ mod tests {
                                 formatted_output: "b\n".into(),
                                 status: ExecCommandStatus::Completed,
                                 completed_at_ms: 0,
+                            }));
+                            send(EventMsg::TurnComplete(TurnCompleteEvent {
+                                last_agent_message: None,
+                                turn_id,
+                                completed_at: None,
+                                duration_ms: None,
+                                time_to_first_token_ms: None,
+                            }));
+                        } else if prompt == "image-generation" {
+                            let turn_id = id.to_string();
+                            let send = |msg| {
+                                self.op_tx
+                                    .send(Event {
+                                        id: id.to_string(),
+                                        msg,
+                                    })
+                                    .unwrap();
+                            };
+                            send(EventMsg::ImageGenerationBegin(ImageGenerationBeginEvent {
+                                call_id: "ig-1".into(),
+                            }));
+                            send(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
+                                call_id: "ig-1".into(),
+                                status: "completed".into(),
+                                revised_prompt: Some("A tiny blue square".into()),
+                                result: "Zm9v".into(),
+                                saved_path: Some("/tmp/ig-1.png".try_into()?),
                             }));
                             send(EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
