@@ -2133,8 +2133,8 @@ impl PromptState {
         let stdin = format!("\n{stdin}\n");
         // Stream output bytes to the display-only terminal via ToolCallUpdate meta.
         if let Some(active_command) = self.active_commands.get_mut(&call_id) {
-            let update = if client.supports_terminal_output(active_command) {
-                ToolCallUpdate::new(
+            if client.supports_terminal_output(active_command) {
+                let update = ToolCallUpdate::new(
                     active_command.tool_call_id.clone(),
                     ToolCallUpdateFields::new(),
                 )
@@ -2144,27 +2144,15 @@ impl PromptState {
                         "terminal_id": call_id,
                         "data": stdin
                     }),
-                )]))
+                )]));
+                client.send_tool_call_update(update);
             } else {
+                // Fallback path: accumulate stdin into the active command buffer and
+                // defer emission to exec_command_end. Emitting per stdin event would
+                // re-send the entire output+stdin buffer each time and reintroduce the
+                // O(N²) growth fixed in the delta path.
                 active_command.output.push_str(&stdin);
-                let content = match active_command.file_extension.as_deref() {
-                    Some("md") => active_command.output.clone(),
-                    Some(ext) => format!(
-                        "```{ext}\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                    None => format!(
-                        "```sh\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                };
-                ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new().content(vec![content.into()]),
-                )
-            };
-
-            client.send_tool_call_update(update);
+            }
         }
     }
 
