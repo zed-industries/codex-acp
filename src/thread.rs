@@ -4211,6 +4211,7 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -4282,6 +4283,9 @@ mod tests {
     async fn test_image_generation_emits_image_content() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+        let expected_uri = image_generation_test_saved_path()
+            .to_string_lossy()
+            .into_owned();
 
         message_tx.send(ThreadMessage::Prompt {
             request: PromptRequest::new(session_id.clone(), vec!["image-generation".into()]),
@@ -4342,10 +4346,14 @@ mod tests {
                     ..
                 }),
                 ..
-            }) if data == "Zm9v" && mime_type == "image/png" && uri.as_deref() == Some("/tmp/ig-1.png")
+            }) if data == "Zm9v" && mime_type == "image/png" && uri.as_deref() == Some(expected_uri.as_str())
         ));
 
         Ok(())
+    }
+
+    fn image_generation_test_saved_path() -> PathBuf {
+        std::env::temp_dir().join("ig-1.png")
     }
 
     #[tokio::test]
@@ -4918,6 +4926,7 @@ mod tests {
                             }));
                         } else if prompt == "image-generation" {
                             let turn_id = id.to_string();
+                            let saved_path = image_generation_test_saved_path();
                             let send = |msg| {
                                 self.op_tx
                                     .send(Event {
@@ -4934,7 +4943,7 @@ mod tests {
                                 status: "completed".into(),
                                 revised_prompt: Some("A tiny blue square".into()),
                                 result: "Zm9v".into(),
-                                saved_path: Some("/tmp/ig-1.png".try_into()?),
+                                saved_path: Some(saved_path.try_into()?),
                             }));
                             send(EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
