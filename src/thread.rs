@@ -2029,8 +2029,8 @@ impl PromptState {
         if let Some(active_command) = self.active_commands.get_mut(&call_id) {
             let data_str = String::from_utf8_lossy(&chunk).to_string();
 
-            let update = if client.supports_terminal_output(active_command) {
-                ToolCallUpdate::new(
+            if client.supports_terminal_output(active_command) {
+                let update = ToolCallUpdate::new(
                     active_command.tool_call_id.clone(),
                     ToolCallUpdateFields::new(),
                 )
@@ -2040,27 +2040,15 @@ impl PromptState {
                         "terminal_id": call_id,
                         "data": data_str
                     }),
-                )]))
+                )]));
+                client.send_tool_call_update(update);
             } else {
+                // Fallback path (no terminal_output capability): accumulate locally
+                // and emit a single ToolCallUpdate at exec_command_end. Resending the
+                // entire accumulated buffer per chunk is O(N²) memory and crashes the
+                // process on large outputs (issue #225).
                 active_command.output.push_str(&data_str);
-                let content = match active_command.file_extension.as_deref() {
-                    Some("md") => active_command.output.clone(),
-                    Some(ext) => format!(
-                        "```{ext}\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                    None => format!(
-                        "```sh\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                };
-                ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new().content(vec![content.into()]),
-                )
-            };
-
-            client.send_tool_call_update(update);
+            }
         }
     }
 
@@ -2092,15 +2080,35 @@ impl PromptState {
                 ExecCommandStatus::Failed | ExecCommandStatus::Declined => ToolCallStatus::Failed,
             };
 
+            let supports_terminal = client.supports_terminal_output(&active_command);
+
+            let mut fields = ToolCallUpdateFields::new()
+                .status(status)
+                .raw_output(raw_output);
+
+            // For the non-terminal fallback path the per-chunk delta handler now
+            // accumulates silently (see exec_command_output_delta). Emit the full
+            // buffer here, exactly once, as a single content block. Skip the emission
+            // entirely when the command produced no output, so we don't surface an
+            // empty fenced code block to the client.
+            if !supports_terminal && !active_command.output.is_empty() {
+                let content = match active_command.file_extension.as_deref() {
+                    Some("md") => active_command.output.clone(),
+                    Some(ext) => format!(
+                        "```{ext}\n{}\n```\n",
+                        active_command.output.trim_end_matches('\n')
+                    ),
+                    None => format!(
+                        "```sh\n{}\n```\n",
+                        active_command.output.trim_end_matches('\n')
+                    ),
+                };
+                fields = fields.content(vec![content.into()]);
+            }
+
             client.send_tool_call_update(
-                ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new()
-                        .status(status)
-                        .raw_output(raw_output),
-                )
-                .meta(client.supports_terminal_output(&active_command).then(
-                    || {
+                ToolCallUpdate::new(active_command.tool_call_id.clone(), fields).meta(
+                    supports_terminal.then(|| {
                         Meta::from_iter([(
                             "terminal_exit".into(),
                             serde_json::json!({
@@ -2109,8 +2117,8 @@ impl PromptState {
                                 "signal": null
                             }),
                         )])
-                    },
-                )),
+                    }),
+                ),
             );
         }
     }
