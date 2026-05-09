@@ -25,6 +25,7 @@ codex-apply-patch = { git = "https://github.com/openai/codex", tag = "rust-v0.12
 codex-arg0 = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
 codex-config = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
 codex-core = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
+codex-core-plugins = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
 codex-exec-server = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
 codex-mcp-server = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
 codex-models-manager = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }

@@ -35,7 +35,7 @@ use std::{
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::thread::Thread;
+use crate::thread::{CodexSkillsProvider, Thread};
 
 /// The Codex implementation of the ACP Agent.
 ///
@@ -571,6 +571,10 @@ impl CodexAgent {
             thread,
             self.auth_manager.clone(),
             Arc::new(self.thread_manager.get_models_manager()),
+            Arc::new(CodexSkillsProvider::new(
+                self.thread_manager.skills_manager(),
+                self.thread_manager.plugins_manager(),
+            )),
             self.client_capabilities.clone(),
             config.clone(),
             cx,
@@ -645,6 +649,10 @@ impl CodexAgent {
             thread,
             self.auth_manager.clone(),
             Arc::new(self.thread_manager.get_models_manager()),
+            Arc::new(CodexSkillsProvider::new(
+                self.thread_manager.skills_manager(),
+                self.thread_manager.plugins_manager(),
+            )),
             self.client_capabilities.clone(),
             config.clone(),
             cx,

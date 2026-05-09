@@ -29,7 +29,9 @@ use codex_core::{
     config::{Config, set_project_trust_level},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
+    skills::{SkillLoadOutcome, SkillMetadata, SkillsLoadInput, SkillsManager},
 };
+use codex_core_plugins::PluginsManager;
 use codex_login::auth::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_protocol::{
@@ -58,13 +60,13 @@ use codex_protocol::{
         ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
         FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ImageGenerationBeginEvent,
-        ImageGenerationEndEvent, ItemCompletedEvent, ItemStartedEvent, ListSkillsResponseEvent,
-        McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent,
-        McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction,
-        Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
+        ImageGenerationEndEvent, ItemCompletedEvent, ItemStartedEvent, McpInvocation,
+        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
+        ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
+        PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
         ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
-        ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SkillMetadata,
-        SkillsListEntry, StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus,
+        ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, StreamErrorEvent,
+        TerminalInteractionEvent, ThreadGoalStatus,
         ThreadGoalUpdatedEvent, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
         TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
         WebSearchBeginEvent, WebSearchEndEvent,
@@ -208,37 +210,114 @@ fn mode_trusts_project(mode_id: &str) -> bool {
     matches!(mode_id, "auto" | "full-access")
 }
 
-fn skill_commands(skills: &[SkillMetadata]) -> Vec<AvailableCommand> {
+#[derive(Clone, Debug)]
+pub struct LoadedSkill {
+    metadata: SkillMetadata,
+    enabled: bool,
+}
+
+impl LoadedSkill {
+    fn new(metadata: SkillMetadata, enabled: bool) -> Self {
+        Self { metadata, enabled }
+    }
+}
+
+pub trait SkillsProvider: Send + Sync {
+    fn load_skills(
+        &self,
+        config: Config,
+        force_reload: bool,
+    ) -> Pin<Box<dyn Future<Output = Vec<LoadedSkill>> + Send + '_>>;
+}
+
+pub struct CodexSkillsProvider {
+    skills_manager: Arc<SkillsManager>,
+    plugins_manager: Arc<PluginsManager>,
+}
+
+impl CodexSkillsProvider {
+    pub fn new(skills_manager: Arc<SkillsManager>, plugins_manager: Arc<PluginsManager>) -> Self {
+        Self {
+            skills_manager,
+            plugins_manager,
+        }
+    }
+
+    async fn load_skills_for_config(
+        skills_manager: Arc<SkillsManager>,
+        plugins_manager: Arc<PluginsManager>,
+        config: Config,
+        force_reload: bool,
+    ) -> Vec<LoadedSkill> {
+        if force_reload {
+            skills_manager.clear_cache();
+        }
+
+        let plugins_input = config.plugins_config_input();
+        let effective_skill_roots = plugins_manager
+            .effective_skill_roots_for_layer_stack(&config.config_layer_stack, &plugins_input)
+            .await;
+        let input = SkillsLoadInput::new(
+            config.cwd.clone(),
+            effective_skill_roots,
+            config.config_layer_stack.clone(),
+            config.bundled_skills_enabled(),
+        );
+        let outcome = skills_manager.skills_for_config(&input, None).await;
+        loaded_skills_from_outcome(outcome)
+    }
+}
+
+impl SkillsProvider for CodexSkillsProvider {
+    fn load_skills(
+        &self,
+        config: Config,
+        force_reload: bool,
+    ) -> Pin<Box<dyn Future<Output = Vec<LoadedSkill>> + Send + '_>> {
+        let skills_manager = self.skills_manager.clone();
+        let plugins_manager = self.plugins_manager.clone();
+
+        Box::pin(Self::load_skills_for_config(
+            skills_manager,
+            plugins_manager,
+            config,
+            force_reload,
+        ))
+    }
+}
+
+fn loaded_skills_from_outcome(outcome: SkillLoadOutcome) -> Vec<LoadedSkill> {
+    outcome
+        .skills
+        .iter()
+        .map(|skill| LoadedSkill::new(skill.clone(), outcome.is_skill_enabled(skill)))
+        .collect()
+}
+
+fn skill_commands(skills: &[LoadedSkill]) -> Vec<AvailableCommand> {
     skills
         .iter()
         .filter(|skill| skill.enabled)
         .map(|skill| {
+            let metadata = &skill.metadata;
             AvailableCommand::new(
-                format!("skills:{}", skill.name),
-                skill
+                format!("skills:{}", metadata.name),
+                metadata
                     .short_description
                     .clone()
                     .or_else(|| {
-                        skill
+                        metadata
                             .interface
                             .as_ref()
                             .and_then(|interface| interface.short_description.clone())
                     })
-                    .unwrap_or_else(|| skill.description.clone()),
+                    .unwrap_or_else(|| metadata.description.clone()),
             )
             .input(AvailableCommandInput::Unstructured(
                 UnstructuredCommandInput::new("optional additional instructions"),
             ))
         })
         .collect()
-}
-
-fn skills_for_cwd(cwd: &Path, entries: &[SkillsListEntry]) -> Vec<SkillMetadata> {
-    entries
-        .iter()
-        .find(|entry| entry.cwd.as_path() == cwd)
-        .map(|entry| entry.skills.clone())
-        .unwrap_or_default()
 }
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
@@ -306,7 +385,7 @@ enum ThreadMessage {
         response_tx: oneshot::Sender<Result<LoadSessionResponse, Error>>,
     },
     SkillsLoaded {
-        skills: Option<Vec<SkillMetadata>>,
+        skills: Vec<LoadedSkill>,
     },
     GetConfigOptions {
         response_tx: oneshot::Sender<Result<Vec<SessionConfigOption>, Error>>,
@@ -355,11 +434,13 @@ pub struct Thread {
 }
 
 impl Thread {
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         session_id: SessionId,
         thread: Arc<dyn CodexThreadImpl>,
         auth: Arc<AuthManager>,
         models_manager: Arc<dyn ModelsManagerImpl>,
+        skills_provider: Arc<dyn SkillsProvider>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         config: Config,
         cx: ConnectionTo<Client>,
@@ -372,6 +453,7 @@ impl Thread {
             SessionClient::new(session_id, cx, client_capabilities),
             thread.clone(),
             models_manager,
+            skills_provider,
             config,
             message_rx,
             resolution_tx,
@@ -829,10 +911,7 @@ fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> String {
     }
 }
 
-#[expect(clippy::large_enum_variant)]
 enum SubmissionState {
-    /// Loading skills for the current workspace.
-    Skills(SkillsState),
     /// User prompts, including slash commands like /init, /review, /compact, /undo.
     Prompt(PromptState),
 }
@@ -840,14 +919,12 @@ enum SubmissionState {
 impl SubmissionState {
     fn is_active(&self) -> bool {
         match self {
-            Self::Skills(state) => state.is_active(),
             Self::Prompt(state) => state.is_active(),
         }
     }
 
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         match self {
-            Self::Skills(state) => state.handle_event(event),
             Self::Prompt(state) => state.handle_event(client, event).await,
         }
     }
@@ -859,7 +936,6 @@ impl SubmissionState {
         response: Result<RequestPermissionResponse, Error>,
     ) -> Result<(), Error> {
         match self {
-            Self::Skills(..) => Ok(()),
             Self::Prompt(state) => {
                 state
                     .handle_permission_request_resolved(client, request_key, response)
@@ -869,47 +945,17 @@ impl SubmissionState {
     }
 
     fn abort_pending_interactions(&mut self) {
-        if let Self::Prompt(state) = self {
-            state.abort_pending_interactions();
+        match self {
+            Self::Prompt(state) => state.abort_pending_interactions(),
         }
     }
 
     fn fail(&mut self, err: Error) {
-        if let Self::Prompt(state) = self
-            && let Some(response_tx) = state.response_tx.take()
-        {
-            drop(response_tx.send(Err(err)));
-        }
-    }
-}
-
-struct SkillsState {
-    response_tx: Option<oneshot::Sender<Result<Vec<SkillsListEntry>, Error>>>,
-}
-
-impl SkillsState {
-    fn new(response_tx: oneshot::Sender<Result<Vec<SkillsListEntry>, Error>>) -> Self {
-        Self {
-            response_tx: Some(response_tx),
-        }
-    }
-
-    fn is_active(&self) -> bool {
-        let Some(response_tx) = &self.response_tx else {
-            return false;
-        };
-        !response_tx.is_closed()
-    }
-
-    fn handle_event(&mut self, event: EventMsg) {
-        match event {
-            EventMsg::ListSkillsResponse(ListSkillsResponseEvent { skills }) => {
-                if let Some(tx) = self.response_tx.take() {
-                    drop(tx.send(Ok(skills)));
+        match self {
+            Self::Prompt(state) => {
+                if let Some(response_tx) = state.response_tx.take() {
+                    drop(response_tx.send(Err(err)));
                 }
-            }
-            event => {
-                warn!("Unexpected event: {event:?}");
             }
         }
     }
@@ -1193,7 +1239,7 @@ impl PromptState {
                         )));
                     }
             }
-            EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item , started_at_ms: _}) => {
+            EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item, .. }) => {
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
             }
             EventMsg::UserMessage(UserMessageEvent {
@@ -1327,7 +1373,7 @@ impl PromptState {
                 );
                 self.terminal_interaction(client, event);
             }
-            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, namespace, tool, arguments, started_at_ms: _ }) => {
+            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, namespace, tool, arguments, .. }) => {
                 info!("Dynamic tool call request: call_id={call_id}, turn_id={turn_id}, namespace={namespace:?}, tool={tool}");
                 self.start_dynamic_tool_call(client, call_id, tool, arguments);
             }
@@ -1399,7 +1445,7 @@ impl PromptState {
                 thread_id,
                 turn_id,
                 item,
-                completed_at_ms: _,
+                ..
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
             }
@@ -1411,6 +1457,13 @@ impl PromptState {
                 self.abort_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
+                }
+            }
+            EventMsg::ThreadRolledBack(event) => {
+                if event.num_turns == 1 {
+                    client.send_agent_text("Undo completed.");
+                } else {
+                    client.send_agent_text(format!("Rolled back {} turns.", event.num_turns));
                 }
             }
             EventMsg::StreamError(StreamErrorEvent {
@@ -1529,13 +1582,12 @@ impl PromptState {
 
             // Ignore these events
             EventMsg::AgentReasoningRawContent(..)
-            | EventMsg::ThreadRolledBack(..)
             | EventMsg::HookStarted(..)
             | EventMsg::HookCompleted(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
+            // Revisit when we can emit status updates
             | EventMsg::SkillsUpdateAvailable
-            // Old events
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..)
             // TODO: Subagent UI?
@@ -1823,6 +1875,7 @@ impl PromptState {
             success,
             error,
             duration: _,
+            ..
         } = event;
 
         client.send_tool_call_update(ToolCallUpdate::new(
@@ -2028,6 +2081,7 @@ impl PromptState {
             cwd,
             parsed_cmd,
             process_id: _,
+            ..
         } = event;
         // Create a new tool call for the command execution
         let tool_call_id = ToolCallId::new(call_id.clone());
@@ -2128,6 +2182,7 @@ impl PromptState {
             process_id: _,
             completed_at_ms: _,
             status,
+            ..
         } = event;
         if let Some(active_command) = self.active_commands.remove(&call_id) {
             let is_success = exit_code == 0;
@@ -2813,6 +2868,8 @@ struct ThreadActor<A> {
     config: Config,
     /// The models available for this thread.
     models_manager: Arc<dyn ModelsManagerImpl>,
+    /// Loads skills using Codex's shared skills and plugins managers.
+    skills_provider: Arc<dyn SkillsProvider>,
     /// Internal message sender used to route spawned interaction results back to the actor.
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     /// A sender for each interested `Op` submission that needs events routed.
@@ -2824,7 +2881,7 @@ struct ThreadActor<A> {
     /// Last config options state we emitted to the client, used for deduping updates.
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
     /// Skills discovered for the current working directory.
-    skills: Vec<SkillMetadata>,
+    skills: Vec<LoadedSkill>,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -2834,6 +2891,7 @@ impl<A: Auth> ThreadActor<A> {
         client: SessionClient,
         thread: Arc<dyn CodexThreadImpl>,
         models_manager: Arc<dyn ModelsManagerImpl>,
+        skills_provider: Arc<dyn SkillsProvider>,
         config: Config,
         message_rx: mpsc::UnboundedReceiver<ThreadMessage>,
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
@@ -2845,6 +2903,7 @@ impl<A: Auth> ThreadActor<A> {
             thread,
             config,
             models_manager,
+            skills_provider,
             resolution_tx,
             submissions: HashMap::new(),
             message_rx,
@@ -2892,9 +2951,7 @@ impl<A: Auth> ThreadActor<A> {
                 self.refresh_skills(true).await;
             }
             ThreadMessage::SkillsLoaded { skills } => {
-                if let Some(skills) = skills {
-                    self.skills = skills;
-                }
+                self.skills = skills;
                 self.send_available_commands_update();
             }
             ThreadMessage::GetConfigOptions { response_tx } => {
@@ -3010,52 +3067,13 @@ impl<A: Auth> ThreadActor<A> {
             ));
     }
 
-    async fn load_skills(
-        &mut self,
-        force_reload: bool,
-    ) -> oneshot::Receiver<Result<Vec<SkillsListEntry>, Error>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        let submission_id = match self
-            .thread
-            .submit(Op::ListSkills {
-                cwds: Vec::new(),
-                force_reload,
-            })
-            .await
-        {
-            Ok(id) => id,
-            Err(error) => {
-                drop(response_tx.send(Err(Error::internal_error().data(error.to_string()))));
-                return response_rx;
-            }
-        };
-
-        self.submissions.insert(
-            submission_id,
-            SubmissionState::Skills(SkillsState::new(response_tx)),
-        );
-
-        response_rx
-    }
-
     async fn refresh_skills(&mut self, force_reload: bool) {
-        let load_skills = self.load_skills(force_reload).await;
         let resolution_tx = self.resolution_tx.clone();
-        let cwd = self.config.cwd.clone();
+        let config = self.config.clone();
+        let skills_provider = self.skills_provider.clone();
 
         tokio::spawn(async move {
-            let skills = match load_skills.await {
-                Ok(Ok(entries)) => Some(skills_for_cwd(cwd.as_path(), &entries)),
-                Ok(Err(error)) => {
-                    error!("Failed to refresh skills: {error:?}");
-                    None
-                }
-                Err(error) => {
-                    error!("Failed to receive skills response: {error:?}");
-                    None
-                }
-            };
-
+            let skills = skills_provider.load_skills(config, force_reload).await;
             drop(resolution_tx.send(ThreadMessage::SkillsLoaded { skills }));
         });
     }
@@ -3064,8 +3082,8 @@ impl<A: Auth> ThreadActor<A> {
         let skill_name = name.strip_prefix("skills:")?;
         self.skills
             .iter()
-            .find(|skill| skill.name == skill_name)
-            .cloned()
+            .find(|skill| skill.enabled && skill.metadata.name == skill_name)
+            .map(|skill| skill.metadata.clone())
     }
 
     fn modes(&self) -> Option<SessionModeState> {
@@ -3397,7 +3415,7 @@ impl<A: Auth> ThreadActor<A> {
             if let Some(skill) = self.resolve_skill_command(name) {
                 let mut skill_items = vec![UserInput::Skill {
                     name: skill.name,
-                    path: skill.path.to_path_buf(),
+                    path: skill.path_to_skills_md.to_path_buf(),
                 }];
                 let instructions = rest.trim();
                 if !instructions.is_empty() {
@@ -3415,7 +3433,7 @@ impl<A: Auth> ThreadActor<A> {
             } else {
                 match name {
                     "compact" => op = Op::Compact,
-                    "undo" => op = Op::Undo,
+                    "undo" => op = Op::ThreadRollback { num_turns: 1 },
                     "init" => {
                         op = Op::UserInput {
                             items: vec![UserInput::Text {
@@ -4404,7 +4422,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prompt() -> anyhow::Result<()> {
-        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (session_id, client, _, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4431,7 +4449,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_thread_goal_updated_is_sent_as_agent_message() -> anyhow::Result<()> {
-        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (session_id, client, _, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4459,7 +4477,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_image_generation_emits_image_content() -> anyhow::Result<()> {
-        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (session_id, client, _, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
         let expected_uri = image_generation_test_saved_path()
             .to_string_lossy()
@@ -4536,7 +4554,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_compact() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (session_id, client, thread, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4658,8 +4676,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_undo() -> anyhow::Result<()> {
+        let (session_id, client, thread, _, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/undo".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(
+            notifications.len(),
+            1,
+            "notifications don't match {notifications:?}"
+        );
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Undo completed."
+        ));
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(ops.as_slice(), &[Op::ThreadRollback { num_turns: 1 }]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_init() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (session_id, client, thread, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4702,7 +4754,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_review() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (session_id, client, thread, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4744,7 +4796,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_custom_review() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (session_id, client, thread, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
         let instructions = "Review what we did in agents.md";
 
@@ -4794,7 +4846,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_review() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (session_id, client, thread, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4842,7 +4894,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_branch_review() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (session_id, client, thread, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4888,17 +4940,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_publishes_skills_as_namespaced_commands() -> anyhow::Result<()> {
-        let skill = SkillMetadata {
-            name: "demo".to_string(),
-            description: "Demo skill".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            path: PathBuf::from("/tmp/demo/SKILL.md").try_into()?,
-            scope: codex_protocol::protocol::SkillScope::Repo,
-            enabled: true,
-        };
-        let (_session_id, client, _thread, message_tx, handle) =
+        let skill = test_skill("demo", "Demo skill", true)?;
+        let (_session_id, client, _thread, _, message_tx, handle) =
             setup_with_skills(vec![skill]).await?;
         let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
 
@@ -4923,17 +4966,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_does_not_publish_disabled_skills() -> anyhow::Result<()> {
-        let skill = SkillMetadata {
-            name: "disabled-demo".to_string(),
-            description: "Disabled demo skill".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            path: PathBuf::from("/tmp/disabled-demo/SKILL.md").try_into()?,
-            scope: codex_protocol::protocol::SkillScope::Repo,
-            enabled: false,
-        };
-        let (_session_id, client, _thread, message_tx, handle) =
+        let skill = test_skill("disabled-demo", "Disabled demo skill", false)?;
+        let (_session_id, client, _thread, _, message_tx, handle) =
             setup_with_skills(vec![skill]).await?;
         let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
 
@@ -4968,19 +5002,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_does_not_publish_skills_for_other_cwd() -> anyhow::Result<()> {
-        let skill = SkillMetadata {
-            name: "other-cwd".to_string(),
-            description: "Other cwd skill".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            path: PathBuf::from("/tmp/other-cwd/SKILL.md").try_into()?,
-            scope: codex_protocol::protocol::SkillScope::Repo,
-            enabled: true,
-        };
-        let (_session_id, client, thread, message_tx, handle) =
-            setup_with_skills(vec![skill]).await?;
-        thread.skills_entries.lock().unwrap()[0].cwd = PathBuf::from("/tmp/not-the-session-cwd");
+        let (_session_id, client, _thread, _, message_tx, handle) =
+            setup_with_skills(vec![]).await?;
         let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Load {
@@ -5014,17 +5037,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_skill_command_creates_skill_user_input() -> anyhow::Result<()> {
-        let skill = SkillMetadata {
-            name: "demo".to_string(),
-            description: "Demo skill".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            path: PathBuf::from("/tmp/demo/SKILL.md").try_into()?,
-            scope: codex_protocol::protocol::SkillScope::Repo,
-            enabled: true,
-        };
-        let (session_id, _client, thread, message_tx, handle) =
+        let skill = test_skill("demo", "Demo skill", true)?;
+        let expected_path = skill.metadata.path_to_skills_md.to_path_buf();
+        let (session_id, _client, thread, _, message_tx, handle) =
             setup_with_skills(vec![skill.clone()]).await?;
         let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
         message_tx.send(ThreadMessage::Load {
@@ -5058,7 +5073,7 @@ mod tests {
 
         assert!(skill_input.iter().any(|item| matches!(
             item,
-            UserInput::Skill { name, path } if name == "demo" && path == &skill.path.to_path_buf()
+            UserInput::Skill { name, path } if name == "demo" && path == &expected_path
         )));
         assert!(skill_input.iter().any(|item| matches!(
             item,
@@ -5070,27 +5085,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_skills_update_available_refreshes_commands() -> anyhow::Result<()> {
-        let initial_skill = SkillMetadata {
-            name: "demo".to_string(),
-            description: "Demo skill".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            path: PathBuf::from("/tmp/demo/SKILL.md").try_into()?,
-            scope: codex_protocol::protocol::SkillScope::Repo,
-            enabled: true,
-        };
-        let refreshed_skill = SkillMetadata {
-            name: "second".to_string(),
-            description: "Second skill".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            path: PathBuf::from("/tmp/second/SKILL.md").try_into()?,
-            scope: codex_protocol::protocol::SkillScope::Repo,
-            enabled: true,
-        };
-        let (_session_id, client, thread, message_tx, handle) =
+        let initial_skill = test_skill("demo", "Demo skill", true)?;
+        let refreshed_skill = test_skill("second", "Second skill", true)?;
+        let (_session_id, client, thread, skills_provider, message_tx, handle) =
             setup_with_skills(vec![initial_skill]).await?;
         let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
 
@@ -5099,7 +5096,7 @@ mod tests {
         })?;
 
         drop(load_response_rx.await??);
-        thread.skills_entries.lock().unwrap()[0].skills = vec![refreshed_skill];
+        *skills_provider.skills.lock().unwrap() = vec![refreshed_skill];
         thread.op_tx.send(Event {
             id: "skill-update".to_string(),
             msg: EventMsg::SkillsUpdateAvailable,
@@ -5122,6 +5119,7 @@ mod tests {
         SessionId,
         Arc<StubClient>,
         Arc<StubCodexThread>,
+        Arc<StubSkillsProvider>,
         UnboundedSender<ThreadMessage>,
         tokio::task::JoinHandle<()>,
     )> {
@@ -5129,11 +5127,12 @@ mod tests {
     }
 
     async fn setup_with_skills(
-        skills: Vec<SkillMetadata>,
+        skills: Vec<LoadedSkill>,
     ) -> anyhow::Result<(
         SessionId,
         Arc<StubClient>,
         Arc<StubCodexThread>,
+        Arc<StubSkillsProvider>,
         UnboundedSender<ThreadMessage>,
         tokio::task::JoinHandle<()>,
     )> {
@@ -5142,21 +5141,13 @@ mod tests {
         let session_client =
             SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
         let conversation = Arc::new(StubCodexThread::new());
+        let skills_provider = Arc::new(StubSkillsProvider::new(skills));
         let models_manager = Arc::new(StubModelsManager);
         let config = Config::load_with_cli_overrides_and_harness_overrides(
             vec![],
             ConfigOverrides::default(),
         )
         .await?;
-        conversation
-            .skills_entries
-            .lock()
-            .unwrap()
-            .push(SkillsListEntry {
-                cwd: config.cwd.clone().to_path_buf(),
-                skills,
-                errors: Vec::new(),
-            });
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -5165,6 +5156,7 @@ mod tests {
             session_client,
             conversation.clone(),
             models_manager,
+            skills_provider.clone(),
             config,
             message_rx,
             resolution_tx,
@@ -5172,7 +5164,31 @@ mod tests {
         );
 
         let handle = tokio::spawn(actor.spawn());
-        Ok((session_id, client, conversation, message_tx, handle))
+        Ok((
+            session_id,
+            client,
+            conversation,
+            skills_provider,
+            message_tx,
+            handle,
+        ))
+    }
+
+    fn test_skill(name: &str, description: &str, enabled: bool) -> anyhow::Result<LoadedSkill> {
+        Ok(LoadedSkill::new(
+            SkillMetadata {
+                name: name.to_string(),
+                description: description.to_string(),
+                short_description: None,
+                interface: None,
+                dependencies: None,
+                policy: None,
+                path_to_skills_md: PathBuf::from(format!("/tmp/{name}/SKILL.md")).try_into()?,
+                scope: codex_protocol::protocol::SkillScope::Repo,
+                plugin_id: None,
+            },
+            enabled,
+        ))
     }
 
     struct StubAuth;
@@ -5198,11 +5214,32 @@ mod tests {
         }
     }
 
+    struct StubSkillsProvider {
+        skills: std::sync::Mutex<Vec<LoadedSkill>>,
+    }
+
+    impl StubSkillsProvider {
+        fn new(skills: Vec<LoadedSkill>) -> Self {
+            Self {
+                skills: std::sync::Mutex::new(skills),
+            }
+        }
+    }
+
+    impl SkillsProvider for StubSkillsProvider {
+        fn load_skills(
+            &self,
+            _config: Config,
+            _force_reload: bool,
+        ) -> Pin<Box<dyn Future<Output = Vec<LoadedSkill>> + Send + '_>> {
+            Box::pin(async { self.skills.lock().unwrap().clone() })
+        }
+    }
+
     struct StubCodexThread {
         current_id: AtomicUsize,
         active_prompt_id: std::sync::Mutex<Option<String>>,
         ops: std::sync::Mutex<Vec<Op>>,
-        skills_entries: std::sync::Mutex<Vec<SkillsListEntry>>,
         op_tx: mpsc::UnboundedSender<Event>,
         op_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
     }
@@ -5214,7 +5251,6 @@ mod tests {
                 current_id: AtomicUsize::new(0),
                 active_prompt_id: std::sync::Mutex::default(),
                 ops: std::sync::Mutex::default(),
-                skills_entries: std::sync::Mutex::default(),
                 op_tx,
                 op_rx: Mutex::new(op_rx),
             }
@@ -5487,6 +5523,30 @@ mod tests {
                             })
                             .unwrap();
                     }
+                    Op::ThreadRollback { .. } => {
+                        self.op_tx
+                            .send(Event {
+                                id: id.to_string(),
+                                msg: EventMsg::ThreadRolledBack(
+                                    codex_protocol::protocol::ThreadRolledBackEvent {
+                                        num_turns: 1,
+                                    },
+                                ),
+                            })
+                            .unwrap();
+                        self.op_tx
+                            .send(Event {
+                                id: id.to_string(),
+                                msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                                    last_agent_message: None,
+                                    turn_id: id.to_string(),
+                                    completed_at: None,
+                                    duration_ms: None,
+                                    time_to_first_token_ms: None,
+                                }),
+                            })
+                            .unwrap();
+                    }
                     Op::Review { review_request } => {
                         self.op_tx
                             .send(Event {
@@ -5519,16 +5579,6 @@ mod tests {
                                     completed_at: None,
                                     duration_ms: None,
                                     time_to_first_token_ms: None,
-                                }),
-                            })
-                            .unwrap();
-                    }
-                    Op::ListSkills { .. } => {
-                        self.op_tx
-                            .send(Event {
-                                id: id.to_string(),
-                                msg: EventMsg::ListSkillsResponse(ListSkillsResponseEvent {
-                                    skills: self.skills_entries.lock().unwrap().clone(),
                                 }),
                             })
                             .unwrap();
@@ -5642,7 +5692,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parallel_exec_commands() -> anyhow::Result<()> {
-        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (session_id, client, _, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -6038,6 +6088,7 @@ mod tests {
             SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
         let conversation = Arc::new(StubCodexThread::new());
         let models_manager = Arc::new(StubModelsManager);
+        let skills_provider = Arc::new(StubSkillsProvider::new(Vec::new()));
         let config = Config::load_with_cli_overrides_and_harness_overrides(
             vec![],
             ConfigOverrides::default(),
@@ -6050,6 +6101,7 @@ mod tests {
             session_client,
             conversation.clone(),
             models_manager,
+            skills_provider,
             config,
             message_rx,
             resolution_tx,
