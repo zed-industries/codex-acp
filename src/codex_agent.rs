@@ -61,7 +61,7 @@ pub struct CodexAgent {
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
-const MCP_TIMEOUT_META_NAMESPACES: [&str; 2] = ["codex_acp", "acpui"];
+const MCP_TIMEOUT_META_NAMESPACES: [&str; 1] = ["codex_acp"];
 
 #[derive(Debug, Clone, Copy, Default)]
 struct TimeoutOverrides {
