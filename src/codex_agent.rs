@@ -31,6 +31,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
@@ -60,6 +61,83 @@ pub struct CodexAgent {
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
+const MCP_TIMEOUT_META_NAMESPACES: [&str; 2] = ["codex_acp", "acpui"];
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TimeoutOverrides {
+    startup_timeout_sec: Option<Duration>,
+    tool_timeout_sec: Option<Duration>,
+}
+
+fn duration_from_json_seconds(value: &serde_json::Value) -> Option<Duration> {
+    let secs = match value {
+        serde_json::Value::Number(n) => n.as_f64()?,
+        serde_json::Value::String(s) => s.parse::<f64>().ok()?,
+        _ => return None,
+    };
+    if !secs.is_finite() || secs <= 0.0 {
+        return None;
+    }
+    Duration::try_from_secs_f64(secs).ok()
+}
+
+fn duration_from_json_millis(value: &serde_json::Value) -> Option<Duration> {
+    let millis = match value {
+        serde_json::Value::Number(n) => n.as_f64()?,
+        serde_json::Value::String(s) => s.parse::<f64>().ok()?,
+        _ => return None,
+    };
+    if !millis.is_finite() || millis <= 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(millis / 1000.0))
+}
+
+fn timeout_overrides_from_map(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> TimeoutOverrides {
+    let startup_timeout_sec = map
+        .get("startup_timeout_sec")
+        .and_then(duration_from_json_seconds)
+        .or_else(|| {
+            map.get("startup_timeout_ms")
+                .and_then(duration_from_json_millis)
+        });
+    let tool_timeout_sec = map
+        .get("tool_timeout_sec")
+        .and_then(duration_from_json_seconds)
+        .or_else(|| {
+            map.get("tool_timeout_ms")
+                .and_then(duration_from_json_millis)
+        });
+    TimeoutOverrides {
+        startup_timeout_sec,
+        tool_timeout_sec,
+    }
+}
+
+fn timeout_overrides_from_meta(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> TimeoutOverrides {
+    let Some(meta) = meta else {
+        return TimeoutOverrides::default();
+    };
+
+    let mut overrides = timeout_overrides_from_map(meta);
+    for namespace in MCP_TIMEOUT_META_NAMESPACES {
+        let Some(serde_json::Value::Object(ns_map)) = meta.get(namespace) else {
+            continue;
+        };
+        let scoped = timeout_overrides_from_map(ns_map);
+        if scoped.startup_timeout_sec.is_some() {
+            overrides.startup_timeout_sec = scoped.startup_timeout_sec;
+        }
+        if scoped.tool_timeout_sec.is_some() {
+            overrides.tool_timeout_sec = scoped.tool_timeout_sec;
+        }
+    }
+    overrides
+}
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
@@ -337,10 +415,23 @@ impl CodexAgent {
                 // Not supported in codex
                 McpServer::Sse(..) => {}
                 McpServer::Http(McpServerHttp {
-                    name, url, headers, ..
+                    name,
+                    url,
+                    headers,
+                    meta,
+                    ..
                 }) => {
                     // Codex does not allow whitespace in MCP server names; replace with underscores.
                     let name = name.replace(|c: char| c.is_whitespace(), "_");
+                    let timeout_overrides = timeout_overrides_from_meta(meta.as_ref());
+                    // Preserve timeout settings from an existing same-name server entry
+                    // (for example, values from ~/.codex/config.toml).
+                    let existing_startup_timeout_sec = new_mcp_servers
+                        .get(&name)
+                        .and_then(|cfg| cfg.startup_timeout_sec);
+                    let existing_tool_timeout_sec = new_mcp_servers
+                        .get(&name)
+                        .and_then(|cfg| cfg.tool_timeout_sec);
                     new_mcp_servers.insert(
                         name,
                         McpServerConfig {
@@ -356,8 +447,12 @@ impl CodexAgent {
                             },
                             required: false,
                             enabled: true,
-                            startup_timeout_sec: None,
-                            tool_timeout_sec: None,
+                            startup_timeout_sec: timeout_overrides
+                                .startup_timeout_sec
+                                .or(existing_startup_timeout_sec),
+                            tool_timeout_sec: timeout_overrides
+                                .tool_timeout_sec
+                                .or(existing_tool_timeout_sec),
                             disabled_tools: None,
                             enabled_tools: None,
                             disabled_reason: None,
@@ -375,10 +470,20 @@ impl CodexAgent {
                     command,
                     args,
                     env,
+                    meta,
                     ..
                 }) => {
                     // Codex does not allow whitespace in MCP server names; replace with underscores.
                     let name = name.replace(|c: char| c.is_whitespace(), "_");
+                    let timeout_overrides = timeout_overrides_from_meta(meta.as_ref());
+                    // Preserve timeout settings from an existing same-name server entry
+                    // (for example, values from ~/.codex/config.toml).
+                    let existing_startup_timeout_sec = new_mcp_servers
+                        .get(&name)
+                        .and_then(|cfg| cfg.startup_timeout_sec);
+                    let existing_tool_timeout_sec = new_mcp_servers
+                        .get(&name)
+                        .and_then(|cfg| cfg.tool_timeout_sec);
                     new_mcp_servers.insert(
                         name,
                         McpServerConfig {
@@ -395,8 +500,12 @@ impl CodexAgent {
                             },
                             required: false,
                             enabled: true,
-                            startup_timeout_sec: None,
-                            tool_timeout_sec: None,
+                            startup_timeout_sec: timeout_overrides
+                                .startup_timeout_sec
+                                .or(existing_startup_timeout_sec),
+                            tool_timeout_sec: timeout_overrides
+                                .tool_timeout_sec
+                                .or(existing_tool_timeout_sec),
                             disabled_tools: None,
                             enabled_tools: None,
                             disabled_reason: None,
