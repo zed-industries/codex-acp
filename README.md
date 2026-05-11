@@ -56,6 +56,22 @@ Or via npm:
 npx @zed-industries/codex-acp
 ```
 
+#### Options
+
+Use `--ignore-user-config` to start the adapter without loading
+`$CODEX_HOME/config.toml`. Authentication and other Codex state still use
+`CODEX_HOME`.
+
+This is useful for ACP clients that provide their own session configuration and
+want to avoid user-level hooks or MCP servers while still using the user's Codex
+login. Configuration overrides passed with `-c key=value` still apply. If your
+credential store mode is normally configured in `config.toml`, pass it
+explicitly, for example:
+
+```
+codex-acp --ignore-user-config -c cli_auth_credentials_store=auto
+```
+
 ## License
 
 Apache-2.0
