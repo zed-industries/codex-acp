@@ -30,7 +30,10 @@ use codex_core::{
     config::{Config, set_project_trust_level},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
+    skills::{SkillLoadOutcome, SkillMetadata, SkillsLoadInput, SkillsManager},
 };
+use codex_core_plugins::PluginsManager;
+use codex_exec_server::LOCAL_FS;
 use codex_login::auth::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_protocol::{
@@ -2815,12 +2818,15 @@ impl<A: Auth> ThreadActor<A> {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
                 let client = self.client.clone();
+                let config = self.config.clone();
                 // Have this happen after the session is loaded by putting it
                 // in a separate task
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     client.send_notification(SessionUpdate::AvailableCommandsUpdate(
-                        AvailableCommandsUpdate::new(Self::builtin_commands()),
+                        AvailableCommandsUpdate::new(
+                            Self::available_commands_for_config(&config).await,
+                        ),
                     ));
                 });
             }
@@ -2922,6 +2928,83 @@ impl<A: Auth> ThreadActor<A> {
             ),
             AvailableCommand::new("logout", "logout of Codex"),
         ]
+    }
+
+    async fn available_commands_for_config(config: &Config) -> Vec<AvailableCommand> {
+        let mut commands = Self::builtin_commands();
+        commands.extend(Self::skill_commands_for_config(config).await);
+        commands
+    }
+
+    async fn skill_commands_for_config(config: &Config) -> Vec<AvailableCommand> {
+        let plugins_manager = PluginsManager::new(config.codex_home.to_path_buf());
+        let plugins_input = config.plugins_config_input();
+        let effective_skill_roots = plugins_manager
+            .plugins_for_config(&plugins_input)
+            .await
+            .effective_plugin_skill_roots();
+
+        let skills_manager =
+            SkillsManager::new(config.codex_home.clone(), config.bundled_skills_enabled());
+        let skills_input = SkillsLoadInput::new(
+            config.cwd.clone(),
+            effective_skill_roots,
+            config.config_layer_stack.clone(),
+            config.bundled_skills_enabled(),
+        );
+        let outcome = skills_manager
+            .skills_for_config(&skills_input, Some(Arc::clone(&LOCAL_FS)))
+            .await;
+
+        for error in &outcome.errors {
+            warn!(
+                "failed to load skill {}: {}",
+                error.path.display(),
+                error.message
+            );
+        }
+
+        Self::skill_commands_from_outcome(&outcome)
+    }
+
+    fn skill_commands_from_outcome(outcome: &SkillLoadOutcome) -> Vec<AvailableCommand> {
+        Self::skill_commands_from_skills(outcome.skills_with_enabled())
+    }
+
+    fn skill_commands_from_skills<'a>(
+        skills: impl IntoIterator<Item = (&'a SkillMetadata, bool)>,
+    ) -> Vec<AvailableCommand> {
+        let mut seen_names: HashSet<String> = Self::builtin_commands()
+            .into_iter()
+            .map(|command| command.name.to_string())
+            .collect();
+        skills
+            .into_iter()
+            .filter_map(|(skill, enabled)| {
+                if !enabled {
+                    return None;
+                }
+                let command_name = format!("${}", skill.name);
+                if !seen_names.insert(command_name.clone()) {
+                    return None;
+                }
+                Some(AvailableCommand::new(
+                    command_name,
+                    Self::skill_command_description(skill),
+                ))
+            })
+            .collect()
+    }
+
+    fn skill_command_description(skill: &SkillMetadata) -> String {
+        skill
+            .interface
+            .as_ref()
+            .and_then(|interface| interface.short_description.as_deref())
+            .or(skill.short_description.as_deref())
+            .unwrap_or(&skill.description)
+            .trim()
+            .to_string()
     }
 
     fn modes(&self) -> Option<SessionModeState> {
@@ -3306,6 +3389,14 @@ impl<A: Auth> ThreadActor<A> {
                 "logout" => {
                     self.auth.logout().await?;
                     return Err(Error::auth_required());
+                }
+                _ if name.starts_with('$') => {
+                    op = Op::UserInput {
+                        items: rewrite_skill_slash_command(items),
+                        final_output_json_schema: None,
+                        environments: None,
+                        responsesapi_client_metadata: None,
+                    }
                 }
                 _ => {
                     op = Op::UserInput {
@@ -4216,6 +4307,31 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
     Some((name, rest))
 }
 
+fn rewrite_skill_slash_command(mut items: Vec<UserInput>) -> Vec<UserInput> {
+    let Some(UserInput::Text {
+        text,
+        text_elements,
+    }) = items.first_mut()
+    else {
+        return items;
+    };
+
+    if !text.starts_with("/$") {
+        return items;
+    }
+
+    text.remove(0);
+    for element in text_elements {
+        *element = element.map_range(|range| {
+            let start = range.start.saturating_sub(1);
+            let end = range.end.saturating_sub(1);
+            (start..end).into()
+        });
+    }
+
+    items
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -4531,6 +4647,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_skill_slash_command_is_forwarded_as_codex_skill_mention() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/$demo-skill hello".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "$demo-skill hello"
+        ));
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(
+            ops.as_slice(),
+            &[Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: "$demo-skill hello".to_string(),
+                    text_elements: vec![],
+                }],
+                final_output_json_schema: None,
+                environments: None,
+                responsesapi_client_metadata: None,
+            }],
+            "ops don't match {ops:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn skill_commands_include_enabled_skills_with_codex_mention_names() -> anyhow::Result<()> {
+        let enabled = test_skill("demo-skill", "Demo description")?;
+        let mut disabled = test_skill("disabled-skill", "Disabled description")?;
+        disabled.short_description = Some("Short disabled".to_string());
+
+        let commands = ThreadActor::<StubAuth>::skill_commands_from_skills([
+            (&enabled, true),
+            (&disabled, false),
+        ]);
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "$demo-skill");
+        assert_eq!(commands[0].description, "Demo description");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_review() -> anyhow::Result<()> {
         let (session_id, client, thread, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -4805,6 +4980,20 @@ mod tests {
         fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
             Box::pin(async { all_model_presets().to_owned() })
         }
+    }
+
+    fn test_skill(name: &str, description: &str) -> anyhow::Result<SkillMetadata> {
+        Ok(SkillMetadata {
+            name: name.to_string(),
+            description: description.to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            policy: None,
+            path_to_skills_md: PathBuf::from(format!("/tmp/{name}/SKILL.md")).try_into()?,
+            scope: codex_protocol::protocol::SkillScope::User,
+            plugin_id: None,
+        })
     }
 
     struct StubCodexThread {
