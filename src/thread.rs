@@ -21,7 +21,7 @@ use agent_client_protocol::{
         SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason,
         Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId,
         ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-        UnstructuredCommandInput, UsageUpdate,
+        UnstructuredCommandInput, Usage, UsageUpdate,
     },
 };
 use codex_apply_patch::parse_patch;
@@ -66,8 +66,9 @@ use codex_protocol::{
         ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
         ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, StreamErrorEvent,
         TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent, TokenCountEvent,
-        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
-        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        TokenUsage, TokenUsageInfo, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent,
+        UserMessageEvent, ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent,
+        WebSearchEndEvent,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -208,6 +209,59 @@ fn mode_trusts_project(mode_id: &str) -> bool {
     matches!(mode_id, "auto" | "full-access")
 }
 
+fn token_count(value: i64) -> u64 {
+    value.max(0) as u64
+}
+
+fn token_count_before_latest_event(total: i64, latest: i64) -> i64 {
+    if total >= latest {
+        total - latest
+    } else {
+        total
+    }
+}
+
+fn token_usage_delta(total: &TokenUsage, previous: &TokenUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: (total.input_tokens - previous.input_tokens).max(0),
+        cached_input_tokens: (total.cached_input_tokens - previous.cached_input_tokens).max(0),
+        output_tokens: (total.output_tokens - previous.output_tokens).max(0),
+        reasoning_output_tokens: (total.reasoning_output_tokens - previous.reasoning_output_tokens)
+            .max(0),
+        total_tokens: (total.total_tokens - previous.total_tokens).max(0),
+    }
+}
+
+fn token_usage_before_latest_event(info: &TokenUsageInfo) -> TokenUsage {
+    let total = &info.total_token_usage;
+    let latest = &info.last_token_usage;
+
+    TokenUsage {
+        input_tokens: token_count_before_latest_event(total.input_tokens, latest.input_tokens),
+        cached_input_tokens: token_count_before_latest_event(
+            total.cached_input_tokens,
+            latest.cached_input_tokens,
+        ),
+        output_tokens: token_count_before_latest_event(total.output_tokens, latest.output_tokens),
+        reasoning_output_tokens: token_count_before_latest_event(
+            total.reasoning_output_tokens,
+            latest.reasoning_output_tokens,
+        ),
+        total_tokens: token_count_before_latest_event(total.total_tokens, latest.total_tokens),
+    }
+}
+
+fn acp_usage_from_token_usage(usage: &TokenUsage) -> Usage {
+    Usage::new(
+        token_count(usage.total_tokens),
+        token_count(usage.input_tokens),
+        token_count(usage.output_tokens),
+    )
+    .thought_tokens(token_count(usage.reasoning_output_tokens))
+    .cached_read_tokens(token_count(usage.cached_input_tokens))
+    .cached_write_tokens(0)
+}
+
 /// Trait for abstracting over the `CodexThread` to make testing easier.
 pub trait CodexThreadImpl: Send + Sync {
     fn submit(&self, op: Op)
@@ -277,7 +331,7 @@ enum ThreadMessage {
     },
     Prompt {
         request: PromptRequest,
-        response_tx: oneshot::Sender<Result<oneshot::Receiver<Result<StopReason, Error>>, Error>>,
+        response_tx: oneshot::Sender<Result<oneshot::Receiver<Result<PromptResult, Error>>, Error>>,
     },
     SetMode {
         mode: SessionModeId,
@@ -307,6 +361,12 @@ enum ThreadMessage {
         request_key: String,
         response: Result<RequestPermissionResponse, Error>,
     },
+}
+
+#[derive(Debug)]
+pub(crate) struct PromptResult {
+    pub(crate) stop_reason: StopReason,
+    pub(crate) usage: Option<Usage>,
 }
 
 pub struct Thread {
@@ -372,7 +432,7 @@ impl Thread {
             .map_err(|e| Error::internal_error().data(e.to_string()))?
     }
 
-    pub async fn prompt(&self, request: PromptRequest) -> Result<StopReason, Error> {
+    pub async fn prompt(&self, request: PromptRequest) -> Result<PromptResult, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ThreadMessage::Prompt {
@@ -835,10 +895,12 @@ impl SubmissionState {
     }
 
     fn fail(&mut self, err: Error) {
-        if let Self::Prompt(state) = self
-            && let Some(response_tx) = state.response_tx.take()
-        {
-            drop(response_tx.send(Err(err)));
+        match self {
+            Self::Prompt(state) => {
+                if let Some(response_tx) = state.response_tx.take() {
+                    drop(response_tx.send(Err(err)));
+                }
+            }
         }
     }
 }
@@ -860,7 +922,9 @@ struct PromptState {
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     pending_permission_interactions: HashMap<String, PendingPermissionInteraction>,
     event_count: usize,
-    response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
+    response_tx: Option<oneshot::Sender<Result<PromptResult, Error>>>,
+    turn_usage_start: Option<TokenUsage>,
+    latest_total_usage: Option<TokenUsage>,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
 }
@@ -870,7 +934,7 @@ impl PromptState {
         submission_id: String,
         thread: Arc<dyn CodexThreadImpl>,
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
-        response_tx: oneshot::Sender<Result<StopReason, Error>>,
+        response_tx: oneshot::Sender<Result<PromptResult, Error>>,
     ) -> Self {
         Self {
             submission_id,
@@ -883,6 +947,8 @@ impl PromptState {
             pending_permission_interactions: HashMap::new(),
             event_count: 0,
             response_tx: Some(response_tx),
+            turn_usage_start: None,
+            latest_total_usage: None,
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
         }
@@ -899,6 +965,23 @@ impl PromptState {
         for (_, interaction) in self.pending_permission_interactions.drain() {
             interaction.task.abort();
         }
+    }
+
+    fn record_token_usage(&mut self, info: &TokenUsageInfo) {
+        if self.turn_usage_start.is_none() {
+            self.turn_usage_start = Some(token_usage_before_latest_event(info));
+        }
+        self.latest_total_usage = Some(info.total_token_usage.clone());
+    }
+
+    fn prompt_result(&self, stop_reason: StopReason) -> PromptResult {
+        let usage = self
+            .latest_total_usage
+            .as_ref()
+            .zip(self.turn_usage_start.as_ref())
+            .map(|(total, start)| acp_usage_from_token_usage(&token_usage_delta(total, start)));
+
+        PromptResult { stop_reason, usage }
     }
 
     fn spawn_permission_request(
@@ -1112,14 +1195,16 @@ impl PromptState {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
             }
             EventMsg::TokenCount(TokenCountEvent { info, .. }) => {
-                if let Some(info) = info
-                    && let Some(size) = info.model_context_window {
+                if let Some(info) = info {
+                    self.record_token_usage(&info);
+                    if let Some(size) = info.model_context_window {
                         let used = info.last_token_usage.tokens_in_context_window().max(0) as u64;
                         client.send_notification(SessionUpdate::UsageUpdate(UsageUpdate::new(
                             used,
                             size as u64,
                         )));
                     }
+                }
             }
             EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item , started_at_ms: _}) => {
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
@@ -1337,8 +1422,9 @@ impl PromptState {
                     self.event_count
                 );
                 self.abort_pending_interactions();
+                let result = self.prompt_result(StopReason::EndTurn);
                 if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::EndTurn)).ok();
+                    response_tx.send(Ok(result)).ok();
                 }
             }
             EventMsg::StreamError(StreamErrorEvent {
@@ -1367,15 +1453,17 @@ impl PromptState {
             EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _ }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
                 self.abort_pending_interactions();
+                let result = self.prompt_result(StopReason::Cancelled);
                 if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::Cancelled)).ok();
+                    response_tx.send(Ok(result)).ok();
                 }
             }
             EventMsg::ShutdownComplete => {
                 info!("Agent shutting down");
                 self.abort_pending_interactions();
+                let result = self.prompt_result(StopReason::Cancelled);
                 if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::Cancelled)).ok();
+                    response_tx.send(Ok(result)).ok();
                 }
             }
             EventMsg::ViewImageToolCall(ViewImageToolCallEvent { call_id, path }) => {
@@ -3244,7 +3332,7 @@ impl<A: Auth> ThreadActor<A> {
     async fn handle_prompt(
         &mut self,
         request: PromptRequest,
-    ) -> Result<oneshot::Receiver<Result<StopReason, Error>>, Error> {
+    ) -> Result<oneshot::Receiver<Result<PromptResult, Error>>, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
         let items = build_prompt_items(request.prompt);
@@ -4243,7 +4331,7 @@ mod tests {
         })?;
 
         let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        assert_eq!(stop_reason.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4260,6 +4348,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_prompt_returns_usage_from_token_count_events() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["token-usage".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let prompt_result = prompt_response_rx.await??.await??;
+        assert_eq!(prompt_result.stop_reason, StopReason::EndTurn);
+        let usage = prompt_result.usage.expect("usage should be returned");
+        assert_eq!(usage.total_tokens, 40);
+        assert_eq!(usage.input_tokens, 25);
+        assert_eq!(usage.output_tokens, 15);
+        assert_eq!(usage.cached_read_tokens, Some(8));
+        assert_eq!(usage.cached_write_tokens, Some(0));
+        assert_eq!(usage.thought_tokens, Some(4));
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        let usage_updates = notifications
+            .iter()
+            .filter(|notification| matches!(&notification.update, SessionUpdate::UsageUpdate(_)))
+            .count();
+        assert_eq!(usage_updates, 3);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_thread_goal_updated_is_sent_as_agent_message() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -4270,7 +4389,7 @@ mod tests {
         })?;
 
         let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        assert_eq!(stop_reason.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4301,7 +4420,7 @@ mod tests {
         })?;
 
         let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        assert_eq!(stop_reason.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4375,7 +4494,7 @@ mod tests {
         })?;
 
         let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        assert_eq!(stop_reason.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4498,7 +4617,7 @@ mod tests {
         })?;
 
         let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        assert_eq!(stop_reason.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4541,7 +4660,7 @@ mod tests {
         })?;
 
         let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        assert_eq!(stop_reason.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4587,7 +4706,7 @@ mod tests {
         })?;
 
         let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        assert_eq!(stop_reason.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4633,7 +4752,7 @@ mod tests {
         })?;
 
         let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        assert_eq!(stop_reason.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4681,7 +4800,7 @@ mod tests {
         })?;
 
         let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        assert_eq!(stop_reason.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4727,7 +4846,7 @@ mod tests {
         })?;
 
         let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        assert_eq!(stop_reason.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         // We should only get ONE notification, not duplicates from both delta and non-delta
@@ -4952,6 +5071,83 @@ mod tests {
                                 revised_prompt: Some("A tiny blue square".into()),
                                 result: "Zm9v".into(),
                                 saved_path: Some(saved_path.try_into()?),
+                            }));
+                            send(EventMsg::TurnComplete(TurnCompleteEvent {
+                                last_agent_message: None,
+                                turn_id,
+                                completed_at: None,
+                                duration_ms: None,
+                                time_to_first_token_ms: None,
+                            }));
+                        } else if prompt == "token-usage" {
+                            let turn_id = id.to_string();
+                            let send = |msg| {
+                                self.op_tx
+                                    .send(Event {
+                                        id: id.to_string(),
+                                        msg,
+                                    })
+                                    .unwrap();
+                            };
+                            send(EventMsg::TokenCount(TokenCountEvent {
+                                info: Some(TokenUsageInfo {
+                                    total_token_usage: TokenUsage {
+                                        input_tokens: 100,
+                                        cached_input_tokens: 27,
+                                        output_tokens: 0,
+                                        reasoning_output_tokens: 0,
+                                        total_tokens: 100,
+                                    },
+                                    last_token_usage: TokenUsage {
+                                        input_tokens: 0,
+                                        cached_input_tokens: 0,
+                                        output_tokens: 0,
+                                        reasoning_output_tokens: 0,
+                                        total_tokens: 120,
+                                    },
+                                    model_context_window: Some(200_000),
+                                }),
+                                rate_limits: None,
+                            }));
+                            send(EventMsg::TokenCount(TokenCountEvent {
+                                info: Some(TokenUsageInfo {
+                                    total_token_usage: TokenUsage {
+                                        input_tokens: 110,
+                                        cached_input_tokens: 30,
+                                        output_tokens: 5,
+                                        reasoning_output_tokens: 2,
+                                        total_tokens: 115,
+                                    },
+                                    last_token_usage: TokenUsage {
+                                        input_tokens: 10,
+                                        cached_input_tokens: 3,
+                                        output_tokens: 5,
+                                        reasoning_output_tokens: 2,
+                                        total_tokens: 15,
+                                    },
+                                    model_context_window: Some(200_000),
+                                }),
+                                rate_limits: None,
+                            }));
+                            send(EventMsg::TokenCount(TokenCountEvent {
+                                info: Some(TokenUsageInfo {
+                                    total_token_usage: TokenUsage {
+                                        input_tokens: 125,
+                                        cached_input_tokens: 35,
+                                        output_tokens: 15,
+                                        reasoning_output_tokens: 4,
+                                        total_tokens: 140,
+                                    },
+                                    last_token_usage: TokenUsage {
+                                        input_tokens: 15,
+                                        cached_input_tokens: 5,
+                                        output_tokens: 10,
+                                        reasoning_output_tokens: 2,
+                                        total_tokens: 25,
+                                    },
+                                    model_context_window: Some(200_000),
+                                }),
+                                rate_limits: None,
                             }));
                             send(EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
@@ -5247,7 +5443,7 @@ mod tests {
         })?;
 
         let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        assert_eq!(stop_reason.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -5679,7 +5875,7 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), thread.shutdown()).await??;
         let stop_reason =
             tokio::time::timeout(Duration::from_millis(100), stop_reason_rx).await??;
-        assert_eq!(stop_reason?, StopReason::Cancelled);
+        assert_eq!(stop_reason?.stop_reason, StopReason::Cancelled);
 
         let ops = conversation.ops.lock().unwrap();
         assert!(matches!(ops.last(), Some(Op::Shutdown)));
