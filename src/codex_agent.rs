@@ -4,7 +4,7 @@ use acp::schema::{
     ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Implementation,
     InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
-    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
+    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, Meta, NewSessionRequest,
     NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
     SessionCapabilities, SessionCloseCapabilities, SessionId, SessionInfo, SessionListCapabilities,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
@@ -31,6 +31,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
@@ -337,10 +338,16 @@ impl CodexAgent {
                 // Not supported in codex
                 McpServer::Sse(..) => {}
                 McpServer::Http(McpServerHttp {
-                    name, url, headers, ..
+                    name,
+                    url,
+                    headers,
+                    meta,
+                    ..
                 }) => {
                     // Codex does not allow whitespace in MCP server names; replace with underscores.
                     let name = name.replace(|c: char| c.is_whitespace(), "_");
+                    let (startup_timeout_sec, tool_timeout_sec) =
+                        mcp_server_timeouts(meta.as_ref());
                     new_mcp_servers.insert(
                         name,
                         McpServerConfig {
@@ -356,8 +363,8 @@ impl CodexAgent {
                             },
                             required: false,
                             enabled: true,
-                            startup_timeout_sec: None,
-                            tool_timeout_sec: None,
+                            startup_timeout_sec,
+                            tool_timeout_sec,
                             disabled_tools: None,
                             enabled_tools: None,
                             disabled_reason: None,
@@ -375,10 +382,13 @@ impl CodexAgent {
                     command,
                     args,
                     env,
+                    meta,
                     ..
                 }) => {
                     // Codex does not allow whitespace in MCP server names; replace with underscores.
                     let name = name.replace(|c: char| c.is_whitespace(), "_");
+                    let (startup_timeout_sec, tool_timeout_sec) =
+                        mcp_server_timeouts(meta.as_ref());
                     new_mcp_servers.insert(
                         name,
                         McpServerConfig {
@@ -395,8 +405,8 @@ impl CodexAgent {
                             },
                             required: false,
                             enabled: true,
-                            startup_timeout_sec: None,
-                            tool_timeout_sec: None,
+                            startup_timeout_sec,
+                            tool_timeout_sec,
                             disabled_tools: None,
                             enabled_tools: None,
                             disabled_reason: None,
@@ -901,5 +911,72 @@ fn format_session_title(message: &str) -> Option<String> {
         None
     } else {
         Some(truncate_graphemes(trimmed, SESSION_TITLE_MAX_GRAPHEMES))
+    }
+}
+
+fn mcp_server_timeouts(meta: Option<&Meta>) -> (Option<Duration>, Option<Duration>) {
+    let startup_timeout_sec =
+        mcp_server_timeout_from_meta(meta, "startup_timeout_sec").map(Duration::from_secs_f64);
+    let tool_timeout_sec =
+        mcp_server_timeout_from_meta(meta, "tool_timeout_sec").map(Duration::from_secs_f64);
+
+    (startup_timeout_sec, tool_timeout_sec)
+}
+
+fn mcp_server_timeout_from_meta(meta: Option<&Meta>, key: &str) -> Option<f64> {
+    meta.and_then(|meta| meta.get(key))
+        .and_then(serde_json::Value::as_f64)
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::Duration;
+
+    #[test]
+    fn mcp_server_timeouts_are_none_when_metadata_is_absent() {
+        let (startup_timeout_sec, tool_timeout_sec) = mcp_server_timeouts(None);
+
+        assert_eq!(startup_timeout_sec, None);
+        assert_eq!(tool_timeout_sec, None);
+    }
+
+    #[test]
+    fn mcp_server_timeouts_are_read_from_metadata() {
+        let meta = serde_json::Map::from_iter([
+            ("startup_timeout_sec".to_string(), json!(15.5)),
+            ("tool_timeout_sec".to_string(), json!(600.25)),
+        ]);
+
+        let (startup_timeout_sec, tool_timeout_sec) = mcp_server_timeouts(Some(&meta));
+
+        assert_eq!(startup_timeout_sec, Some(Duration::from_secs_f64(15.5)));
+        assert_eq!(tool_timeout_sec, Some(Duration::from_secs_f64(600.25)));
+    }
+
+    #[test]
+    fn mcp_server_timeouts_are_preserved_through_acp_json_metadata() {
+        let mcp_server: McpServer = serde_json::from_value(json!({
+            "type": "http",
+            "name": "devflow",
+            "url": "http://127.0.0.1:3000/mcp",
+            "headers": [],
+            "_meta": {
+                "startup_timeout_sec": 30,
+                "tool_timeout_sec": 900
+            }
+        }))
+        .unwrap();
+
+        let McpServer::Http(McpServerHttp { meta, .. }) = mcp_server else {
+            panic!("expected HTTP MCP server");
+        };
+
+        let (startup_timeout_sec, tool_timeout_sec) = mcp_server_timeouts(meta.as_ref());
+
+        assert_eq!(startup_timeout_sec, Some(Duration::from_secs(30)));
+        assert_eq!(tool_timeout_sec, Some(Duration::from_secs(900)));
     }
 }

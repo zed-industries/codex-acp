@@ -56,6 +56,13 @@ Or via npm:
 npx @zed-industries/codex-acp
 ```
 
+### Client MCP server timeouts
+
+ACP clients can tune Codex MCP startup and tool-call timeouts for per-session MCP
+servers by including `startup_timeout_sec` or `tool_timeout_sec` numbers in the
+server's `_meta` object. When these keys are absent, Codex keeps its default MCP
+timeouts.
+
 ## License
 
 Apache-2.0
