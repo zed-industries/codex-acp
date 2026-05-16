@@ -3954,9 +3954,20 @@ impl<A: Auth> ThreadActor<A> {
     async fn handle_event(&mut self, Event { id, msg }: Event) {
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
-        } else {
-            warn!("Received event for unknown submission ID: {id} {msg:?}");
+            return;
         }
+
+        if matches!(msg, EventMsg::ElicitationRequest(_))
+            && let Some((_submission_id, submission)) = self
+                .submissions
+                .iter_mut()
+                .find(|(_submission_id, submission)| submission.is_active())
+        {
+            submission.handle_event(&self.client, msg).await;
+            return;
+        }
+
+        warn!("Received event for unknown submission ID: {id} {msg:?}");
     }
 }
 
@@ -5814,6 +5825,97 @@ mod tests {
                 && content.get("name").and_then(serde_json::Value::as_str) == Some("Alice")
                 && content.get("approved").and_then(serde_json::Value::as_bool) == Some(true)
                 && meta.get("source").and_then(serde_json::Value::as_str) == Some("test")
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unknown_mcp_elicitation_event_routes_to_active_prompt() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::with_elicitation_responses(vec![
+            serde_json::json!({
+                "action": "accept",
+                "content": { "confirmed": true }
+            }),
+        ]));
+        let capabilities = Arc::new(std::sync::Mutex::new(
+            ClientCapabilities::new().elicitation(
+                agent_client_protocol::schema::ElicitationCapabilities::new()
+                    .form(agent_client_protocol::schema::ElicitationFormCapabilities::new()),
+            ),
+        ));
+        let session_client = SessionClient::with_client(session_id, client.clone(), capabilities);
+        let thread = Arc::new(StubCodexThread::new());
+        let models_manager = Arc::new(StubModelsManager);
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        let (_message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let mut actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            thread.clone(),
+            models_manager,
+            config,
+            message_rx,
+            resolution_tx.clone(),
+            resolution_rx,
+        );
+
+        actor.submissions.insert(
+            "submission-id".to_string(),
+            SubmissionState::Prompt(PromptState::new(
+                "submission-id".to_string(),
+                thread.clone(),
+                resolution_tx,
+                response_tx,
+            )),
+        );
+
+        actor
+            .handle_event(Event {
+                id: "mcp_elicitation_request".to_string(),
+                msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
+                    turn_id: None,
+                    server_name: "test-server".to_string(),
+                    id: codex_protocol::mcp::RequestId::String("request-id".to_string()),
+                    request: ElicitationRequest::Form {
+                        meta: None,
+                        message: "Need confirmation".to_string(),
+                        requested_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "confirmed": { "type": "boolean" }
+                            }
+                        }),
+                    },
+                }),
+            })
+            .await;
+
+        let requests = client.elicitation_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["mode"], "form");
+        assert_eq!(requests[0]["message"], "Need confirmation");
+        drop(requests);
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.last(),
+            Some(Op::ResolveElicitation {
+                server_name,
+                request_id: codex_protocol::mcp::RequestId::String(request_id),
+                decision: ElicitationAction::Accept,
+                content: Some(content),
+                meta: None,
+            }) if server_name == "test-server"
+                && request_id == "request-id"
+                && content.get("confirmed").and_then(serde_json::Value::as_bool) == Some(true)
         ));
 
         Ok(())
