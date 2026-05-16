@@ -46,7 +46,7 @@ use codex_protocol::{
         ActivePermissionProfile, AdditionalPermissionProfile, PermissionProfile, ResponseItem,
         WebSearchAction,
     },
-    openai_models::{ModelPreset, ReasoningEffort},
+    openai_models::{ModelPreset, ReasoningEffort, SPEED_TIER_FAST},
     parse_command::ParsedCommand,
     permissions::{
         FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSpecialPath,
@@ -83,6 +83,34 @@ use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+const FAST_MODEL_SUFFIX: &str = "-fast";
+
+pub(crate) fn normalize_model_id_alias(model_id: &str) -> (String, Option<String>) {
+    let normalized = normalize_gpt_model_alias(model_id);
+
+    if let Some(base_model) = normalized.strip_suffix(FAST_MODEL_SUFFIX) {
+        (base_model.to_owned(), Some(SPEED_TIER_FAST.to_owned()))
+    } else {
+        (normalized, None)
+    }
+}
+
+fn normalize_gpt_model_alias(model_id: &str) -> String {
+    let Some(rest) = model_id.strip_prefix("gpt") else {
+        return model_id.to_owned();
+    };
+
+    if rest.starts_with('-') || rest.is_empty() {
+        return model_id.to_owned();
+    }
+
+    if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        format!("gpt-{rest}")
+    } else {
+        model_id.to_owned()
+    }
+}
 
 /// Abstraction over the ACP connection for sending notifications and requests
 /// back to the client. This replaces the old `Client` trait usage.
@@ -2956,17 +2984,67 @@ impl<A: Auth> ThreadActor<A> {
             })
             .unwrap_or(preset.default_reasoning_effort);
 
-        Some(Self::model_id(&preset.id, effort))
+        let service_tier = self
+            .config
+            .service_tier
+            .as_deref()
+            .filter(|tier| *tier == SPEED_TIER_FAST && preset.supports_fast_mode());
+
+        Some(Self::model_id(&preset.id, effort, service_tier))
     }
 
-    fn model_id(id: &str, effort: ReasoningEffort) -> ModelId {
+    fn model_id(id: &str, effort: ReasoningEffort, service_tier: Option<&str>) -> ModelId {
+        let id = Self::model_option_id(id, service_tier);
         ModelId::new(format!("{id}/{effort}"))
     }
 
-    fn parse_model_id(id: &ModelId) -> Option<(String, ReasoningEffort)> {
+    fn model_option_id(id: &str, service_tier: Option<&str>) -> String {
+        if service_tier == Some(SPEED_TIER_FAST) {
+            format!("{id}{FAST_MODEL_SUFFIX}")
+        } else {
+            id.to_owned()
+        }
+    }
+
+    fn model_select_options_for_preset(preset: ModelPreset) -> Vec<SessionConfigSelectOption> {
+        let mut options = vec![
+            SessionConfigSelectOption::new(preset.id.clone(), preset.display_name.clone())
+                .description(preset.description.clone()),
+        ];
+
+        if preset.supports_fast_mode() {
+            options.push(
+                SessionConfigSelectOption::new(
+                    Self::model_option_id(&preset.id, Some(SPEED_TIER_FAST)),
+                    format!("{} Fast", preset.display_name),
+                )
+                .description(Self::fast_model_description(&preset)),
+            );
+        }
+
+        options
+    }
+
+    fn fast_model_description(preset: &ModelPreset) -> String {
+        let fast_tier_description = preset
+            .service_tiers
+            .iter()
+            .find(|tier| tier.id == SPEED_TIER_FAST)
+            .map(|tier| tier.description.as_str())
+            .unwrap_or("Uses the fast service tier.");
+
+        if preset.description.is_empty() {
+            fast_tier_description.to_owned()
+        } else {
+            format!("{} {}", preset.description, fast_tier_description)
+        }
+    }
+
+    fn parse_model_id(id: &ModelId) -> Option<(String, ReasoningEffort, Option<Option<String>>)> {
         let (model, reasoning) = id.0.split_once('/')?;
         let reasoning = serde_json::from_value(reasoning.into()).ok()?;
-        Some((model.to_owned(), reasoning))
+        let (model, service_tier) = normalize_model_id_alias(model);
+        Some((model, reasoning, Some(service_tier)))
     }
 
     async fn config_options(&self) -> Result<Vec<SessionConfigOption>, Error> {
@@ -2995,13 +3073,24 @@ impl<A: Auth> ThreadActor<A> {
 
         let current_model = self.get_current_model().await;
         let current_preset = presets.iter().find(|p| p.model == current_model).cloned();
+        let current_model_option_id = current_preset
+            .as_ref()
+            .map(|preset| {
+                let service_tier = self
+                    .config
+                    .service_tier
+                    .as_deref()
+                    .filter(|tier| *tier == SPEED_TIER_FAST && preset.supports_fast_mode());
+                Self::model_option_id(&preset.id, service_tier)
+            })
+            .unwrap_or_else(|| current_model.clone());
 
         let mut model_select_options = Vec::new();
 
         if current_preset.is_none() {
             // If no preset found, return the current model string as-is
             model_select_options.push(SessionConfigSelectOption::new(
-                current_model.clone(),
+                current_model_option_id.clone(),
                 current_model.clone(),
             ));
         };
@@ -3010,16 +3099,18 @@ impl<A: Auth> ThreadActor<A> {
             presets
                 .into_iter()
                 .filter(|model| model.show_in_picker || model.model == current_model)
-                .map(|preset| {
-                    SessionConfigSelectOption::new(preset.id, preset.display_name)
-                        .description(preset.description)
-                }),
+                .flat_map(Self::model_select_options_for_preset),
         );
 
         options.push(
-            SessionConfigOption::select("model", "Model", current_model, model_select_options)
-                .category(SessionConfigOptionCategory::Model)
-                .description("Choose which model Codex should use"),
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                current_model_option_id,
+                model_select_options,
+            )
+            .category(SessionConfigOptionCategory::Model)
+            .description("Choose which model Codex should use"),
         );
 
         // Reasoning effort selector (only if the current preset exists and has >1 supported effort)
@@ -3100,10 +3191,10 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_set_config_model(&mut self, value: SessionConfigValueId) -> Result<(), Error> {
-        let model_id = value.0;
+        let (model_id, service_tier) = normalize_model_id_alias(value.0.as_ref());
 
         let presets = self.models_manager.list_models().await;
-        let preset = presets.iter().find(|p| p.id.as_str() == &*model_id);
+        let preset = presets.iter().find(|p| p.id == model_id);
 
         let model_to_use = preset
             .map(|p| p.model.clone())
@@ -3112,6 +3203,15 @@ impl<A: Auth> ThreadActor<A> {
         if model_to_use.is_empty() {
             return Err(Error::invalid_params().data("No model selected"));
         }
+
+        if service_tier.as_deref() == Some(SPEED_TIER_FAST)
+            && preset.is_some_and(|preset| !preset.supports_fast_mode())
+        {
+            return Err(Error::invalid_params()
+                .data("Fast service tier is not supported for selected model"));
+        }
+
+        let service_tier_to_use = Some(service_tier);
 
         let effort_to_use = if let Some(preset) = preset {
             if let Some(effort) = self.config.model_reasoning_effort
@@ -3141,7 +3241,7 @@ impl<A: Auth> ThreadActor<A> {
                 collaboration_mode: None,
                 personality: None,
                 windows_sandbox_level: None,
-                service_tier: None,
+                service_tier: service_tier_to_use.clone(),
                 approvals_reviewer: None,
                 permission_profile: None,
             })
@@ -3150,6 +3250,9 @@ impl<A: Auth> ThreadActor<A> {
 
         self.config.model = Some(model_to_use);
         self.config.model_reasoning_effort = effort_to_use;
+        if let Some(service_tier) = service_tier_to_use {
+            self.config.service_tier = service_tier;
+        }
 
         Ok(())
     }
@@ -3221,13 +3324,35 @@ impl<A: Auth> ThreadActor<A> {
                 .iter()
                 .filter(|model| model.show_in_picker || model.model == config_model)
                 .flat_map(|preset| {
-                    preset.supported_reasoning_efforts.iter().map(|effort| {
-                        ModelInfo::new(
-                            Self::model_id(&preset.id, effort.effort),
-                            format!("{} ({})", preset.display_name, effort.effort),
-                        )
-                        .description(format!("{} {}", preset.description, effort.description))
-                    })
+                    let mut models = Vec::new();
+                    for effort in &preset.supported_reasoning_efforts {
+                        models.push(
+                            ModelInfo::new(
+                                Self::model_id(&preset.id, effort.effort, None),
+                                format!("{} ({})", preset.display_name, effort.effort),
+                            )
+                            .description(format!("{} {}", preset.description, effort.description)),
+                        );
+
+                        if preset.supports_fast_mode() {
+                            models.push(
+                                ModelInfo::new(
+                                    Self::model_id(
+                                        &preset.id,
+                                        effort.effort,
+                                        Some(SPEED_TIER_FAST),
+                                    ),
+                                    format!("{} Fast ({})", preset.display_name, effort.effort),
+                                )
+                                .description(format!(
+                                    "{} {}",
+                                    Self::fast_model_description(preset),
+                                    effort.description
+                                )),
+                            );
+                        }
+                    }
+                    models
                 }),
         );
 
@@ -3400,17 +3525,26 @@ impl<A: Auth> ThreadActor<A> {
 
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
         // Try parsing as preset format, otherwise use as-is, fallback to config
-        let (model_to_use, effort_to_use) = if let Some((m, e)) = Self::parse_model_id(&model) {
-            (m, Some(e))
-        } else {
-            let model_str = model.0.to_string();
-            let fallback = if !model_str.is_empty() {
-                model_str
+        let (model_to_use, effort_to_use, service_tier_to_use) =
+            if let Some((m, e, service_tier)) = Self::parse_model_id(&model) {
+                (m, Some(e), service_tier)
             } else {
-                self.get_current_model().await
+                let model_str = model.0.to_string();
+                if !model_str.is_empty() {
+                    let (model, service_tier) = normalize_model_id_alias(&model_str);
+                    (
+                        model,
+                        self.config.model_reasoning_effort,
+                        Some(service_tier),
+                    )
+                } else {
+                    (
+                        self.get_current_model().await,
+                        self.config.model_reasoning_effort,
+                        None,
+                    )
+                }
             };
-            (fallback, self.config.model_reasoning_effort)
-        };
 
         if model_to_use.is_empty() {
             return Err(Error::invalid_params().data("No model parsed or configured"));
@@ -3427,7 +3561,7 @@ impl<A: Auth> ThreadActor<A> {
                 collaboration_mode: None,
                 personality: None,
                 windows_sandbox_level: None,
-                service_tier: None,
+                service_tier: service_tier_to_use.clone(),
                 approvals_reviewer: None,
                 permission_profile: None,
             })
@@ -3436,6 +3570,9 @@ impl<A: Auth> ThreadActor<A> {
 
         self.config.model = Some(model_to_use);
         self.config.model_reasoning_effort = effort_to_use;
+        if let Some(service_tier) = service_tier_to_use {
+            self.config.service_tier = service_tier;
+        }
 
         Ok(())
     }
@@ -4487,6 +4624,83 @@ mod tests {
         assert!(mode_trusts_project("full-access"));
     }
 
+    #[test]
+    fn gpt_fast_model_aliases_normalize_to_service_tier() {
+        assert_eq!(
+            normalize_model_id_alias("gpt5.5-fast"),
+            ("gpt-5.5".to_string(), Some(SPEED_TIER_FAST.to_string()))
+        );
+        assert_eq!(
+            normalize_model_id_alias("gpt-5.5-fast"),
+            ("gpt-5.5".to_string(), Some(SPEED_TIER_FAST.to_string()))
+        );
+        assert_eq!(
+            normalize_model_id_alias("gpt5.5"),
+            ("gpt-5.5".to_string(), None)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_model_fast_alias_sets_service_tier() -> anyhow::Result<()> {
+        let (_session_id, _client, thread, message_tx, _handle) = setup().await?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::SetModel {
+            model: ModelId::new("gpt5.5-fast/high"),
+            response_tx,
+        })?;
+
+        response_rx.await??;
+        drop(message_tx);
+
+        let ops = thread.ops.lock().unwrap();
+        let Some(Op::OverrideTurnContext {
+            model,
+            effort,
+            service_tier,
+            ..
+        }) = ops.last()
+        else {
+            panic!("expected OverrideTurnContext op, got {ops:?}");
+        };
+        assert_eq!(model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(effort, &Some(Some(ReasoningEffort::High)));
+        assert_eq!(service_tier, &Some(Some(SPEED_TIER_FAST.to_string())));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_config_model_fast_alias_sets_service_tier() -> anyhow::Result<()> {
+        let (_session_id, _client, thread, message_tx, _handle) = setup().await?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::SetConfigOption {
+            config_id: SessionConfigId::new("model"),
+            value: SessionConfigOptionValue::ValueId {
+                value: SessionConfigValueId::new("gpt5.5-fast"),
+            },
+            response_tx,
+        })?;
+
+        response_rx.await??;
+        drop(message_tx);
+
+        let ops = thread.ops.lock().unwrap();
+        let Some(Op::OverrideTurnContext {
+            model,
+            service_tier,
+            ..
+        }) = ops.last()
+        else {
+            panic!("expected OverrideTurnContext op, got {ops:?}");
+        };
+        assert_eq!(model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(service_tier, &Some(Some(SPEED_TIER_FAST.to_string())));
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_init() -> anyhow::Result<()> {
         let (session_id, client, thread, message_tx, _handle) = setup().await?;
@@ -5129,6 +5343,7 @@ mod tests {
                             })
                             .unwrap();
                     }
+                    Op::OverrideTurnContext { .. } => {}
                     Op::ExecApproval { .. }
                     | Op::ResolveElicitation { .. }
                     | Op::RequestPermissionsResponse { .. }

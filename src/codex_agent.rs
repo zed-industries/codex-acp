@@ -35,7 +35,7 @@ use std::{
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::thread::Thread;
+use crate::thread::{Thread, normalize_model_id_alias};
 
 /// The Codex implementation of the ACP Agent.
 ///
@@ -64,9 +64,11 @@ const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
     pub async fn new(
-        config: Config,
+        mut config: Config,
         codex_linux_sandbox_exe: Option<PathBuf>,
     ) -> std::io::Result<Self> {
+        normalize_config_model_alias(&mut config);
+
         let auth_manager = AuthManager::shared(
             config.codex_home.to_path_buf(),
             false,
@@ -419,6 +421,18 @@ impl CodexAgent {
             .map_err(|e| anyhow::anyhow!(e))?;
 
         Ok(config)
+    }
+}
+
+fn normalize_config_model_alias(config: &mut Config) {
+    let Some(config_model) = config.model.as_deref() else {
+        return;
+    };
+
+    let (model, service_tier) = normalize_model_id_alias(config_model);
+    config.model = Some(model);
+    if service_tier.is_some() {
+        config.service_tier = service_tier;
     }
 }
 
