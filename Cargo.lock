@@ -1522,6 +1522,7 @@ name = "codex-acp"
 version = "0.14.0"
 dependencies = [
  "agent-client-protocol",
+ "agent-client-protocol-schema",
  "anyhow",
  "clap",
  "codex-apply-patch",

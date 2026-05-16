@@ -8,7 +8,7 @@ use std::{
 };
 
 use agent_client_protocol::{
-    Client, ConnectionTo, Error,
+    Client, ConnectionTo, Error, UntypedMessage,
     schema::{
         AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ClientCapabilities,
         ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
@@ -92,6 +92,10 @@ trait ClientSender: Send + Sync + 'static {
         &self,
         req: RequestPermissionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<RequestPermissionResponse, Error>> + Send + '_>>;
+    fn create_elicitation(
+        &self,
+        req: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, Error>> + Send + '_>>;
 }
 
 /// Production implementation that wraps a `ConnectionTo<Client>`.
@@ -107,6 +111,16 @@ impl ClientSender for AcpConnection {
         req: RequestPermissionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<RequestPermissionResponse, Error>> + Send + '_>> {
         Box::pin(async move { self.0.send_request(req).block_task().await })
+    }
+
+    fn create_elicitation(
+        &self,
+        req: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, Error>> + Send + '_>> {
+        Box::pin(async move {
+            let request = UntypedMessage::new("elicitation/create", req)?;
+            self.0.send_request(request).block_task().await
+        })
     }
 }
 
@@ -669,6 +683,94 @@ fn build_supported_mcp_elicitation_permission_request(
         options,
         option_map,
     })
+}
+
+fn mcp_elicitation_create_request(
+    session_id: &SessionId,
+    request: &ElicitationRequest,
+) -> serde_json::Value {
+    match request {
+        ElicitationRequest::Form {
+            meta,
+            message,
+            requested_schema,
+        } => {
+            let mut params = serde_json::Map::new();
+            params.insert(
+                "mode".to_string(),
+                serde_json::Value::String("form".to_string()),
+            );
+            params.insert(
+                "sessionId".to_string(),
+                serde_json::Value::String(session_id.0.to_string()),
+            );
+            params.insert(
+                "message".to_string(),
+                serde_json::Value::String(message.clone()),
+            );
+            params.insert("requestedSchema".to_string(), requested_schema.clone());
+            if let Some(meta) = meta.clone() {
+                params.insert("_meta".to_string(), meta);
+            }
+            serde_json::Value::Object(params)
+        }
+        ElicitationRequest::Url {
+            meta,
+            message,
+            url,
+            elicitation_id,
+        } => {
+            let mut params = serde_json::Map::new();
+            params.insert(
+                "mode".to_string(),
+                serde_json::Value::String("url".to_string()),
+            );
+            params.insert(
+                "sessionId".to_string(),
+                serde_json::Value::String(session_id.0.to_string()),
+            );
+            params.insert(
+                "message".to_string(),
+                serde_json::Value::String(message.clone()),
+            );
+            params.insert("url".to_string(), serde_json::Value::String(url.clone()));
+            params.insert(
+                "elicitationId".to_string(),
+                serde_json::Value::String(elicitation_id.clone()),
+            );
+            if let Some(meta) = meta.clone() {
+                params.insert("_meta".to_string(), meta);
+            }
+            serde_json::Value::Object(params)
+        }
+    }
+}
+
+fn resolved_mcp_elicitation_from_acp_response(
+    response: serde_json::Value,
+) -> ResolvedMcpElicitation {
+    let action = response
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("cancel");
+    let meta = response.get("_meta").cloned();
+    match action {
+        "accept" => ResolvedMcpElicitation {
+            action: ElicitationAction::Accept,
+            content: response.get("content").cloned(),
+            meta,
+        },
+        "decline" => ResolvedMcpElicitation {
+            action: ElicitationAction::Decline,
+            content: None,
+            meta,
+        },
+        _ => ResolvedMcpElicitation {
+            action: ElicitationAction::Cancel,
+            content: None,
+            meta,
+        },
+    }
 }
 
 fn mcp_tool_approval_persist_modes(
@@ -1531,18 +1633,40 @@ impl PromptState {
             ElicitationRequest::Url { .. } => "url",
         };
 
-        info!(
-            "Auto-declining unsupported MCP elicitation: server={}, id={:?}, kind={request_kind}",
-            server_name, id
-        );
+        let response = if client.supports_mcp_elicitation(&request) {
+            info!(
+                "Forwarding MCP elicitation through ACP elicitation/create: server={}, id={:?}, kind={request_kind}",
+                server_name, id
+            );
+            match client.create_elicitation(&request).await {
+                Ok(response) => response,
+                Err(err) => {
+                    warn!(
+                        "ACP elicitation/create failed; cancelling MCP elicitation: server={}, id={:?}, kind={request_kind}, error={err:?}",
+                        server_name, id
+                    );
+                    ResolvedMcpElicitation::cancel()
+                }
+            }
+        } else {
+            info!(
+                "Auto-declining unsupported MCP elicitation: server={}, id={:?}, kind={request_kind}",
+                server_name, id
+            );
+            ResolvedMcpElicitation {
+                action: ElicitationAction::Decline,
+                content: None,
+                meta: None,
+            }
+        };
 
         self.thread
             .submit(Op::ResolveElicitation {
                 server_name,
                 request_id: id,
-                decision: ElicitationAction::Decline,
-                content: None,
-                meta: None,
+                decision: response.action,
+                content: response.content,
+                meta: response.meta,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -2616,6 +2740,33 @@ impl SessionClient {
             client,
             client_capabilities,
         }
+    }
+
+    fn supports_mcp_elicitation(&self, request: &ElicitationRequest) -> bool {
+        let capabilities = self.client_capabilities.lock().unwrap();
+        match request {
+            ElicitationRequest::Form { .. } => capabilities
+                .elicitation
+                .as_ref()
+                .and_then(|elicitation| elicitation.form.as_ref())
+                .is_some(),
+            ElicitationRequest::Url { .. } => capabilities
+                .elicitation
+                .as_ref()
+                .and_then(|elicitation| elicitation.url.as_ref())
+                .is_some(),
+        }
+    }
+
+    async fn create_elicitation(
+        &self,
+        request: &ElicitationRequest,
+    ) -> Result<ResolvedMcpElicitation, Error> {
+        let params = mcp_elicitation_create_request(&self.session_id, request);
+        self.client
+            .create_elicitation(params)
+            .await
+            .map(resolved_mcp_elicitation_from_acp_response)
     }
 
     fn supports_terminal_output(&self, active_command: &ActiveCommand) -> bool {
@@ -5173,6 +5324,8 @@ mod tests {
         notifications: std::sync::Mutex<Vec<SessionNotification>>,
         permission_requests: std::sync::Mutex<Vec<RequestPermissionRequest>>,
         permission_responses: std::sync::Mutex<VecDeque<RequestPermissionResponse>>,
+        elicitation_requests: std::sync::Mutex<Vec<serde_json::Value>>,
+        elicitation_responses: std::sync::Mutex<VecDeque<serde_json::Value>>,
         block_permission_requests: Option<Arc<Notify>>,
     }
 
@@ -5182,6 +5335,8 @@ mod tests {
                 notifications: std::sync::Mutex::default(),
                 permission_requests: std::sync::Mutex::default(),
                 permission_responses: std::sync::Mutex::default(),
+                elicitation_requests: std::sync::Mutex::default(),
+                elicitation_responses: std::sync::Mutex::default(),
                 block_permission_requests: None,
             }
         }
@@ -5191,6 +5346,8 @@ mod tests {
                 notifications: std::sync::Mutex::default(),
                 permission_requests: std::sync::Mutex::default(),
                 permission_responses: std::sync::Mutex::new(responses.into()),
+                elicitation_requests: std::sync::Mutex::default(),
+                elicitation_responses: std::sync::Mutex::default(),
                 block_permission_requests: None,
             }
         }
@@ -5203,7 +5360,20 @@ mod tests {
                 notifications: std::sync::Mutex::default(),
                 permission_requests: std::sync::Mutex::default(),
                 permission_responses: std::sync::Mutex::new(responses.into()),
+                elicitation_requests: std::sync::Mutex::default(),
+                elicitation_responses: std::sync::Mutex::default(),
                 block_permission_requests: Some(notify),
+            }
+        }
+
+        fn with_elicitation_responses(responses: Vec<serde_json::Value>) -> Self {
+            StubClient {
+                notifications: std::sync::Mutex::default(),
+                permission_requests: std::sync::Mutex::default(),
+                permission_responses: std::sync::Mutex::default(),
+                elicitation_requests: std::sync::Mutex::default(),
+                elicitation_responses: std::sync::Mutex::new(responses.into()),
+                block_permission_requests: None,
             }
         }
     }
@@ -5232,6 +5402,21 @@ mod tests {
                     .unwrap_or_else(|| {
                         RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled)
                     }))
+            })
+        }
+
+        fn create_elicitation(
+            &self,
+            args: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, Error>> + Send + '_>> {
+            Box::pin(async move {
+                self.elicitation_requests.lock().unwrap().push(args);
+                Ok(self
+                    .elicitation_responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| serde_json::json!({ "action": "cancel" })))
             })
         }
     }
@@ -5549,6 +5734,156 @@ mod tests {
                 content: None,
                 meta: None,
             }) if server_name == "test-server" && request_id == "request-id"
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_generic_mcp_form_elicitation_forwards_to_acp_create() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::with_elicitation_responses(vec![
+            serde_json::json!({
+                "action": "accept",
+                "content": { "name": "Alice", "approved": true },
+                "_meta": { "source": "test" }
+            }),
+        ]));
+        let capabilities = Arc::new(std::sync::Mutex::new(
+            ClientCapabilities::new().elicitation(
+                agent_client_protocol::schema::ElicitationCapabilities::new()
+                    .form(agent_client_protocol::schema::ElicitationFormCapabilities::new()),
+            ),
+        ));
+        let session_client = SessionClient::with_client(session_id, client.clone(), capabilities);
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state = PromptState::new(
+            "submission-id".to_string(),
+            thread.clone(),
+            message_tx,
+            response_tx,
+        );
+
+        prompt_state
+            .mcp_elicitation(
+                &session_client,
+                ElicitationRequestEvent {
+                    turn_id: Some("turn-id".to_string()),
+                    server_name: "test-server".to_string(),
+                    id: codex_protocol::mcp::RequestId::String("request-id".to_string()),
+                    request: ElicitationRequest::Form {
+                        meta: None,
+                        message: "Need some structured input".to_string(),
+                        requested_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "approved": { "type": "boolean" }
+                            },
+                            "required": ["name"]
+                        }),
+                    },
+                },
+            )
+            .await?;
+
+        let requests = client.elicitation_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["mode"], "form");
+        assert_eq!(requests[0]["sessionId"], "test");
+        assert_eq!(requests[0]["message"], "Need some structured input");
+        assert_eq!(
+            requests[0]["requestedSchema"]["properties"]["name"]["type"],
+            "string"
+        );
+        drop(requests);
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.last(),
+            Some(Op::ResolveElicitation {
+                server_name,
+                request_id: codex_protocol::mcp::RequestId::String(request_id),
+                decision: ElicitationAction::Accept,
+                content: Some(content),
+                meta: Some(meta),
+            }) if server_name == "test-server"
+                && request_id == "request-id"
+                && content.get("name").and_then(serde_json::Value::as_str) == Some("Alice")
+                && content.get("approved").and_then(serde_json::Value::as_bool) == Some(true)
+                && meta.get("source").and_then(serde_json::Value::as_str) == Some("test")
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_generic_mcp_url_elicitation_forwards_to_acp_create() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::with_elicitation_responses(vec![
+            serde_json::json!({
+                "action": "accept",
+                "_meta": { "completed": true }
+            }),
+        ]));
+        let capabilities = Arc::new(std::sync::Mutex::new(
+            ClientCapabilities::new().elicitation(
+                agent_client_protocol::schema::ElicitationCapabilities::new()
+                    .url(agent_client_protocol::schema::ElicitationUrlCapabilities::new()),
+            ),
+        ));
+        let session_client = SessionClient::with_client(session_id, client.clone(), capabilities);
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state = PromptState::new(
+            "submission-id".to_string(),
+            thread.clone(),
+            message_tx,
+            response_tx,
+        );
+
+        prompt_state
+            .mcp_elicitation(
+                &session_client,
+                ElicitationRequestEvent {
+                    turn_id: Some("turn-id".to_string()),
+                    server_name: "test-server".to_string(),
+                    id: codex_protocol::mcp::RequestId::String("request-id".to_string()),
+                    request: ElicitationRequest::Url {
+                        meta: Some(serde_json::json!({ "kind": "oauth" })),
+                        message: "Authenticate in the browser".to_string(),
+                        url: "https://example.test/oauth".to_string(),
+                        elicitation_id: "elicitation-123".to_string(),
+                    },
+                },
+            )
+            .await?;
+
+        let requests = client.elicitation_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["mode"], "url");
+        assert_eq!(requests[0]["sessionId"], "test");
+        assert_eq!(requests[0]["message"], "Authenticate in the browser");
+        assert_eq!(requests[0]["url"], "https://example.test/oauth");
+        assert_eq!(requests[0]["elicitationId"], "elicitation-123");
+        assert_eq!(requests[0]["_meta"]["kind"], "oauth");
+        drop(requests);
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.last(),
+            Some(Op::ResolveElicitation {
+                server_name,
+                request_id: codex_protocol::mcp::RequestId::String(request_id),
+                decision: ElicitationAction::Accept,
+                content: None,
+                meta: Some(meta),
+            }) if server_name == "test-server"
+                && request_id == "request-id"
+                && meta.get("completed").and_then(serde_json::Value::as_bool) == Some(true)
         ));
 
         Ok(())

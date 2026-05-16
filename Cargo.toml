@@ -19,6 +19,8 @@ path = "src/lib.rs"
 
 [dependencies]
 agent-client-protocol = { version = "=0.11.1", features = ["unstable"] }
+# Enable ACP elicitation schema types until agent-client-protocol exposes a top-level feature.
+agent-client-protocol-schema = { version = "=0.12.0", features = ["unstable_elicitation"] }
 anyhow = "1"
 clap = "4"
 codex-apply-patch = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }
