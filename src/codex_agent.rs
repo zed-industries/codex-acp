@@ -56,8 +56,9 @@ pub struct CodexAgent {
     sessions: Arc<Mutex<HashMap<SessionId, Arc<Thread>>>>,
     /// Session working directories for filesystem sandboxing
     session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>>,
+    /// Client identity reported during initialization
+    client_info: Arc<Mutex<Option<Implementation>>>,
 }
-
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
 
@@ -87,6 +88,7 @@ impl CodexAgent {
         );
         let thread_store = thread_store_from_config(&config, state_db.clone());
         let installation_id = resolve_installation_id(&config.codex_home).await?;
+        let client_info: Arc<Mutex<Option<Implementation>>> = Arc::default();
         let thread_manager = ThreadManager::new(
             &config,
             auth_manager.clone(),
@@ -105,6 +107,7 @@ impl CodexAgent {
             state_db,
             sessions: Arc::default(),
             session_roots,
+            client_info,
         })
     }
 
@@ -427,11 +430,19 @@ impl CodexAgent {
         let InitializeRequest {
             protocol_version,
             client_capabilities,
-            client_info: _, // TODO: save and pass into Codex somehow
+            client_info,
             ..
         } = request;
-        debug!("Received initialize request with protocol version {protocol_version:?}",);
+        debug!("Received initialize request with protocol version {protocol_version:?}");
         let protocol_version = ProtocolVersion::V1;
+
+        if let Some(ref info) = client_info {
+            info!(
+                "connected client: {} {} {:?}",
+                info.name, info.version, info.title
+            );
+        }
+        *self.client_info.lock().unwrap() = client_info;
 
         *self.client_capabilities.lock().unwrap() = client_capabilities;
 
