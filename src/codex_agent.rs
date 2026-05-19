@@ -27,8 +27,10 @@ use codex_protocol::{
     ThreadId,
     protocol::{InitialHistory, SessionSource},
 };
+use serde_json::json;
 use std::{
     collections::HashMap,
+    env, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -420,6 +422,47 @@ impl CodexAgent {
 
         Ok(config)
     }
+
+    fn status_snapshot_path() -> PathBuf {
+        env::var_os("CODEX_ACP_STATUS_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| env::temp_dir().join("codex-acp-auth-status.json"))
+    }
+
+    async fn write_status_snapshot(
+        &self,
+        event: &str,
+        session_id: Option<&SessionId>,
+    ) -> std::io::Result<()> {
+        let auth = self.auth_manager.auth().await;
+        let auth_snapshot = auth.as_ref().map(|auth| {
+            json!({
+                "auth_mode": format!("{:?}", auth.auth_mode()),
+                "api_auth_mode": format!("{:?}", auth.api_auth_mode()),
+                "account_email": auth.get_account_email(),
+                "account_id": auth.get_account_id(),
+                "chatgpt_user_id": auth.get_chatgpt_user_id(),
+                "plan_type": auth.account_plan_type().map(|plan| format!("{:?}", plan)),
+                "is_workspace_account": auth.is_workspace_account(),
+                "is_fedramp_account": auth.is_fedramp_account(),
+            })
+        });
+
+        let payload = json!({
+            "event": event,
+            "adapter": {
+                "name": "codex-acp",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "session_id": session_id.map(|id| id.0.as_ref().to_string()),
+            "auth": auth_snapshot,
+        });
+
+        fs::write(
+            Self::status_snapshot_path(),
+            serde_json::to_vec_pretty(&payload)?,
+        )
+    }
 }
 
 impl CodexAgent {
@@ -454,6 +497,8 @@ impl CodexAgent {
         if std::env::var("NO_BROWSER").is_ok() {
             auth_methods.remove(0);
         }
+
+        drop(self.write_status_snapshot("initialize", None).await);
 
         Ok(InitializeResponse::new(protocol_version)
             .agent_capabilities(agent_capabilities)
@@ -584,6 +629,11 @@ impl CodexAgent {
 
         debug!("Created new session with {} MCP servers", num_mcp_servers);
 
+        drop(
+            self.write_status_snapshot("new_session", Some(&session_id))
+                .await,
+        );
+
         Ok(NewSessionResponse::new(session_id)
             .modes(load.modes)
             .models(load.models)
@@ -658,7 +708,15 @@ impl CodexAgent {
             .lock()
             .unwrap()
             .insert(session_id.clone(), config.cwd.to_path_buf());
-        self.sessions.lock().unwrap().insert(session_id, thread);
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), thread);
+
+        drop(
+            self.write_status_snapshot("load_session", Some(&session_id))
+                .await,
+        );
 
         Ok(LoadSessionResponse::new()
             .modes(load.modes)
