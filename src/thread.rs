@@ -305,6 +305,7 @@ enum ThreadMessage {
     },
     PermissionRequestResolved {
         submission_id: String,
+        interaction_id: u64,
         request_key: String,
         response: Result<RequestPermissionResponse, Error>,
     },
@@ -497,8 +498,8 @@ enum PendingPermissionRequest {
 }
 
 struct PendingPermissionInteraction {
+    id: u64,
     request: PendingPermissionRequest,
-    task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Clone)]
@@ -817,22 +818,28 @@ impl SubmissionState {
     async fn handle_permission_request_resolved(
         &mut self,
         client: &SessionClient,
+        interaction_id: u64,
         request_key: String,
         response: Result<RequestPermissionResponse, Error>,
     ) -> Result<(), Error> {
         match self {
             Self::Prompt(state) => {
                 state
-                    .handle_permission_request_resolved(client, request_key, response)
+                    .handle_permission_request_resolved(
+                        client,
+                        interaction_id,
+                        request_key,
+                        response,
+                    )
                     .await
             }
         }
     }
 
-    fn abort_pending_interactions(&mut self) {
+    fn detach_pending_interactions(&mut self) {
         match self {
             Self::Prompt(state) => {
-                state.abort_pending_interactions();
+                state.detach_pending_interactions();
             }
         }
     }
@@ -862,6 +869,7 @@ struct PromptState {
     thread: Arc<dyn CodexThreadImpl>,
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     pending_permission_interactions: HashMap<String, PendingPermissionInteraction>,
+    next_permission_interaction_id: u64,
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     seen_message_deltas: bool,
@@ -884,6 +892,7 @@ impl PromptState {
             thread,
             resolution_tx,
             pending_permission_interactions: HashMap::new(),
+            next_permission_interaction_id: 0,
             event_count: 0,
             response_tx: Some(response_tx),
             seen_message_deltas: false,
@@ -898,10 +907,10 @@ impl PromptState {
         !response_tx.is_closed()
     }
 
-    fn abort_pending_interactions(&mut self) {
-        for (_, interaction) in self.pending_permission_interactions.drain() {
-            interaction.task.abort();
-        }
+    fn detach_pending_interactions(&mut self) {
+        // Keep detached permission request tasks running so ACP can route the
+        // client's required `Cancelled` response after session cancellation.
+        self.pending_permission_interactions.clear();
     }
 
     fn spawn_permission_request(
@@ -912,38 +921,54 @@ impl PromptState {
         tool_call: ToolCallUpdate,
         options: Vec<PermissionOption>,
     ) {
+        let interaction_id = self.next_permission_interaction_id;
+        self.next_permission_interaction_id = self.next_permission_interaction_id.wrapping_add(1);
         let client = client.clone();
         let resolution_tx = self.resolution_tx.clone();
         let submission_id = self.submission_id.clone();
         let resolved_request_key = request_key.clone();
-        let handle = tokio::spawn(async move {
+        drop(tokio::spawn(async move {
             let response = client.request_permission(tool_call, options).await;
             drop(
                 resolution_tx.send(ThreadMessage::PermissionRequestResolved {
                     submission_id,
+                    interaction_id,
                     request_key: resolved_request_key,
                     response,
                 }),
             );
-        });
+        }));
 
-        if let Some(interaction) = self.pending_permission_interactions.insert(
+        self.pending_permission_interactions.insert(
             request_key,
             PendingPermissionInteraction {
+                id: interaction_id,
                 request: pending_request,
-                task: handle,
             },
-        ) {
-            interaction.task.abort();
-        }
+        );
     }
 
     async fn handle_permission_request_resolved(
         &mut self,
         _client: &SessionClient,
+        interaction_id: u64,
         request_key: String,
         response: Result<RequestPermissionResponse, Error>,
     ) -> Result<(), Error> {
+        let Some(pending_interaction_id) = self
+            .pending_permission_interactions
+            .get(&request_key)
+            .map(|interaction| interaction.id)
+        else {
+            warn!("Ignoring permission response for unknown request key: {request_key}");
+            return Ok(());
+        };
+
+        if pending_interaction_id != interaction_id {
+            warn!("Ignoring stale permission response for request key: {request_key}");
+            return Ok(());
+        }
+
         let Some(interaction) = self.pending_permission_interactions.remove(&request_key) else {
             warn!("Ignoring permission response for unknown request key: {request_key}");
             return Ok(());
@@ -1342,7 +1367,7 @@ impl PromptState {
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
                 );
-                self.abort_pending_interactions();
+                self.detach_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
@@ -1361,7 +1386,7 @@ impl PromptState {
                 codex_error_info,
             }) => {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
-                self.abort_pending_interactions();
+                self.detach_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx
                         .send(Err(Error::internal_error().data(
@@ -1372,14 +1397,14 @@ impl PromptState {
             }
             EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _ }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
-                self.abort_pending_interactions();
+                self.detach_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
                 }
             }
             EventMsg::ShutdownComplete => {
                 info!("Agent shutting down");
-                self.abort_pending_interactions();
+                self.detach_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
                 }
@@ -2879,6 +2904,7 @@ impl<A: Auth> ThreadActor<A> {
             }
             ThreadMessage::PermissionRequestResolved {
                 submission_id,
+                interaction_id,
                 request_key,
                 response,
             } => {
@@ -2890,10 +2916,15 @@ impl<A: Auth> ThreadActor<A> {
                 };
 
                 if let Err(err) = submission
-                    .handle_permission_request_resolved(&self.client, request_key, response)
+                    .handle_permission_request_resolved(
+                        &self.client,
+                        interaction_id,
+                        request_key,
+                        response,
+                    )
                     .await
                 {
-                    submission.abort_pending_interactions();
+                    submission.detach_pending_interactions();
                     submission.fail(err);
                 }
             }
@@ -3423,7 +3454,7 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_cancel(&mut self) -> Result<(), Error> {
-        self.abort_pending_interactions();
+        self.detach_pending_interactions();
         self.thread
             .submit(Op::Interrupt)
             .await
@@ -3432,7 +3463,7 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_shutdown(&mut self) -> Result<(), Error> {
-        self.abort_pending_interactions();
+        self.detach_pending_interactions();
         self.thread
             .submit(Op::Shutdown)
             .await
@@ -3440,9 +3471,9 @@ impl<A: Auth> ThreadActor<A> {
         Ok(())
     }
 
-    fn abort_pending_interactions(&mut self) {
+    fn detach_pending_interactions(&mut self) {
         for submission in self.submissions.values_mut() {
-            submission.abort_pending_interactions();
+            submission.detach_pending_interactions();
         }
     }
 
@@ -5331,6 +5362,7 @@ mod tests {
 
         let ThreadMessage::PermissionRequestResolved {
             submission_id,
+            interaction_id,
             request_key,
             response,
         } = message_rx.recv().await.unwrap()
@@ -5339,7 +5371,12 @@ mod tests {
         };
         assert_eq!(submission_id, "submission-id");
         prompt_state
-            .handle_permission_request_resolved(&session_client, request_key, response)
+            .handle_permission_request_resolved(
+                &session_client,
+                interaction_id,
+                request_key,
+                response,
+            )
             .await?;
 
         let requests = client.permission_requests.lock().unwrap();
@@ -5419,6 +5456,7 @@ mod tests {
 
         let ThreadMessage::PermissionRequestResolved {
             submission_id,
+            interaction_id,
             request_key,
             response,
         } = message_rx.recv().await.unwrap()
@@ -5447,7 +5485,12 @@ mod tests {
         }
 
         prompt_state
-            .handle_permission_request_resolved(&session_client, request_key, response)
+            .handle_permission_request_resolved(
+                &session_client,
+                interaction_id,
+                request_key,
+                response,
+            )
             .await?;
 
         let op = thread.ops.lock().unwrap().last().cloned().unwrap();
@@ -5540,9 +5583,10 @@ mod tests {
     #[tokio::test]
     async fn test_blocked_approval_does_not_block_followup_events() -> anyhow::Result<()> {
         let session_id = SessionId::new("test");
+        let notify = Arc::new(Notify::new());
         let client = Arc::new(StubClient::with_blocked_permission_requests(
             vec![],
-            Arc::new(Notify::new()),
+            notify.clone(),
         ));
         let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
         let thread = Arc::new(StubCodexThread::new());
@@ -5600,7 +5644,99 @@ mod tests {
         }));
 
         drop(notifications);
-        prompt_state.abort_pending_interactions();
+        prompt_state.detach_pending_interactions();
+        notify.notify_one();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_detached_permission_request_drains_late_response() -> anyhow::Result<()> {
+        let notify = Arc::new(Notify::new());
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::with_blocked_permission_requests(
+            vec![RequestPermissionResponse::new(
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("approved")),
+            )],
+            notify.clone(),
+        ));
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state = PromptState::new(
+            "submission-id".to_string(),
+            thread.clone(),
+            message_tx,
+            response_tx,
+        );
+
+        prompt_state
+            .handle_event(
+                &session_client,
+                EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+                    call_id: "call-id".to_string(),
+                    approval_id: Some("approval-id".to_string()),
+                    turn_id: "turn-id".to_string(),
+                    started_at_ms: 0,
+                    command: vec!["echo".to_string(), "hi".to_string()],
+                    cwd: std::env::current_dir()?.try_into()?,
+                    reason: None,
+                    network_approval_context: None,
+                    proposed_execpolicy_amendment: None,
+                    proposed_network_policy_amendments: None,
+                    additional_permissions: None,
+                    available_decisions: Some(vec![
+                        ReviewDecision::Approved,
+                        ReviewDecision::Abort,
+                    ]),
+                    parsed_cmd: vec![ParsedCommand::Unknown {
+                        cmd: "echo hi".to_string(),
+                    }],
+                }),
+            )
+            .await;
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if !client.permission_requests.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        prompt_state.detach_pending_interactions();
+        notify.notify_one();
+
+        let ThreadMessage::PermissionRequestResolved {
+            submission_id,
+            interaction_id,
+            request_key,
+            response,
+        } = tokio::time::timeout(Duration::from_millis(100), message_rx.recv())
+            .await?
+            .expect("permission response should be drained")
+        else {
+            panic!("expected permission resolution message");
+        };
+        assert_eq!(submission_id, "submission-id");
+
+        prompt_state
+            .handle_permission_request_resolved(
+                &session_client,
+                interaction_id,
+                request_key,
+                response,
+            )
+            .await?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            ops.is_empty(),
+            "late permission response should not submit an approval: {ops:?}"
+        );
 
         Ok(())
     }
@@ -5608,11 +5744,12 @@ mod tests {
     #[tokio::test]
     async fn test_thread_shutdown_bypasses_blocked_permission_request() -> anyhow::Result<()> {
         let session_id = SessionId::new("test");
+        let notify = Arc::new(Notify::new());
         let client = Arc::new(StubClient::with_blocked_permission_requests(
             vec![RequestPermissionResponse::new(
                 RequestPermissionOutcome::Cancelled,
             )],
-            Arc::new(Notify::new()),
+            notify.clone(),
         ));
         let session_client =
             SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
@@ -5664,6 +5801,7 @@ mod tests {
         let stop_reason =
             tokio::time::timeout(Duration::from_millis(100), stop_reason_rx).await??;
         assert_eq!(stop_reason?, StopReason::Cancelled);
+        notify.notify_one();
 
         let ops = conversation.ops.lock().unwrap();
         assert!(matches!(ops.last(), Some(Op::Shutdown)));
