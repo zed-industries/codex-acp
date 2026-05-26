@@ -31,6 +31,7 @@ use codex_core::{
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
+use codex_features::Feature;
 use codex_login::auth::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_protocol::{
@@ -38,7 +39,7 @@ use codex_protocol::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
         GuardianCommandSource,
     },
-    config_types::TrustLevel,
+    config_types::{ApprovalsReviewer, SERVICE_TIER_DEFAULT_REQUEST_VALUE, TrustLevel},
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
     mcp::CallToolResult,
@@ -46,7 +47,7 @@ use codex_protocol::{
         ActivePermissionProfile, AdditionalPermissionProfile, PermissionProfile, ResponseItem,
         WebSearchAction,
     },
-    openai_models::{ModelPreset, ReasoningEffort},
+    openai_models::{ModelPreset, ReasoningEffort, SPEED_TIER_FAST},
     parse_command::ParsedCommand,
     permissions::{
         FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSpecialPath,
@@ -116,6 +117,7 @@ const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 const CODEX_READ_ONLY_PROFILE_ID: &str = ":read-only";
 const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
 const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
+const CODEX_DEFAULT_MODE_ID: &str = "auto";
 
 fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> {
     match profile_id {
@@ -129,7 +131,7 @@ fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> 
 fn active_profile_id_for_session_mode(mode_id: &str) -> Option<&'static str> {
     match mode_id {
         "read-only" => Some(CODEX_READ_ONLY_PROFILE_ID),
-        "auto" => Some(CODEX_WORKSPACE_PROFILE_ID),
+        CODEX_DEFAULT_MODE_ID => Some(CODEX_WORKSPACE_PROFILE_ID),
         "full-access" => Some(CODEX_DANGER_NO_SANDBOX_PROFILE_ID),
         _ => None,
     }
@@ -145,6 +147,12 @@ fn mode_id_if_approval_matches(mode_id: &'static str, config: &Config) -> Option
         .iter()
         .find(|preset| preset.id == mode_id && approval_matches_current_config(preset, config))
         .map(|preset| SessionModeId::new(preset.id))
+}
+
+fn default_approval_preset() -> Option<&'static ApprovalPreset> {
+    APPROVAL_PRESETS
+        .iter()
+        .find(|preset| preset.id == CODEX_DEFAULT_MODE_ID)
 }
 
 fn untrusted_read_only_mode_id(config: &Config) -> Option<SessionModeId> {
@@ -163,7 +171,7 @@ fn semantic_session_mode_id_for_permission_profile(config: &Config) -> Option<&'
 
     match permission_profile {
         PermissionProfile::Managed { .. } => {
-            let workspace_preset = APPROVAL_PRESETS.iter().find(|preset| preset.id == "auto")?;
+            let workspace_preset = default_approval_preset()?;
             if permission_profile.network_sandbox_policy()
                 != workspace_preset.permission_profile.network_sandbox_policy()
             {
@@ -206,7 +214,42 @@ fn current_session_mode_id(config: &Config) -> Option<SessionModeId> {
 }
 
 fn mode_trusts_project(mode_id: &str) -> bool {
-    matches!(mode_id, "auto" | "full-access")
+    matches!(mode_id, CODEX_DEFAULT_MODE_ID | "full-access")
+}
+
+enum FastModeCommand {
+    Toggle,
+    On,
+    Off,
+}
+
+impl FastModeCommand {
+    fn parse(rest: &str) -> Result<Self, Error> {
+        match rest.trim().to_ascii_lowercase().as_str() {
+            "" | "toggle" => Ok(Self::Toggle),
+            "on" | "enable" | "enabled" => Ok(Self::On),
+            "off" | "disable" | "disabled" => Ok(Self::Off),
+            _ => Err(Error::invalid_params().data("Usage: /fast [on|off]")),
+        }
+    }
+}
+
+fn model_fast_service_tier(preset: &ModelPreset) -> Option<String> {
+    preset
+        .service_tiers
+        .iter()
+        .find(|tier| {
+            tier.id.eq_ignore_ascii_case(SPEED_TIER_FAST)
+                || tier.name.eq_ignore_ascii_case(SPEED_TIER_FAST)
+        })
+        .map(|tier| tier.id.clone())
+        .or_else(|| {
+            preset
+                .additional_speed_tiers
+                .iter()
+                .any(|tier| tier.eq_ignore_ascii_case(SPEED_TIER_FAST))
+                .then(|| SPEED_TIER_FAST.to_string())
+        })
 }
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
@@ -2837,12 +2880,13 @@ impl<A: Auth> ThreadActor<A> {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
                 let client = self.client.clone();
+                let commands = self.builtin_commands();
                 // Have this happen after the session is loaded by putting it
                 // in a separate task
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     client.send_notification(SessionUpdate::AvailableCommandsUpdate(
-                        AvailableCommandsUpdate::new(Self::builtin_commands()),
+                        AvailableCommandsUpdate::new(commands),
                     ));
                 });
             }
@@ -2919,8 +2963,8 @@ impl<A: Auth> ThreadActor<A> {
         }
     }
 
-    fn builtin_commands() -> Vec<AvailableCommand> {
-        vec![
+    fn builtin_commands(&self) -> Vec<AvailableCommand> {
+        let mut commands = vec![
             AvailableCommand::new("review", "Review my current changes and find issues").input(
                 AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
                     "optional custom review instructions",
@@ -2948,22 +2992,32 @@ impl<A: Auth> ThreadActor<A> {
                 "compact",
                 "summarize conversation to prevent hitting the context limit",
             ),
-            AvailableCommand::new("logout", "logout of Codex"),
-        ]
+        ];
+
+        if self.fast_mode_enabled() {
+            commands.push(
+                AvailableCommand::new("fast", "turn Fast mode on or off").input(
+                    AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                        "on, off, or empty to toggle",
+                    )),
+                ),
+            );
+        }
+
+        commands.push(AvailableCommand::new("logout", "logout of Codex"));
+        commands
     }
 
     fn modes(&self) -> Option<SessionModeState> {
         let current_mode_id = current_session_mode_id(&self.config)?;
+        let mut available_modes = Vec::new();
 
-        Some(SessionModeState::new(
-            current_mode_id,
-            APPROVAL_PRESETS
-                .iter()
-                .map(|preset| {
-                    SessionMode::new(preset.id, preset.label).description(preset.description)
-                })
-                .collect(),
-        ))
+        for preset in APPROVAL_PRESETS.iter() {
+            available_modes
+                .push(SessionMode::new(preset.id, preset.label).description(preset.description));
+        }
+
+        Some(SessionModeState::new(current_mode_id, available_modes))
     }
 
     async fn find_current_model(&self) -> Option<ModelId> {
@@ -3051,7 +3105,7 @@ impl<A: Auth> ThreadActor<A> {
         );
 
         // Reasoning effort selector (only if the current preset exists and has >1 supported effort)
-        if let Some(preset) = current_preset
+        if let Some(ref preset) = current_preset
             && preset.supported_reasoning_efforts.len() > 1
         {
             let supported = &preset.supported_reasoning_efforts;
@@ -3214,6 +3268,81 @@ impl<A: Auth> ThreadActor<A> {
         Ok(())
     }
 
+    async fn handle_fast_mode_command(
+        &mut self,
+        rest: &str,
+    ) -> Result<oneshot::Receiver<Result<StopReason, Error>>, Error> {
+        if !self.fast_mode_enabled() {
+            return Err(Error::invalid_params().data("Fast mode is disabled"));
+        }
+
+        let command = FastModeCommand::parse(rest)?;
+        let current_tier = self.config.service_tier.as_deref();
+        let next_tier = match command {
+            FastModeCommand::Off => SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string(),
+            FastModeCommand::On => self.current_model_fast_service_tier().await?,
+            FastModeCommand::Toggle if current_tier == Some(SPEED_TIER_FAST) => {
+                SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()
+            }
+            FastModeCommand::Toggle => {
+                let fast_tier = self.current_model_fast_service_tier().await?;
+                if current_tier == Some(fast_tier.as_str()) {
+                    SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()
+                } else {
+                    fast_tier
+                }
+            }
+        };
+
+        self.set_service_tier(next_tier.clone()).await?;
+        let status = if next_tier == SERVICE_TIER_DEFAULT_REQUEST_VALUE {
+            "off"
+        } else {
+            "on"
+        };
+        self.client.send_agent_text(format!("Fast mode {status}\n"));
+
+        let (response_tx, response_rx) = oneshot::channel();
+        drop(response_tx.send(Ok(StopReason::EndTurn)));
+        Ok(response_rx)
+    }
+
+    fn fast_mode_enabled(&self) -> bool {
+        self.config.features.enabled(Feature::FastMode)
+    }
+
+    async fn set_service_tier(&mut self, next_tier: String) -> Result<(), Error> {
+        self.thread
+            .submit(Op::ThreadSettings {
+                thread_settings: ThreadSettingsOverrides {
+                    service_tier: Some(Some(next_tier.clone())),
+                    ..Default::default()
+                },
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.config.service_tier = Some(next_tier);
+        Ok(())
+    }
+
+    async fn current_model_fast_service_tier(&self) -> Result<String, Error> {
+        let current_model = self.get_current_model().await;
+        let presets = self.models_manager.list_models().await;
+        let Some(preset) = presets
+            .iter()
+            .find(|preset| preset.model == current_model || preset.id == current_model)
+        else {
+            return Err(Error::invalid_params().data("Fast mode requires a known model preset"));
+        };
+
+        if let Some(fast_tier) = model_fast_service_tier(preset) {
+            return Ok(fast_tier);
+        }
+
+        Err(Error::invalid_params().data("Fast mode is not supported for the selected model"))
+    }
+
     async fn models(&self) -> Result<SessionModelState, Error> {
         let mut available_models = Vec::new();
         let config_model = self.get_current_model().await;
@@ -3317,6 +3446,9 @@ impl<A: Auth> ThreadActor<A> {
                         },
                     }
                 }
+                "fast" => {
+                    return self.handle_fast_mode_command(rest).await;
+                }
                 "logout" => {
                     self.auth.logout().await?;
                     return Err(Error::auth_required());
@@ -3363,17 +3495,19 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
+        let mode_id = mode.0.as_ref();
         let preset = APPROVAL_PRESETS
             .iter()
-            .find(|preset| mode.0.as_ref() == preset.id)
+            .find(|preset| mode_id == preset.id)
             .ok_or_else(Error::invalid_params)?;
 
         self.thread
             .submit(Op::ThreadSettings {
                 thread_settings: ThreadSettingsOverrides {
                     approval_policy: Some(preset.approval),
+                    approvals_reviewer: Some(ApprovalsReviewer::User),
                     permission_profile: Some(preset.permission_profile.clone()),
-                    active_permission_profile: active_profile_id_for_session_mode(preset.id)
+                    active_permission_profile: active_profile_id_for_session_mode(mode_id)
                         .map(ActivePermissionProfile::new),
                     ..Default::default()
                 },
@@ -3390,8 +3524,9 @@ impl<A: Auth> ThreadActor<A> {
             .permissions
             .set_permission_profile(preset.permission_profile.clone())
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        self.config.approvals_reviewer = ApprovalsReviewer::User;
 
-        if mode_trusts_project(preset.id) {
+        if mode_trusts_project(mode_id) {
             set_project_trust_level(
                 &self.config.codex_home,
                 &self.config.cwd,
@@ -4395,6 +4530,229 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_fast_on() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/fast on".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Fast mode on\n"
+        ));
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.as_slice(),
+            [Op::ThreadSettings { thread_settings }]
+                if thread_settings.service_tier == Some(Some(SPEED_TIER_FAST.to_string()))
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fast_off() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/fast off".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Fast mode off\n"
+        ));
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.as_slice(),
+            [Op::ThreadSettings { thread_settings }]
+                if thread_settings.service_tier
+                    == Some(Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()))
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fast_toggle() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+
+        for prompt in ["/fast", "/fast"] {
+            let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+            message_tx.send(ThreadMessage::Prompt {
+                request: PromptRequest::new(session_id.clone(), vec![prompt.into()]),
+                response_tx: prompt_response_tx,
+            })?;
+            let stop_reason = prompt_response_rx.await??.await??;
+            assert_eq!(stop_reason, StopReason::EndTurn);
+        }
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 2);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Fast mode on\n"
+        ));
+        assert!(matches!(
+            &notifications[1].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Fast mode off\n"
+        ));
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.as_slice(),
+            [
+                Op::ThreadSettings {
+                    thread_settings: first,
+                },
+                Op::ThreadSettings {
+                    thread_settings: second,
+                },
+            ] if first.service_tier == Some(Some(SPEED_TIER_FAST.to_string()))
+                && second.service_tier
+                    == Some(Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()))
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fast_on_rejects_unsupported_model() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, _handle) =
+            setup_with_models_manager(StubModelsManager::without_fast()).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/fast on".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        assert!(prompt_response_rx.await?.is_err());
+        drop(message_tx);
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(ops.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fast_rejects_when_feature_disabled() -> anyhow::Result<()> {
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config.features.disable(Feature::FastMode)?;
+        let (session_id, _client, thread, message_tx, _handle) =
+            setup_with_models_manager_and_config(StubModelsManager::fast(), config).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/fast on".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        assert!(prompt_response_rx.await?.is_err());
+        drop(message_tx);
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(ops.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn available_commands_exclude_fast_when_feature_disabled() -> anyhow::Result<()> {
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config.features.disable(Feature::FastMode)?;
+        let (_session_id, client, _thread, message_tx, _handle) =
+            setup_with_models_manager_and_config(StubModelsManager::fast(), config).await?;
+        let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Load {
+            response_tx: load_response_tx,
+        })?;
+        load_response_rx.await??;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::AvailableCommandsUpdate(update)
+                    if update
+                        .available_commands
+                        .iter()
+                        .all(|command| command.name != "fast")
+            )
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn config_options_exclude_fast_mode_selector() -> anyhow::Result<()> {
+        let (_session_id, _client, _thread, message_tx, _handle) = setup().await?;
+        let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Load {
+            response_tx: load_response_tx,
+        })?;
+
+        let response = load_response_rx.await??;
+        drop(message_tx);
+
+        let config_options = response
+            .config_options
+            .expect("config options should be available");
+        assert!(
+            config_options
+                .iter()
+                .all(|option| option.id.0.as_ref() != "fast_mode")
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn test_guardian_execve_summary_uses_argv_without_duplication() -> anyhow::Result<()> {
         let action = GuardianAssessmentAction::Execve {
@@ -4475,6 +4833,57 @@ mod tests {
 
         let mode_id = current_session_mode_id(&config).expect("mode should be recognized");
         assert_eq!(mode_id.0.as_ref(), "auto");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn modes_include_approval_presets() -> anyhow::Result<()> {
+        let (_session_id, _client, _thread, message_tx, _handle) = setup().await?;
+        let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Load {
+            response_tx: load_response_tx,
+        })?;
+
+        let response = load_response_rx.await??;
+        drop(message_tx);
+
+        let modes = response.modes.expect("modes should be available");
+        let mode_ids = modes
+            .available_modes
+            .iter()
+            .map(|mode| mode.id.0.as_ref())
+            .collect::<Vec<_>>();
+        assert!(mode_ids.contains(&CODEX_DEFAULT_MODE_ID));
+        assert!(!mode_ids.contains(&"auto-review"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_mode_clears_auto_review_reviewer() -> anyhow::Result<()> {
+        let (_session_id, _client, thread, message_tx, _handle) = setup().await?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::SetMode {
+            mode: SessionModeId::new(CODEX_DEFAULT_MODE_ID),
+            response_tx,
+        })?;
+
+        response_rx.await??;
+        drop(message_tx);
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.as_slice(),
+            [Op::ThreadSettings { thread_settings }]
+                if thread_settings.approvals_reviewer == Some(ApprovalsReviewer::User)
+                && thread_settings
+                    .active_permission_profile
+                    .as_ref()
+                    .is_some_and(|profile| profile.id == CODEX_WORKSPACE_PROFILE_ID)
+        ));
 
         Ok(())
     }
@@ -4755,17 +5164,42 @@ mod tests {
         UnboundedSender<ThreadMessage>,
         tokio::task::JoinHandle<()>,
     )> {
-        let session_id = SessionId::new("test");
-        let client = Arc::new(StubClient::new());
-        let session_client =
-            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
-        let conversation = Arc::new(StubCodexThread::new());
-        let models_manager = Arc::new(StubModelsManager);
+        setup_with_models_manager(StubModelsManager::fast()).await
+    }
+
+    async fn setup_with_models_manager(
+        models_manager: StubModelsManager,
+    ) -> anyhow::Result<(
+        SessionId,
+        Arc<StubClient>,
+        Arc<StubCodexThread>,
+        UnboundedSender<ThreadMessage>,
+        tokio::task::JoinHandle<()>,
+    )> {
         let config = Config::load_with_cli_overrides_and_harness_overrides(
             vec![],
             ConfigOverrides::default(),
         )
         .await?;
+        setup_with_models_manager_and_config(models_manager, config).await
+    }
+
+    async fn setup_with_models_manager_and_config(
+        models_manager: StubModelsManager,
+        config: Config,
+    ) -> anyhow::Result<(
+        SessionId,
+        Arc<StubClient>,
+        Arc<StubCodexThread>,
+        UnboundedSender<ThreadMessage>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+        let conversation = Arc::new(StubCodexThread::new());
+        let models_manager = Arc::new(models_manager);
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -4792,18 +5226,46 @@ mod tests {
         }
     }
 
-    struct StubModelsManager;
+    struct StubModelsManager {
+        models: Vec<ModelPreset>,
+    }
+
+    impl StubModelsManager {
+        fn fast() -> Self {
+            let mut models = all_model_presets().to_owned();
+            if let Some(model) = models.first_mut() {
+                model.service_tiers = vec![codex_protocol::openai_models::ModelServiceTier {
+                    id: SPEED_TIER_FAST.to_string(),
+                    name: SPEED_TIER_FAST.to_string(),
+                    description: "Use Fast mode".to_string(),
+                }];
+                model.additional_speed_tiers.clear();
+            }
+            Self { models }
+        }
+
+        fn without_fast() -> Self {
+            let mut models = Self::fast().models;
+            if let Some(model) = models.first_mut() {
+                model.service_tiers.clear();
+                model.additional_speed_tiers.clear();
+            }
+            Self { models }
+        }
+    }
 
     impl ModelsManagerImpl for StubModelsManager {
         fn get_model(
             &self,
             _model_id: &Option<String>,
         ) -> Pin<Box<dyn Future<Output = String> + Send + '_>> {
-            Box::pin(async { all_model_presets()[0].to_owned().id })
+            let model = self.models[0].model.clone();
+            Box::pin(async move { model })
         }
 
         fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
-            Box::pin(async { all_model_presets().to_owned() })
+            let models = self.models.clone();
+            Box::pin(async move { models })
         }
     }
 
@@ -5134,6 +5596,7 @@ mod tests {
                     | Op::ResolveElicitation { .. }
                     | Op::RequestPermissionsResponse { .. }
                     | Op::PatchApproval { .. }
+                    | Op::ThreadSettings { .. }
                     | Op::Interrupt => {}
                     Op::Shutdown => {
                         if let Some(active_prompt_id) = self.active_prompt_id.lock().unwrap().take()
@@ -5742,7 +6205,7 @@ mod tests {
         let session_client =
             SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
         let conversation = Arc::new(StubCodexThread::new());
-        let models_manager = Arc::new(StubModelsManager);
+        let models_manager = Arc::new(StubModelsManager::fast());
         let config = Config::load_with_cli_overrides_and_harness_overrides(
             vec![],
             ConfigOverrides::default(),
