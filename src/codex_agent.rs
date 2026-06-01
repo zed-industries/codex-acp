@@ -443,7 +443,14 @@ impl CodexAgent {
             .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
             .mcp_capabilities(McpCapabilities::new().http(true))
             .load_session(true)
-            .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()));
+            .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()))
+            // Non-standard hint that this agent supports TRUE mid-turn steering:
+            // a `session/prompt` sent while a turn is in flight is injected into
+            // the running turn (dissolved) rather than queued as a new turn.
+            .meta(acp::schema::Meta::from_iter([(
+                "midTurnSteering".to_string(),
+                serde_json::Value::Bool(true),
+            )]));
 
         agent_capabilities.session_capabilities = SessionCapabilities::new()
             .close(SessionCloseCapabilities::new())

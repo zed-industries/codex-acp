@@ -809,6 +809,14 @@ impl SubmissionState {
         }
     }
 
+    /// Attach an additional ACP responder that dissolves into this in-flight
+    /// turn (mid-turn steering). Resolves with the running turn's `StopReason`.
+    fn attach_steer(&mut self, response_tx: oneshot::Sender<Result<StopReason, Error>>) {
+        match self {
+            Self::Prompt(state) => state.attach_steer(response_tx),
+        }
+    }
+
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         match self {
             Self::Prompt(state) => state.handle_event(client, event).await,
@@ -845,11 +853,8 @@ impl SubmissionState {
     }
 
     fn fail(&mut self, err: Error) {
-        if let Self::Prompt(state) = self
-            && let Some(response_tx) = state.response_tx.take()
-        {
-            drop(response_tx.send(Err(err)));
-        }
+        let Self::Prompt(state) = self;
+        state.resolve(Err(err));
     }
 }
 
@@ -872,6 +877,11 @@ struct PromptState {
     next_permission_interaction_id: u64,
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
+    /// Additional ACP responders that have "dissolved" into this running turn via
+    /// mid-turn steering. When a `session/prompt` arrives while this turn is still
+    /// in flight, its input is injected into the running turn (core's `steer_input`)
+    /// and its `prompt().await` resolves with the shared turn's terminal `StopReason`.
+    steer_response_txs: Vec<oneshot::Sender<Result<StopReason, Error>>>,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
 }
@@ -895,6 +905,7 @@ impl PromptState {
             next_permission_interaction_id: 0,
             event_count: 0,
             response_tx: Some(response_tx),
+            steer_response_txs: Vec::new(),
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
         }
@@ -905,6 +916,34 @@ impl PromptState {
             return false;
         };
         !response_tx.is_closed()
+    }
+
+    /// Attach an additional ACP responder that will resolve with this turn's
+    /// terminal `StopReason`. Used by mid-turn steering ("dissolve into the
+    /// current turn"): the steered prompt does not start its own turn.
+    fn attach_steer(&mut self, response_tx: oneshot::Sender<Result<StopReason, Error>>) {
+        self.steer_response_txs.push(response_tx);
+    }
+
+    /// Resolve this turn: send `result` to the primary responder and every
+    /// steered responder that dissolved into it. Idempotent — once the primary
+    /// `response_tx` has been taken, subsequent calls are no-ops, so terminal
+    /// events cannot double-resolve.
+    fn resolve(&mut self, result: Result<StopReason, Error>) {
+        let Some(response_tx) = self.response_tx.take() else {
+            return;
+        };
+        for steer_tx in self.steer_response_txs.drain(..) {
+            // `Error` is not `Clone`, so steered responders receive a faithful copy
+            // of a successful `StopReason` and a synthesized error for the failure
+            // case (the authoritative error is delivered to the primary responder).
+            let steer_result = match &result {
+                Ok(stop_reason) => Ok(stop_reason.clone()),
+                Err(_) => Err(Error::internal_error().data("steered turn failed")),
+            };
+            drop(steer_tx.send(steer_result));
+        }
+        drop(response_tx.send(result));
     }
 
     fn detach_pending_interactions(&mut self) {
@@ -1254,10 +1293,8 @@ impl PromptState {
                     "Command execution started: call_id={}, command={:?}",
                     event.call_id, event.command
                 );
-                if let Err(err) = self.exec_approval(client, event)
-                    && let Some(response_tx) = self.response_tx.take()
-                {
-                    drop(response_tx.send(Err(err)));
+                if let Err(err) = self.exec_approval(client, event) {
+                    self.resolve(Err(err));
                 }
             }
             EventMsg::ExecCommandBegin(event) => {
@@ -1326,10 +1363,8 @@ impl PromptState {
                     "Apply patch approval request: call_id={}, reason={:?}",
                     event.call_id, event.reason
                 );
-                if let Err(err) = self.patch_approval(client, event)
-                    && let Some(response_tx) = self.response_tx.take()
-                {
-                    drop(response_tx.send(Err(err)));
+                if let Err(err) = self.patch_approval(client, event) {
+                    self.resolve(Err(err));
                 }
             }
             EventMsg::PatchApplyBegin(event) => {
@@ -1368,9 +1403,7 @@ impl PromptState {
                     self.event_count
                 );
                 self.detach_pending_interactions();
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::EndTurn)).ok();
-                }
+                self.resolve(Ok(StopReason::EndTurn));
             }
             EventMsg::StreamError(StreamErrorEvent {
                 message,
@@ -1387,27 +1420,19 @@ impl PromptState {
             }) => {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
                 self.detach_pending_interactions();
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx
-                        .send(Err(Error::internal_error().data(
-                            json!({ "message": message, "codex_error_info": codex_error_info }),
-                        )))
-                        .ok();
-                }
+                self.resolve(Err(Error::internal_error().data(
+                    json!({ "message": message, "codex_error_info": codex_error_info }),
+                )));
             }
             EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _ }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
                 self.detach_pending_interactions();
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::Cancelled)).ok();
-                }
+                self.resolve(Ok(StopReason::Cancelled));
             }
             EventMsg::ShutdownComplete => {
                 info!("Agent shutting down");
                 self.detach_pending_interactions();
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::Cancelled)).ok();
-                }
+                self.resolve(Ok(StopReason::Cancelled));
             }
             EventMsg::ViewImageToolCall(ViewImageToolCallEvent { call_id, path }) => {
                 info!("ViewImageToolCallEvent received");
@@ -1426,10 +1451,8 @@ impl PromptState {
             }
             EventMsg::ExitedReviewMode(event) => {
                 info!("Review end: output={event:?}");
-                if let Err(err) = self.review_mode_exit(client, event)
-                    && let Some(response_tx) = self.response_tx.take()
-                {
-                    drop(response_tx.send(Err(err)));
+                if let Err(err) = self.review_mode_exit(client, event) {
+                    self.resolve(Err(err));
                 }
             }
             EventMsg::Warning(WarningEvent { message })
@@ -1453,10 +1476,8 @@ impl PromptState {
             }
             EventMsg::ElicitationRequest(event) => {
                 info!("Elicitation request: server={}, id={:?}", event.server_name, event.id);
-                if let Err(err) = self.mcp_elicitation(client, event).await
-                    && let Some(response_tx) = self.response_tx.take()
-                {
-                    drop(response_tx.send(Err(err)));
+                if let Err(err) = self.mcp_elicitation(client, event).await {
+                    self.resolve(Err(err));
                 }
             }
             EventMsg::ModelReroute(ModelRerouteEvent { from_model, to_model, reason }) => {
@@ -1472,10 +1493,8 @@ impl PromptState {
             }
             EventMsg::RequestPermissions(event) => {
                 info!("Request permissions: {} {}", event.call_id, event.turn_id);
-                if let Err(err) = self.request_permissions(client, event)
-                    && let Some(response_tx) = self.response_tx.take()
-                {
-                    drop(response_tx.send(Err(err)));
+                if let Err(err) = self.request_permissions(client, event) {
+                    self.resolve(Err(err));
                 }
             }
             EventMsg::GuardianAssessment(event) => {
@@ -3262,10 +3281,20 @@ impl<A: Auth> ThreadActor<A> {
 
         let items = build_prompt_items(request.prompt);
         let op;
+        // Whether this prompt is a recognized slash command that starts or
+        // replaces a turn (e.g. /compact, /init, /review). Such commands are
+        // never steered mid-turn — injecting them into a running turn's pending
+        // input would mis-fire, so they fall through to the default path and let
+        // codex-core serialize them. Plain text (and unrecognized "/foo") steers.
+        let mut is_turn_command = false;
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
-                "compact" => op = Op::Compact,
+                "compact" => {
+                    op = Op::Compact;
+                    is_turn_command = true;
+                }
                 "init" => {
+                    is_turn_command = true;
                     op = Op::UserInput {
                         items: vec![UserInput::Text {
                             text: INIT_COMMAND_PROMPT.into(),
@@ -3292,7 +3321,8 @@ impl<A: Auth> ThreadActor<A> {
                             user_facing_hint: Some(user_facing_hint(&target)),
                             target,
                         },
-                    }
+                    };
+                    is_turn_command = true;
                 }
                 "review-branch" if !rest.is_empty() => {
                     let target = ReviewTarget::BaseBranch {
@@ -3303,7 +3333,8 @@ impl<A: Auth> ThreadActor<A> {
                             user_facing_hint: Some(user_facing_hint(&target)),
                             target,
                         },
-                    }
+                    };
+                    is_turn_command = true;
                 }
                 "review-commit" if !rest.is_empty() => {
                     let target = ReviewTarget::Commit {
@@ -3315,7 +3346,8 @@ impl<A: Auth> ThreadActor<A> {
                             user_facing_hint: Some(user_facing_hint(&target)),
                             target,
                         },
-                    }
+                    };
+                    is_turn_command = true;
                 }
                 "logout" => {
                     self.auth.logout().await?;
@@ -3339,6 +3371,40 @@ impl<A: Auth> ThreadActor<A> {
                 responsesapi_client_metadata: None,
                 thread_settings: Default::default(),
             }
+        }
+
+        // TRUE mid-turn steering ("dissolve into current turn"): if a prompt turn
+        // is already in flight and this is plain user input (not a turn-starting
+        // slash command), submit it as `Op::UserInput` so codex-core's
+        // `submission_loop` routes it to `Session::steer_input()` and injects it
+        // into the running turn's pending input. We do NOT register an independent
+        // turn for it; instead its ACP response is attached to the live turn's
+        // submission and resolves with that shared turn's terminal `StopReason`.
+        if !is_turn_command
+            && self
+                .submissions
+                .values()
+                .any(|submission| submission.is_active())
+        {
+            let submission_id = self
+                .thread
+                .submit(op)
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))?;
+            info!(
+                "Steered into in-flight turn; steer submission_id: {submission_id} (response dissolves into running turn)"
+            );
+            // Attach to the live turn so the steered prompt resolves with the
+            // shared turn's terminal StopReason. The `is_active()` check above
+            // guarantees such a submission exists.
+            if let Some(active) = self
+                .submissions
+                .values_mut()
+                .find(|submission| submission.is_active())
+            {
+                active.attach_steer(response_tx);
+            }
+            return Ok(response_rx);
         }
 
         let submission_id = self
