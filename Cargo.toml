@@ -27,11 +27,13 @@ codex-config = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" 
 codex-core = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
 codex-exec-server = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
 codex-extension-api = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
+codex-features = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
 codex-mcp-server = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
 codex-models-manager = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
 codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
 codex-login = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
 codex-shell-command = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
+codex-state = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
 codex-utils-approval-presets = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
 codex-utils-cli = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
 # Pin allocative to 0.3.4 because starlark_map 0.13.0 exposes hashbrown 0.14

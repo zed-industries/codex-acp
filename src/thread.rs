@@ -26,11 +26,12 @@ use agent_client_protocol::{
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
-    CodexThread,
+    CodexThread, ExternalGoalPreviousStatus, ExternalGoalSet,
     config::{Config, set_project_trust_level},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
+use codex_features::Feature;
 use codex_login::auth::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_protocol::{
@@ -68,7 +69,7 @@ use codex_protocol::{
         TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
         ThreadSettingsOverrides, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
         TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
-        WebSearchBeginEvent, WebSearchEndEvent,
+        WebSearchBeginEvent, WebSearchEndEvent, validate_thread_goal_objective,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -214,6 +215,10 @@ pub trait CodexThreadImpl: Send + Sync {
     fn submit(&self, op: Op)
     -> Pin<Box<dyn Future<Output = Result<String, CodexErr>> + Send + '_>>;
     fn next_event(&self) -> Pin<Box<dyn Future<Output = Result<Event, CodexErr>> + Send + '_>>;
+    fn set_thread_goal_objective(
+        &self,
+        objective: String,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<ThreadGoalUpdatedEvent>> + Send + '_>>;
 }
 
 impl CodexThreadImpl for CodexThread {
@@ -226,6 +231,83 @@ impl CodexThreadImpl for CodexThread {
 
     fn next_event(&self) -> Pin<Box<dyn Future<Output = Result<Event, CodexErr>> + Send + '_>> {
         Box::pin(self.next_event())
+    }
+
+    fn set_thread_goal_objective(
+        &self,
+        objective: String,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<ThreadGoalUpdatedEvent>> + Send + '_>> {
+        Box::pin(async move {
+            let config = self.config().await;
+            if !config.features.enabled(Feature::Goals) {
+                anyhow::bail!("goals feature is disabled");
+            }
+
+            let objective = objective.trim().to_string();
+            validate_thread_goal_objective(objective.as_str()).map_err(anyhow::Error::msg)?;
+
+            let thread_id = self.session_configured().thread_id;
+            let state_db = self
+                .state_db()
+                .ok_or_else(|| anyhow::anyhow!("ephemeral thread does not support goals"))?;
+
+            self.prepare_external_goal_mutation().await;
+
+            let existing_goal = state_db.thread_goals().get_thread_goal(thread_id).await?;
+            let (goal, previous_status) = if let Some(existing_goal) = existing_goal.as_ref() {
+                let previous_status = ExternalGoalPreviousStatus::from(existing_goal);
+                let goal = state_db
+                    .thread_goals()
+                    .update_thread_goal(
+                        thread_id,
+                        codex_state::GoalUpdate {
+                            objective: Some(objective),
+                            status: Some(codex_state::ThreadGoalStatus::Active),
+                            token_budget: None,
+                            expected_goal_id: Some(existing_goal.goal_id.clone()),
+                        },
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("cannot update goal for thread {thread_id}: no goal exists")
+                    })?;
+                (goal, previous_status)
+            } else {
+                let previous_status = ExternalGoalPreviousStatus::NewGoal;
+                let goal = state_db
+                    .thread_goals()
+                    .replace_thread_goal(
+                        thread_id,
+                        objective.as_str(),
+                        codex_state::ThreadGoalStatus::Active,
+                        None,
+                    )
+                    .await?;
+                (goal, previous_status)
+            };
+
+            if let Err(err) = state_db
+                .set_thread_preview_if_empty(thread_id, goal.objective.as_str())
+                .await
+            {
+                warn!(
+                    "failed to set empty thread preview from goal objective for {thread_id}: {err}"
+                );
+            }
+
+            let event = ThreadGoalUpdatedEvent {
+                thread_id,
+                turn_id: None,
+                goal: thread_goal_from_state(goal.clone()),
+            };
+            self.apply_external_goal_set(ExternalGoalSet {
+                goal,
+                previous_status,
+            })
+            .await;
+
+            Ok(event)
+        })
     }
 }
 
@@ -794,6 +876,30 @@ fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> String {
         format!("Goal updated ({status}):\n{objective}")
     } else {
         format!("Goal updated ({status}): {objective}")
+    }
+}
+
+fn thread_goal_status_from_state(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus {
+    match status {
+        codex_state::ThreadGoalStatus::Active => ThreadGoalStatus::Active,
+        codex_state::ThreadGoalStatus::Paused => ThreadGoalStatus::Paused,
+        codex_state::ThreadGoalStatus::Blocked => ThreadGoalStatus::Blocked,
+        codex_state::ThreadGoalStatus::UsageLimited => ThreadGoalStatus::UsageLimited,
+        codex_state::ThreadGoalStatus::BudgetLimited => ThreadGoalStatus::BudgetLimited,
+        codex_state::ThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
+    }
+}
+
+fn thread_goal_from_state(goal: codex_state::ThreadGoal) -> codex_protocol::protocol::ThreadGoal {
+    codex_protocol::protocol::ThreadGoal {
+        thread_id: goal.thread_id,
+        objective: goal.objective,
+        status: thread_goal_status_from_state(goal.status),
+        token_budget: goal.token_budget,
+        tokens_used: goal.tokens_used,
+        time_used_seconds: goal.time_used_seconds,
+        created_at: goal.created_at.timestamp_millis(),
+        updated_at: goal.updated_at.timestamp_millis(),
     }
 }
 
@@ -2948,6 +3054,11 @@ impl<A: Auth> ThreadActor<A> {
                 "compact",
                 "summarize conversation to prevent hitting the context limit",
             ),
+            AvailableCommand::new("goal", "Set the thread goal").input(
+                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                    "goal objective",
+                )),
+            ),
             AvailableCommand::new("logout", "logout of Codex"),
         ]
     }
@@ -3316,6 +3427,21 @@ impl<A: Auth> ThreadActor<A> {
                             target,
                         },
                     }
+                }
+                "goal" => {
+                    let objective = rest.trim();
+                    if objective.is_empty() {
+                        return Err(Error::invalid_params().data("Usage: /goal <objective>"));
+                    }
+                    let event = self
+                        .thread
+                        .set_thread_goal_objective(objective.to_owned())
+                        .await
+                        .map_err(|e| Error::invalid_params().data(e.to_string()))?;
+                    self.client
+                        .send_agent_text(format_thread_goal_update(&event));
+                    drop(response_tx.send(Ok(StopReason::EndTurn)));
+                    return Ok(response_rx);
                 }
                 "logout" => {
                     self.auth.logout().await?;
@@ -4290,6 +4416,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_goal_slash_command_sets_thread_goal() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/goal Ship ACP support".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        assert_eq!(
+            thread.goal_objectives.lock().unwrap().as_slice(),
+            &["Ship ACP support"]
+        );
+        assert!(thread.ops.lock().unwrap().is_empty());
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Goal updated (active): Ship ACP support"
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_image_generation_emits_image_content() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -4810,6 +4969,7 @@ mod tests {
     struct StubCodexThread {
         current_id: AtomicUsize,
         active_prompt_id: std::sync::Mutex<Option<String>>,
+        goal_objectives: std::sync::Mutex<Vec<String>>,
         ops: std::sync::Mutex<Vec<Op>>,
         op_tx: mpsc::UnboundedSender<Event>,
         op_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
@@ -4821,6 +4981,7 @@ mod tests {
             StubCodexThread {
                 current_id: AtomicUsize::new(0),
                 active_prompt_id: std::sync::Mutex::default(),
+                goal_objectives: std::sync::Mutex::default(),
                 ops: std::sync::Mutex::default(),
                 op_tx,
                 op_rx: Mutex::new(op_rx),
@@ -5166,6 +5327,32 @@ mod tests {
                     return Err(CodexErr::InternalAgentDied);
                 };
                 Ok(event)
+            })
+        }
+
+        fn set_thread_goal_objective(
+            &self,
+            objective: String,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<ThreadGoalUpdatedEvent>> + Send + '_>>
+        {
+            Box::pin(async move {
+                let objective = objective.trim().to_string();
+                self.goal_objectives.lock().unwrap().push(objective.clone());
+
+                Ok(ThreadGoalUpdatedEvent {
+                    thread_id: ThreadId::default(),
+                    turn_id: None,
+                    goal: ThreadGoal {
+                        thread_id: ThreadId::default(),
+                        objective,
+                        status: ThreadGoalStatus::Active,
+                        token_budget: None,
+                        tokens_used: 0,
+                        time_used_seconds: 0,
+                        created_at: 0,
+                        updated_at: 0,
+                    },
+                })
             })
         }
     }
