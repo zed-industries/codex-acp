@@ -39,6 +39,7 @@ codex-utils-cli = { git = "https://github.com/openai/codex", tag = "rust-v0.133.
 # Pin allocative to 0.3.4 because starlark_map 0.13.0 exposes hashbrown 0.14
 # internals that need allocative's matching hashbrown implementation.
 allocative = "=0.3.4"
+chrono = "0.4"
 diffy = { version = "0.5.0", features = ["std"] }
 itertools = "0.14.0"
 serde = { version = "1", features = ["derive"] }

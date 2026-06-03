@@ -218,7 +218,12 @@ pub trait CodexThreadImpl: Send + Sync {
     fn set_thread_goal_objective(
         &self,
         objective: String,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<ThreadGoalUpdatedEvent>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<SetThreadGoalObjectiveResult>> + Send + '_>>;
+}
+
+pub struct SetThreadGoalObjectiveResult {
+    event: ThreadGoalUpdatedEvent,
+    transient: bool,
 }
 
 impl CodexThreadImpl for CodexThread {
@@ -236,7 +241,8 @@ impl CodexThreadImpl for CodexThread {
     fn set_thread_goal_objective(
         &self,
         objective: String,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<ThreadGoalUpdatedEvent>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<SetThreadGoalObjectiveResult>> + Send + '_>>
+    {
         Box::pin(async move {
             let config = self.config().await;
             if !config.features.enabled(Feature::Goals) {
@@ -247,11 +253,38 @@ impl CodexThreadImpl for CodexThread {
             validate_thread_goal_objective(objective.as_str()).map_err(anyhow::Error::msg)?;
 
             let thread_id = self.session_configured().thread_id;
-            let state_db = self
-                .state_db()
-                .ok_or_else(|| anyhow::anyhow!("ephemeral thread does not support goals"))?;
 
             self.prepare_external_goal_mutation().await;
+
+            let Some(state_db) = self.state_db() else {
+                let now = chrono::Utc::now();
+                let goal = codex_state::ThreadGoal {
+                    thread_id,
+                    goal_id: format!("transient-{}", Uuid::new_v4()),
+                    objective,
+                    status: codex_state::ThreadGoalStatus::Active,
+                    token_budget: None,
+                    tokens_used: 0,
+                    time_used_seconds: 0,
+                    created_at: now,
+                    updated_at: now,
+                };
+                let event = ThreadGoalUpdatedEvent {
+                    thread_id,
+                    turn_id: None,
+                    goal: thread_goal_from_state(goal.clone()),
+                };
+                self.apply_external_goal_set(ExternalGoalSet {
+                    goal,
+                    previous_status: ExternalGoalPreviousStatus::NewGoal,
+                })
+                .await;
+
+                return Ok(SetThreadGoalObjectiveResult {
+                    event,
+                    transient: true,
+                });
+            };
 
             let existing_goal = state_db.thread_goals().get_thread_goal(thread_id).await?;
             let (goal, previous_status) = if let Some(existing_goal) = existing_goal.as_ref() {
@@ -306,7 +339,10 @@ impl CodexThreadImpl for CodexThread {
             })
             .await;
 
-            Ok(event)
+            Ok(SetThreadGoalObjectiveResult {
+                event,
+                transient: false,
+            })
         })
     }
 }
@@ -2879,6 +2915,8 @@ struct ThreadActor<A> {
     resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     /// Last config options state we emitted to the client, used for deduping updates.
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
+    /// Goal objective for ephemeral ACP sessions that cannot persist goals in Codex state.
+    transient_goal_objective: Option<String>,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -2904,7 +2942,27 @@ impl<A: Auth> ThreadActor<A> {
             message_rx,
             resolution_rx,
             last_sent_config_options: None,
+            transient_goal_objective: None,
         }
+    }
+
+    fn user_input_with_transient_goal_context(&self, items: Vec<UserInput>) -> Vec<UserInput> {
+        let Some(objective) = self
+            .transient_goal_objective
+            .as_deref()
+            .map(str::trim)
+            .filter(|objective| !objective.is_empty())
+        else {
+            return items;
+        };
+
+        let mut contextual_items = Vec::with_capacity(items.len() + 1);
+        contextual_items.push(UserInput::Text {
+            text: format!("Current thread goal:\n{objective}"),
+            text_elements: vec![],
+        });
+        contextual_items.extend(items);
+        contextual_items
     }
 
     async fn spawn(mut self) {
@@ -3433,11 +3491,14 @@ impl<A: Auth> ThreadActor<A> {
                     if objective.is_empty() {
                         return Err(Error::invalid_params().data("Usage: /goal <objective>"));
                     }
-                    let event = self
+                    let result = self
                         .thread
                         .set_thread_goal_objective(objective.to_owned())
                         .await
                         .map_err(|e| Error::invalid_params().data(e.to_string()))?;
+                    let event = result.event;
+                    self.transient_goal_objective =
+                        result.transient.then(|| event.goal.objective.clone());
                     self.client
                         .send_agent_text(format_thread_goal_update(&event));
                     drop(response_tx.send(Ok(StopReason::EndTurn)));
@@ -3449,7 +3510,7 @@ impl<A: Auth> ThreadActor<A> {
                 }
                 _ => {
                     op = Op::UserInput {
-                        items,
+                        items: self.user_input_with_transient_goal_context(items),
                         final_output_json_schema: None,
                         environments: None,
                         responsesapi_client_metadata: None,
@@ -3459,7 +3520,7 @@ impl<A: Auth> ThreadActor<A> {
             }
         } else {
             op = Op::UserInput {
-                items,
+                items: self.user_input_with_transient_goal_context(items),
                 final_output_json_schema: None,
                 environments: None,
                 responsesapi_client_metadata: None,
@@ -4449,6 +4510,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_transient_goal_context_is_sent_with_next_prompt() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, _handle) = setup().await?;
+        let (goal_response_tx, goal_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/goal ephemeral".into()]),
+            response_tx: goal_response_tx,
+        })?;
+
+        let stop_reason = goal_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["Next task".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(ops.len(), 1);
+        let Op::UserInput { items, .. } = &ops[0] else {
+            panic!("expected user input op");
+        };
+        let texts = items
+            .iter()
+            .map(|item| match item {
+                UserInput::Text { text, .. } => text.as_str(),
+                _ => panic!("expected text input"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["Current thread goal:\nephemeral", "Next task"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_image_generation_emits_image_content() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -5333,25 +5434,29 @@ mod tests {
         fn set_thread_goal_objective(
             &self,
             objective: String,
-        ) -> Pin<Box<dyn Future<Output = anyhow::Result<ThreadGoalUpdatedEvent>> + Send + '_>>
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<SetThreadGoalObjectiveResult>> + Send + '_>>
         {
             Box::pin(async move {
                 let objective = objective.trim().to_string();
                 self.goal_objectives.lock().unwrap().push(objective.clone());
+                let transient = objective == "ephemeral";
 
-                Ok(ThreadGoalUpdatedEvent {
-                    thread_id: ThreadId::default(),
-                    turn_id: None,
-                    goal: ThreadGoal {
+                Ok(SetThreadGoalObjectiveResult {
+                    event: ThreadGoalUpdatedEvent {
                         thread_id: ThreadId::default(),
-                        objective,
-                        status: ThreadGoalStatus::Active,
-                        token_budget: None,
-                        tokens_used: 0,
-                        time_used_seconds: 0,
-                        created_at: 0,
-                        updated_at: 0,
+                        turn_id: None,
+                        goal: ThreadGoal {
+                            thread_id: ThreadId::default(),
+                            objective,
+                            status: ThreadGoalStatus::Active,
+                            token_budget: None,
+                            tokens_used: 0,
+                            time_used_seconds: 0,
+                            created_at: 0,
+                            updated_at: 0,
+                        },
                     },
+                    transient,
                 })
             })
         }
