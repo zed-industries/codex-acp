@@ -6,9 +6,10 @@ use acp::schema::{
     LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
     McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
     NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
-    SessionCapabilities, SessionCloseCapabilities, SessionId, SessionInfo, SessionListCapabilities,
+    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
+    SessionId, SessionInfo, SessionListCapabilities, SessionResumeCapabilities,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
+    SetSessionModeResponse,
 };
 use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
@@ -190,6 +191,24 @@ impl CodexAgent {
             .on_receive_request(
                 {
                     let agent = agent.clone();
+                    async move |request: ResumeSessionRequest,
+                                responder,
+                                cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        let session_cx = cx.clone();
+                        cx.spawn(async move {
+                            responder.respond_with_result(
+                                agent.resume_session(request, session_cx).await,
+                            )
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
                     async move |request: ListSessionsRequest,
                                 responder,
                                 cx: ConnectionTo<Client>| {
@@ -255,21 +274,6 @@ impl CodexAgent {
                         let agent = agent.clone();
                         cx.spawn(async move {
                             responder.respond_with_result(agent.set_session_mode(request).await)
-                        })?;
-                        Ok(())
-                    }
-                },
-                acp::on_receive_request!(),
-            )
-            .on_receive_request(
-                {
-                    let agent = agent.clone();
-                    async move |request: SetSessionModelRequest,
-                                responder,
-                                cx: ConnectionTo<Client>| {
-                        let agent = agent.clone();
-                        cx.spawn(async move {
-                            responder.respond_with_result(agent.set_session_model(request).await)
                         })?;
                         Ok(())
                     }
@@ -447,7 +451,8 @@ impl CodexAgent {
 
         agent_capabilities.session_capabilities = SessionCapabilities::new()
             .close(SessionCloseCapabilities::new())
-            .list(SessionListCapabilities::new());
+            .list(SessionListCapabilities::new())
+            .resume(SessionResumeCapabilities::new());
 
         let mut auth_methods = vec![
             CodexAuthMethod::ChatGpt.into(),
@@ -590,7 +595,6 @@ impl CodexAgent {
 
         Ok(NewSessionResponse::new(session_id)
             .modes(load.modes)
-            .models(load.models)
             .config_options(load.config_options))
     }
 
@@ -610,6 +614,43 @@ impl CodexAgent {
             ..
         } = request;
 
+        self.restore_session(session_id, cwd, mcp_servers, cx, true)
+            .await
+    }
+
+    async fn resume_session(
+        &self,
+        request: ResumeSessionRequest,
+        cx: ConnectionTo<Client>,
+    ) -> Result<ResumeSessionResponse, Error> {
+        info!("Resuming session: {}", request.session_id);
+        // Check before sending if authentication was successful or not
+        self.check_auth().await?;
+
+        let ResumeSessionRequest {
+            session_id,
+            cwd,
+            mcp_servers,
+            ..
+        } = request;
+
+        let load = self
+            .restore_session(session_id, cwd, mcp_servers, cx, false)
+            .await?;
+
+        Ok(ResumeSessionResponse::new()
+            .modes(load.modes)
+            .config_options(load.config_options))
+    }
+
+    async fn restore_session(
+        &self,
+        session_id: SessionId,
+        cwd: PathBuf,
+        mcp_servers: Vec<McpServer>,
+        cx: ConnectionTo<Client>,
+        replay_history: bool,
+    ) -> Result<LoadSessionResponse, Error> {
         let rollout_path = find_thread_path_by_id_str(
             &self.config.codex_home,
             session_id.0.as_ref(),
@@ -619,14 +660,18 @@ impl CodexAgent {
         .map_err(|e| Error::internal_error().data(e.to_string()))?
         .ok_or_else(|| Error::resource_not_found(None))?;
 
-        let history = RolloutRecorder::get_rollout_history(&rollout_path)
-            .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+        let rollout_items = if replay_history {
+            let history = RolloutRecorder::get_rollout_history(&rollout_path)
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
-        let rollout_items = match &history {
-            InitialHistory::Resumed(resumed) => resumed.history.clone(),
-            InitialHistory::Forked(items) => items.clone(),
-            InitialHistory::Cleared | InitialHistory::New => Vec::new(),
+            match &history {
+                InitialHistory::Resumed(resumed) => resumed.history.clone(),
+                InitialHistory::Forked(items) => items.clone(),
+                InitialHistory::Cleared | InitialHistory::New => Vec::new(),
+            }
+        } else {
+            Vec::new()
         };
 
         let config = self.build_session_config(&cwd, mcp_servers)?;
@@ -654,7 +699,9 @@ impl CodexAgent {
             cx,
         ));
 
-        thread.replay_history(rollout_items).await?;
+        if replay_history {
+            thread.replay_history(rollout_items).await?;
+        }
 
         let load = thread.load().await?;
 
@@ -666,7 +713,6 @@ impl CodexAgent {
 
         Ok(LoadSessionResponse::new()
             .modes(load.modes)
-            .models(load.models)
             .config_options(load.config_options))
     }
 
@@ -781,19 +827,6 @@ impl CodexAgent {
             .set_mode(args.mode_id)
             .await?;
         Ok(SetSessionModeResponse::default())
-    }
-
-    async fn set_session_model(
-        &self,
-        args: SetSessionModelRequest,
-    ) -> Result<SetSessionModelResponse, Error> {
-        info!("Setting session model for session: {}", args.session_id);
-
-        self.get_thread(&args.session_id)?
-            .set_model(args.model_id)
-            .await?;
-
-        Ok(SetSessionModelResponse::default())
     }
 
     async fn set_session_config_option(

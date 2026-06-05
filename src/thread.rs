@@ -12,16 +12,16 @@ use agent_client_protocol::{
     schema::{
         AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ClientCapabilities,
         ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
-        EmbeddedResourceResource, ImageContent, LoadSessionResponse, Meta, ModelId, ModelInfo,
-        PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
-        PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
-        RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionConfigId,
-        SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-        SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionMode, SessionModeId,
-        SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason,
-        Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId,
-        ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-        UnstructuredCommandInput, UsageUpdate,
+        EmbeddedResourceResource, ImageContent, LoadSessionResponse, Meta, PermissionOption,
+        PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
+        RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+        ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
+        SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
+        SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
+        SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
+        TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
+        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+        UsageUpdate,
     },
 };
 use codex_apply_patch::parse_patch;
@@ -284,10 +284,6 @@ enum ThreadMessage {
         mode: SessionModeId,
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
-    SetModel {
-        model: ModelId,
-        response_tx: oneshot::Sender<Result<(), Error>>,
-    },
     SetConfigOption {
         config_id: SessionConfigId,
         value: SessionConfigOptionValue,
@@ -394,17 +390,6 @@ impl Thread {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ThreadMessage::SetMode { mode, response_tx };
-        drop(self.message_tx.send(message));
-
-        response_rx
-            .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?
-    }
-
-    pub async fn set_model(&self, model: ModelId) -> Result<(), Error> {
-        let (response_tx, response_rx) = oneshot::channel();
-
-        let message = ThreadMessage::SetModel { model, response_tx };
         drop(self.message_tx.send(message));
 
         response_rx
@@ -2862,11 +2847,6 @@ impl<A: Auth> ThreadActor<A> {
                 drop(response_tx.send(result));
                 self.maybe_emit_config_options_update().await;
             }
-            ThreadMessage::SetModel { model, response_tx } => {
-                let result = self.handle_set_model(model).await;
-                drop(response_tx.send(result));
-                self.maybe_emit_config_options_update().await;
-            }
             ThreadMessage::SetConfigOption {
                 config_id,
                 value,
@@ -2964,37 +2944,6 @@ impl<A: Auth> ThreadActor<A> {
                 })
                 .collect(),
         ))
-    }
-
-    async fn find_current_model(&self) -> Option<ModelId> {
-        let model_presets = self.models_manager.list_models().await;
-        let config_model = self.get_current_model().await;
-        let preset = model_presets
-            .iter()
-            .find(|preset| preset.model == config_model)?;
-
-        let effort = self
-            .config
-            .model_reasoning_effort
-            .and_then(|effort| {
-                preset
-                    .supported_reasoning_efforts
-                    .iter()
-                    .find_map(|e| (e.effort == effort).then_some(effort))
-            })
-            .unwrap_or(preset.default_reasoning_effort);
-
-        Some(Self::model_id(&preset.id, effort))
-    }
-
-    fn model_id(id: &str, effort: ReasoningEffort) -> ModelId {
-        ModelId::new(format!("{id}/{effort}"))
-    }
-
-    fn parse_model_id(id: &ModelId) -> Option<(String, ReasoningEffort)> {
-        let (model, reasoning) = id.0.split_once('/')?;
-        let reasoning = serde_json::from_value(reasoning.into()).ok()?;
-        Some((model.to_owned(), reasoning))
     }
 
     async fn config_options(&self) -> Result<Vec<SessionConfigOption>, Error> {
@@ -3214,42 +3163,8 @@ impl<A: Auth> ThreadActor<A> {
         Ok(())
     }
 
-    async fn models(&self) -> Result<SessionModelState, Error> {
-        let mut available_models = Vec::new();
-        let config_model = self.get_current_model().await;
-
-        let current_model_id = if let Some(model_id) = self.find_current_model().await {
-            model_id
-        } else {
-            // If no preset found, return the current model string as-is
-            let model_id = ModelId::new(self.get_current_model().await);
-            available_models.push(ModelInfo::new(model_id.clone(), model_id.to_string()));
-            model_id
-        };
-
-        available_models.extend(
-            self.models_manager
-                .list_models()
-                .await
-                .iter()
-                .filter(|model| model.show_in_picker || model.model == config_model)
-                .flat_map(|preset| {
-                    preset.supported_reasoning_efforts.iter().map(|effort| {
-                        ModelInfo::new(
-                            Self::model_id(&preset.id, effort.effort),
-                            format!("{} ({})", preset.display_name, effort.effort),
-                        )
-                        .description(format!("{} {}", preset.description, effort.description))
-                    })
-                }),
-        );
-
-        Ok(SessionModelState::new(current_model_id, available_models))
-    }
-
     async fn handle_load(&mut self) -> Result<LoadSessionResponse, Error> {
         Ok(LoadSessionResponse::new()
-            .models(self.models().await?)
             .modes(self.modes())
             .config_options(self.config_options().await?))
     }
@@ -3404,41 +3319,6 @@ impl<A: Auth> ThreadActor<A> {
 
     async fn get_current_model(&self) -> String {
         self.models_manager.get_model(&self.config.model).await
-    }
-
-    async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
-        // Try parsing as preset format, otherwise use as-is, fallback to config
-        let (model_to_use, effort_to_use) = if let Some((m, e)) = Self::parse_model_id(&model) {
-            (m, Some(e))
-        } else {
-            let model_str = model.0.to_string();
-            let fallback = if !model_str.is_empty() {
-                model_str
-            } else {
-                self.get_current_model().await
-            };
-            (fallback, self.config.model_reasoning_effort)
-        };
-
-        if model_to_use.is_empty() {
-            return Err(Error::invalid_params().data("No model parsed or configured"));
-        }
-
-        self.thread
-            .submit(Op::ThreadSettings {
-                thread_settings: ThreadSettingsOverrides {
-                    model: Some(model_to_use.clone()),
-                    effort: Some(effort_to_use),
-                    ..Default::default()
-                },
-            })
-            .await
-            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-
-        self.config.model = Some(model_to_use);
-        self.config.model_reasoning_effort = effort_to_use;
-
-        Ok(())
     }
 
     async fn handle_cancel(&mut self) -> Result<(), Error> {
