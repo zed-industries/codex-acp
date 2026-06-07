@@ -10,7 +10,10 @@ This tool implements an ACP adapter around the Codex CLI, supporting:
 - Following
 - Edit review
 - TODO lists
+- Plan mode (investigate read-only and propose a plan before making changes;
+  available in the mode selector or via `/plan`)
 - Slash commands:
+  - /plan (with optional description of what to plan)
   - /review (with optional instructions)
   - /review-branch
   - /review-commit
