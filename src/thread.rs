@@ -11,17 +11,18 @@ use agent_client_protocol::{
     Client, ConnectionTo, Error,
     schema::{
         AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ClientCapabilities,
-        ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
-        EmbeddedResourceResource, ImageContent, LoadSessionResponse, Meta, ModelId, ModelInfo,
-        PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
-        PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
-        RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionConfigId,
-        SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-        SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionMode, SessionModeId,
-        SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason,
-        Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId,
-        ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-        UnstructuredCommandInput, UsageUpdate,
+        ConfigOptionUpdate, Content, ContentBlock, ContentChunk, CurrentModeUpdate, Diff,
+        EmbeddedResource, EmbeddedResourceResource, ImageContent, LoadSessionResponse, Meta,
+        ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+        PlanEntryPriority, PlanEntryStatus, PromptRequest, RequestPermissionOutcome,
+        RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
+        SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
+        SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
+        SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
+        SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
+        TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
+        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+        UsageUpdate,
     },
 };
 use codex_apply_patch::parse_patch;
@@ -38,7 +39,7 @@ use codex_protocol::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
         GuardianCommandSource,
     },
-    config_types::TrustLevel,
+    config_types::{CollaborationMode, ModeKind, Settings, TrustLevel},
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
     mcp::CallToolResult,
@@ -116,6 +117,14 @@ const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 const CODEX_READ_ONLY_PROFILE_ID: &str = ":read-only";
 const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
 const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
+
+/// Synthetic session-mode id for plan mode. Unlike the other modes it is not a
+/// Codex approval preset; it maps to the read-only sandbox plus Codex's native
+/// `ModeKind::Plan` collaboration mode.
+const PLAN_MODE_ID: &str = "plan";
+const PLAN_MODE_LABEL: &str = "Plan";
+const PLAN_MODE_DESCRIPTION: &str = "Investigate read-only and propose a plan before making changes. \
+     Switch to another mode to execute the plan.";
 
 fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> {
     match profile_id {
@@ -207,6 +216,11 @@ fn current_session_mode_id(config: &Config) -> Option<SessionModeId> {
 
 fn mode_trusts_project(mode_id: &str) -> bool {
     matches!(mode_id, "auto" | "full-access")
+}
+
+/// The synthetic plan-mode entry shown in the session-mode selector.
+fn plan_session_mode() -> SessionMode {
+    SessionMode::new(PLAN_MODE_ID, PLAN_MODE_LABEL).description(PLAN_MODE_DESCRIPTION)
 }
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
@@ -2773,6 +2787,10 @@ struct ThreadActor<A> {
     resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     /// Last config options state we emitted to the client, used for deduping updates.
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
+    /// Whether the session is currently in plan mode. Plan mode runs read-only
+    /// and sets Codex's native `ModeKind::Plan` collaboration mode. In-memory
+    /// only (a reloaded session starts with plan mode off).
+    plan_mode: bool,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -2798,6 +2816,7 @@ impl<A: Auth> ThreadActor<A> {
             message_rx,
             resolution_rx,
             last_sent_config_options: None,
+            plan_mode: false,
         }
     }
 
@@ -2921,6 +2940,13 @@ impl<A: Auth> ThreadActor<A> {
 
     fn builtin_commands() -> Vec<AvailableCommand> {
         vec![
+            AvailableCommand::new(
+                "plan",
+                "Investigate read-only and propose a plan before making changes",
+            )
+            .input(AvailableCommandInput::Unstructured(
+                UnstructuredCommandInput::new("what to plan"),
+            )),
             AvailableCommand::new("review", "Review my current changes and find issues").input(
                 AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
                     "optional custom review instructions",
@@ -2953,17 +2979,23 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     fn modes(&self) -> Option<SessionModeState> {
-        let current_mode_id = current_session_mode_id(&self.config)?;
+        // When plan mode is active we surface "plan" as current even if the
+        // underlying read-only profile would otherwise be reported.
+        let current_mode_id = if self.plan_mode {
+            SessionModeId::new(PLAN_MODE_ID)
+        } else {
+            current_session_mode_id(&self.config)?
+        };
 
-        Some(SessionModeState::new(
-            current_mode_id,
-            APPROVAL_PRESETS
-                .iter()
-                .map(|preset| {
-                    SessionMode::new(preset.id, preset.label).description(preset.description)
-                })
-                .collect(),
-        ))
+        let mut available_modes: Vec<SessionMode> = APPROVAL_PRESETS
+            .iter()
+            .map(|preset| SessionMode::new(preset.id, preset.label).description(preset.description))
+            .collect();
+        // Plan mode is synthetic (not a Codex approval preset); surface it as a
+        // first-class choice at the front of the selector.
+        available_modes.insert(0, plan_session_mode());
+
+        Some(SessionModeState::new(current_mode_id, available_modes))
     }
 
     async fn find_current_model(&self) -> Option<ModelId> {
@@ -3265,6 +3297,36 @@ impl<A: Auth> ThreadActor<A> {
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
                 "compact" => op = Op::Compact,
+                "plan" => {
+                    let description = rest.trim().to_owned();
+                    self.enter_plan_mode().await?;
+                    // The mode changed from inside a prompt, so the client did
+                    // not initiate it: tell it explicitly so the selector/config
+                    // option reflect plan mode.
+                    self.client
+                        .send_notification(SessionUpdate::CurrentModeUpdate(
+                            CurrentModeUpdate::new(SessionModeId::new(PLAN_MODE_ID)),
+                        ));
+                    self.maybe_emit_config_options_update().await;
+
+                    if description.is_empty() {
+                        // Just switched into plan mode without a request to plan
+                        // yet; the mode switch is the result of this turn.
+                        drop(response_tx.send(Ok(StopReason::EndTurn)));
+                        return Ok(response_rx);
+                    }
+
+                    op = Op::UserInput {
+                        items: vec![UserInput::Text {
+                            text: description,
+                            text_elements: vec![],
+                        }],
+                        final_output_json_schema: None,
+                        environments: None,
+                        responsesapi_client_metadata: None,
+                        thread_settings: Default::default(),
+                    }
+                }
                 "init" => {
                     op = Op::UserInput {
                         items: vec![UserInput::Text {
@@ -3362,11 +3424,78 @@ impl<A: Auth> ThreadActor<A> {
         Ok(response_rx)
     }
 
+    /// Build a `CollaborationMode` for `mode` that preserves the session's
+    /// current model and reasoning effort. `collaboration_mode` takes precedence
+    /// over model/effort in Codex, so we echo them back to avoid changing them
+    /// when we only mean to switch the mode kind.
+    async fn collaboration_mode(&self, mode: ModeKind) -> CollaborationMode {
+        CollaborationMode {
+            mode,
+            settings: Settings {
+                model: self.get_current_model().await,
+                reasoning_effort: self.config.model_reasoning_effort,
+                developer_instructions: None,
+            },
+        }
+    }
+
+    /// Enter plan mode: apply the read-only sandbox and Codex's native
+    /// `ModeKind::Plan` collaboration mode. Deliberately does not trust the
+    /// project.
+    async fn enter_plan_mode(&mut self) -> Result<(), Error> {
+        let read_only = APPROVAL_PRESETS
+            .iter()
+            .find(|preset| preset.id == "read-only")
+            .ok_or_else(Error::internal_error)?;
+        let collaboration_mode = self.collaboration_mode(ModeKind::Plan).await;
+
+        self.thread
+            .submit(Op::ThreadSettings {
+                thread_settings: ThreadSettingsOverrides {
+                    approval_policy: Some(read_only.approval),
+                    permission_profile: Some(read_only.permission_profile.clone()),
+                    active_permission_profile: active_profile_id_for_session_mode("read-only")
+                        .map(ActivePermissionProfile::new),
+                    collaboration_mode: Some(collaboration_mode),
+                    ..Default::default()
+                },
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.config
+            .permissions
+            .approval_policy
+            .set(read_only.approval)
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        self.config
+            .permissions
+            .set_permission_profile(read_only.permission_profile.clone())
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.plan_mode = true;
+        Ok(())
+    }
+
     async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
+        if mode.0.as_ref() == PLAN_MODE_ID {
+            return self.enter_plan_mode().await;
+        }
+
         let preset = APPROVAL_PRESETS
             .iter()
             .find(|preset| mode.0.as_ref() == preset.id)
             .ok_or_else(Error::invalid_params)?;
+
+        // If we were in plan mode, also reset the collaboration mode back to
+        // default; otherwise the session would keep behaving like plan mode even
+        // once the sandbox becomes writable.
+        let was_plan = std::mem::take(&mut self.plan_mode);
+        let collaboration_mode = if was_plan {
+            Some(self.collaboration_mode(ModeKind::Default).await)
+        } else {
+            None
+        };
 
         self.thread
             .submit(Op::ThreadSettings {
@@ -3375,6 +3504,7 @@ impl<A: Auth> ThreadActor<A> {
                     permission_profile: Some(preset.permission_profile.clone()),
                     active_permission_profile: active_profile_id_for_session_mode(preset.id)
                         .map(ActivePermissionProfile::new),
+                    collaboration_mode,
                     ..Default::default()
                 },
             })
@@ -4530,6 +4660,147 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn builtin_commands_includes_plan() {
+        let commands = ThreadActor::<StubAuth>::builtin_commands();
+        assert!(
+            commands.iter().any(|c| c.name == "plan"),
+            "expected a /plan command in {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_command() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/plan add a cache".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        // The mode change happened from inside a prompt, so the client must be
+        // told explicitly that we are now in plan mode.
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|n| matches!(
+                &n.update,
+                SessionUpdate::CurrentModeUpdate(CurrentModeUpdate { current_mode_id, .. })
+                    if current_mode_id.0.as_ref() == PLAN_MODE_ID
+            )),
+            "expected a CurrentModeUpdate(plan), got {notifications:?}"
+        );
+
+        // First we enter plan mode (read-only sandbox + Codex's Plan
+        // collaboration mode), then we submit the description as a normal turn.
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(ops.len(), 2, "ops don't match {ops:?}");
+        match &ops[0] {
+            Op::ThreadSettings { thread_settings } => {
+                assert_eq!(
+                    thread_settings.collaboration_mode.as_ref().map(|c| c.mode),
+                    Some(ModeKind::Plan),
+                );
+                let read_only = APPROVAL_PRESETS
+                    .iter()
+                    .find(|p| p.id == "read-only")
+                    .unwrap();
+                assert_eq!(thread_settings.approval_policy, Some(read_only.approval));
+            }
+            other => panic!("expected Op::ThreadSettings, got {other:?}"),
+        }
+        assert_eq!(
+            ops[1],
+            Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: "add a cache".to_string(),
+                    text_elements: vec![],
+                }],
+                final_output_json_schema: None,
+                environments: None,
+                responsesapi_client_metadata: None,
+                thread_settings: Default::default(),
+            },
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_command_without_description_only_switches_mode() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/plan".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|n| matches!(
+                &n.update,
+                SessionUpdate::CurrentModeUpdate(CurrentModeUpdate { current_mode_id, .. })
+                    if current_mode_id.0.as_ref() == PLAN_MODE_ID
+            )),
+            "expected a CurrentModeUpdate(plan), got {notifications:?}"
+        );
+
+        // Only the mode switch is submitted; no user turn runs.
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(ops.len(), 1, "ops don't match {ops:?}");
+        assert!(matches!(&ops[0], Op::ThreadSettings { .. }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_set_mode_plan_then_out_resets_collaboration_mode() -> anyhow::Result<()> {
+        let (_session_id, _client, thread, message_tx, _handle) = setup().await?;
+
+        // read-only is used to exit plan mode because it does not trust the
+        // project (avoiding filesystem trust side effects in tests).
+        for mode in ["plan", "read-only"] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            message_tx.send(ThreadMessage::SetMode {
+                mode: SessionModeId::new(mode),
+                response_tx: tx,
+            })?;
+            rx.await??;
+        }
+        drop(message_tx);
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(ops.len(), 2, "ops don't match {ops:?}");
+        // Entering plan mode sets Codex's Plan collaboration mode...
+        match &ops[0] {
+            Op::ThreadSettings { thread_settings } => assert_eq!(
+                thread_settings.collaboration_mode.as_ref().map(|c| c.mode),
+                Some(ModeKind::Plan),
+            ),
+            other => panic!("expected Op::ThreadSettings, got {other:?}"),
+        }
+        // ...and leaving it resets the collaboration mode back to Default so the
+        // session no longer behaves like plan mode.
+        match &ops[1] {
+            Op::ThreadSettings { thread_settings } => assert_eq!(
+                thread_settings.collaboration_mode.as_ref().map(|c| c.mode),
+                Some(ModeKind::Default),
+            ),
+            other => panic!("expected Op::ThreadSettings, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_review() -> anyhow::Result<()> {
         let (session_id, client, thread, message_tx, _handle) = setup().await?;
@@ -5134,6 +5405,7 @@ mod tests {
                     | Op::ResolveElicitation { .. }
                     | Op::RequestPermissionsResponse { .. }
                     | Op::PatchApproval { .. }
+                    | Op::ThreadSettings { .. }
                     | Op::Interrupt => {}
                     Op::Shutdown => {
                         if let Some(active_prompt_id) = self.active_prompt_id.lock().unwrap().take()
