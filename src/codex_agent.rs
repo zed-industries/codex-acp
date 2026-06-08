@@ -14,9 +14,8 @@ use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
 use codex_config::{DEFAULT_MCP_SERVER_ENVIRONMENT_ID, McpServerConfig, McpServerTransportConfig};
 use codex_core::{
-    NewThread, RolloutRecorder, SortDirection, StateDbHandle, ThreadManager, ThreadSortKey,
-    config::Config, find_thread_path_by_id_str, init_state_db, parse_cursor,
-    resolve_installation_id, thread_store_from_config,
+    NewThread, RolloutRecorder, StateDbHandle, ThreadManager, config::Config,
+    find_thread_path_by_id_str, init_state_db, resolve_installation_id, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
 use codex_extension_api::empty_extension_registry;
@@ -27,6 +26,10 @@ use codex_login::{
 use codex_protocol::{
     ThreadId,
     protocol::{InitialHistory, SessionSource},
+};
+use codex_thread_store::{
+    ListThreadsParams, SortDirection as StoreSortDirection, ThreadSortKey as StoreThreadSortKey,
+    ThreadStore,
 };
 use std::{
     collections::HashMap,
@@ -51,6 +54,8 @@ pub struct CodexAgent {
     config: Config,
     /// Thread manager for handling sessions
     thread_manager: ThreadManager,
+    /// Store for listing and updating persisted thread metadata
+    thread_store: Arc<dyn ThreadStore>,
     /// SQLite-backed Codex state index, when initialization succeeds
     state_db: Option<StateDbHandle>,
     /// Active sessions mapped by `SessionId`
@@ -95,7 +100,7 @@ impl CodexAgent {
             environment_manager,
             empty_extension_registry(),
             None,
-            thread_store,
+            thread_store.clone(),
             state_db.clone(),
             installation_id,
             None,
@@ -105,6 +110,7 @@ impl CodexAgent {
             client_capabilities,
             config,
             thread_manager,
+            thread_store,
             state_db,
             sessions: Arc::default(),
             session_roots,
@@ -677,62 +683,52 @@ impl CodexAgent {
         self.check_auth().await?;
 
         let ListSessionsRequest { cwd, cursor, .. } = request;
-        let cursor_obj = cursor.as_deref().and_then(parse_cursor);
+        let allowed_sources = [
+            SessionSource::Cli,
+            SessionSource::VSCode,
+            SessionSource::Unknown,
+        ];
+        let cwd_filter = cwd.clone();
 
-        let page = RolloutRecorder::list_threads(
-            self.state_db.clone(),
-            &self.config,
-            SESSION_LIST_PAGE_SIZE,
-            cursor_obj.as_ref(),
-            ThreadSortKey::UpdatedAt,
-            SortDirection::Desc,
-            &[
-                SessionSource::Cli,
-                SessionSource::VSCode,
-                SessionSource::Unknown,
-            ],
-            None,
-            None,
-            self.config.model_provider_id.as_str(),
-            None,
-        )
-        .await
-        .map_err(|err| Error::internal_error().data(format!("failed to list sessions: {err}")))?;
+        let page = self
+            .thread_store
+            .list_threads(ListThreadsParams {
+                page_size: SESSION_LIST_PAGE_SIZE,
+                cursor,
+                sort_key: StoreThreadSortKey::UpdatedAt,
+                sort_direction: StoreSortDirection::Desc,
+                allowed_sources: allowed_sources.to_vec(),
+                model_providers: None,
+                cwd_filters: cwd.map(|cwd| vec![cwd]),
+                archived: false,
+                search_term: None,
+                use_state_db_only: false,
+            })
+            .await
+            .map_err(|err| {
+                Error::internal_error().data(format!("failed to list sessions: {err}"))
+            })?;
 
         let sessions = page
             .items
             .into_iter()
-            .filter_map(|item| {
-                let thread_id = item.thread_id?;
-                let item_cwd = item.cwd?;
+            .filter(|item| {
+                allowed_sources.contains(&item.source)
+                    && cwd_filter
+                        .as_ref()
+                        .is_none_or(|filter_cwd| item.cwd.as_path() == filter_cwd.as_path())
+            })
+            .map(|item| {
+                let title = stored_session_title(item.name.as_deref(), &item.preview);
+                let updated_at = item.updated_at.to_rfc3339();
 
-                if let Some(filter_cwd) = cwd.as_ref()
-                    && item_cwd != *filter_cwd
-                {
-                    return None;
-                }
-
-                let title = item
-                    .first_user_message
-                    .as_deref()
-                    .and_then(format_session_title);
-                let updated_at = item.updated_at.or(item.created_at);
-
-                Some(
-                    SessionInfo::new(SessionId::new(thread_id.to_string()), item_cwd)
-                        .title(title)
-                        .updated_at(updated_at),
-                )
+                SessionInfo::new(SessionId::new(item.thread_id.to_string()), item.cwd)
+                    .title(title)
+                    .updated_at(updated_at)
             })
             .collect::<Vec<_>>();
 
-        let next_cursor = page
-            .next_cursor
-            .as_ref()
-            .and_then(|next_cursor| serde_json::to_value(next_cursor).ok())
-            .and_then(|value| value.as_str().map(str::to_owned));
-
-        Ok(ListSessionsResponse::new(sessions).next_cursor(next_cursor))
+        Ok(ListSessionsResponse::new(sessions).next_cursor(page.next_cursor))
     }
 
     async fn close_session(
@@ -751,9 +747,9 @@ impl CodexAgent {
             .lock()
             .unwrap()
             .remove(&request.session_id);
+
         Ok(CloseSessionResponse::new())
     }
-
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {
         info!("Processing prompt for session: {}", request.session_id);
         // Check before sending if authentication was successful or not
@@ -905,5 +901,37 @@ fn format_session_title(message: &str) -> Option<String> {
         None
     } else {
         Some(truncate_graphemes(trimmed, SESSION_TITLE_MAX_GRAPHEMES))
+    }
+}
+
+fn stored_session_title(name: Option<&str>, preview: &str) -> Option<String> {
+    [name, Some(preview)]
+        .into_iter()
+        .flatten()
+        .find_map(format_session_title)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_session_title_prefers_thread_name() {
+        assert_eq!(
+            stored_session_title(Some("renamed"), "preview"),
+            Some("renamed".to_string())
+        );
+    }
+
+    #[test]
+    fn stored_session_title_falls_back_to_preview() {
+        assert_eq!(
+            stored_session_title(None, "preview"),
+            Some("preview".to_string())
+        );
+        assert_eq!(
+            stored_session_title(Some("  "), "preview"),
+            Some("preview".to_string())
+        );
     }
 }
