@@ -34,6 +34,9 @@ codex-login = { git = "https://github.com/openai/codex", tag = "rust-v0.137.0" }
 codex-shell-command = { git = "https://github.com/openai/codex", tag = "rust-v0.137.0" }
 codex-utils-approval-presets = { git = "https://github.com/openai/codex", tag = "rust-v0.137.0" }
 codex-utils-cli = { git = "https://github.com/openai/codex", tag = "rust-v0.137.0" }
+# Pin allocative to 0.3.4 because starlark_map 0.13.0 exposes hashbrown 0.14
+# internals that need allocative's matching hashbrown implementation.
+allocative = "=0.3.4"
 diffy = { version = "0.5.0", features = ["std"] }
 itertools = "0.14.0"
 serde = { version = "1", features = ["derive"] }
@@ -57,6 +60,3 @@ unused = "warn"
 [patch.crates-io]
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "132f5b39c862e3a970f731d709608b3e6276d5f6" }
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "9200079d3b54a1ff51072e24d81fd354f085156f" }
-
-[patch."https://github.com/openai/codex"]
-codex-utils-pty = { path = "vendor/codex-utils-pty" }
