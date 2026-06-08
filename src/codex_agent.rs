@@ -12,7 +12,7 @@ use acp::schema::{
 };
 use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
-use codex_config::{McpServerConfig, McpServerTransportConfig};
+use codex_config::{DEFAULT_MCP_SERVER_ENVIRONMENT_ID, McpServerConfig, McpServerTransportConfig};
 use codex_core::{
     NewThread, RolloutRecorder, SortDirection, StateDbHandle, ThreadManager, ThreadSortKey,
     config::Config, find_thread_path_by_id_str, init_state_db, parse_cursor,
@@ -367,7 +367,7 @@ impl CodexAgent {
                             oauth: None,
                             oauth_resource: None,
                             tools: Default::default(),
-                            experimental_environment: None,
+                            environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
                             supports_parallel_tool_calls: false,
                             default_tools_approval_mode: None,
                         },
@@ -407,7 +407,7 @@ impl CodexAgent {
                             oauth: None,
                             oauth_resource: None,
                             tools: Default::default(),
-                            experimental_environment: None,
+                            environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
                             supports_parallel_tool_calls: false,
                             default_tools_approval_mode: None,
                         },

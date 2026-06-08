@@ -2,7 +2,7 @@
 edition = "2024"
 license = "Apache-2.0"
 name = "codex-utils-pty"
-version = "0.133.0"
+version = "0.137.0"
 
 [dependencies]
 anyhow = "1"

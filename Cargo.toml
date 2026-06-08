@@ -21,19 +21,19 @@ path = "src/lib.rs"
 agent-client-protocol = { version = "=0.12.1", features = ["unstable"] }
 anyhow = "1"
 clap = "4"
-codex-apply-patch = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-arg0 = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-config = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-core = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-exec-server = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-extension-api = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-mcp-server = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-models-manager = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-login = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-shell-command = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-utils-approval-presets = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-utils-cli = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
+codex-apply-patch = { git = "https://github.com/openai/codex", tag = "rust-v0.137.0" }
+codex-arg0 = { git = "https://github.com/openai/codex", tag = "rust-v0.137.0" }
+codex-config = { git = "https://github.com/openai/codex", tag = "rust-v0.137.0" }
+codex-core = { git = "https://github.com/openai/codex", tag = "rust-v0.137.0" }
+codex-exec-server = { git = "https://github.com/openai/codex", tag = "rust-v0.137.0" }
+codex-extension-api = { git = "https://github.com/openai/codex", tag = "rust-v0.137.0" }
+codex-mcp-server = { git = "https://github.com/openai/codex", tag = "rust-v0.137.0" }
+codex-models-manager = { git = "https://github.com/openai/codex", tag = "rust-v0.137.0" }
+codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.137.0" }
+codex-login = { git = "https://github.com/openai/codex", tag = "rust-v0.137.0" }
+codex-shell-command = { git = "https://github.com/openai/codex", tag = "rust-v0.137.0" }
+codex-utils-approval-presets = { git = "https://github.com/openai/codex", tag = "rust-v0.137.0" }
+codex-utils-cli = { git = "https://github.com/openai/codex", tag = "rust-v0.137.0" }
 # Pin allocative to 0.3.4 because starlark_map 0.13.0 exposes hashbrown 0.14
 # internals that need allocative's matching hashbrown implementation.
 allocative = "=0.3.4"
