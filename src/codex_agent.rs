@@ -15,11 +15,11 @@ use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
 use codex_config::{DEFAULT_MCP_SERVER_ENVIRONMENT_ID, McpServerConfig, McpServerTransportConfig};
 use codex_core::{
-    NewThread, RolloutRecorder, StateDbHandle, ThreadManager, config::Config,
+    CodexThread, NewThread, RolloutRecorder, StateDbHandle, ThreadManager, config::Config,
     find_thread_path_by_id_str, init_state_db, resolve_installation_id, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
-use codex_extension_api::empty_extension_registry;
+use codex_extension_api::{ExtensionRegistry, ExtensionRegistryBuilder};
 use codex_login::{
     CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
     auth::{AuthManager, CodexAuth, read_codex_api_key_from_env, read_openai_api_key_from_env},
@@ -54,19 +54,86 @@ pub struct CodexAgent {
     /// The underlying codex configuration
     config: Config,
     /// Thread manager for handling sessions
-    thread_manager: ThreadManager,
+    thread_manager: Arc<ThreadManager>,
     /// Store for listing and updating persisted thread metadata
     thread_store: Arc<dyn ThreadStore>,
     /// SQLite-backed Codex state index, when initialization succeeds
     state_db: Option<StateDbHandle>,
     /// Active sessions mapped by `SessionId`
     sessions: Arc<Mutex<HashMap<SessionId, Arc<Thread>>>>,
+    /// Memory startup handles for active Codex sessions.
+    memory_startup_sessions: Arc<Mutex<HashMap<SessionId, Arc<dyn MemoryStartupSession>>>>,
     /// Session working directories for filesystem sandboxing
     session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>>,
 }
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
+
+trait MemoryStartupSession: Send + Sync {
+    fn start(&self, source: SessionSource);
+}
+
+struct CodexMemoryStartupSession {
+    thread_manager: Arc<ThreadManager>,
+    auth_manager: Arc<AuthManager>,
+    thread_id: ThreadId,
+    thread: Arc<CodexThread>,
+}
+
+impl MemoryStartupSession for CodexMemoryStartupSession {
+    fn start(&self, source: SessionSource) {
+        let thread_manager = self.thread_manager.clone();
+        let auth_manager = self.auth_manager.clone();
+        let thread_id = self.thread_id;
+        let thread = self.thread.clone();
+
+        tokio::spawn(async move {
+            let config = thread.config().await;
+            codex_memories_write::start_memories_startup_task(
+                thread_manager,
+                auth_manager,
+                thread_id,
+                thread,
+                config,
+                &source,
+            );
+        });
+    }
+}
+
+fn acp_session_source() -> SessionSource {
+    SessionSource::Mcp
+}
+
+fn listable_session_sources() -> Vec<SessionSource> {
+    vec![
+        SessionSource::Cli,
+        SessionSource::VSCode,
+        SessionSource::Mcp,
+        SessionSource::Unknown,
+    ]
+}
+
+fn built_in_extension_registry() -> Arc<ExtensionRegistry<Config>> {
+    let mut registry = ExtensionRegistryBuilder::new();
+    codex_memories_extension::install(&mut registry, None);
+    Arc::new(registry.build())
+}
+
+fn start_memory_startup_session(
+    sessions: &Mutex<HashMap<SessionId, Arc<dyn MemoryStartupSession>>>,
+    session_id: &SessionId,
+    source: SessionSource,
+) -> bool {
+    let session = sessions.lock().unwrap().remove(session_id);
+    if let Some(session) = session {
+        session.start(source);
+        true
+    } else {
+        false
+    }
+}
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
@@ -94,18 +161,18 @@ impl CodexAgent {
         );
         let thread_store = thread_store_from_config(&config, state_db.clone());
         let installation_id = resolve_installation_id(&config.codex_home).await?;
-        let thread_manager = ThreadManager::new(
+        let thread_manager = Arc::new(ThreadManager::new(
             &config,
             auth_manager.clone(),
-            SessionSource::Unknown,
+            acp_session_source(),
             environment_manager,
-            empty_extension_registry(),
+            built_in_extension_registry(),
             None,
             thread_store.clone(),
             state_db.clone(),
             installation_id,
             None,
-        );
+        ));
         Ok(Self {
             auth_manager,
             client_capabilities,
@@ -114,6 +181,7 @@ impl CodexAgent {
             thread_store,
             state_db,
             sessions: Arc::default(),
+            memory_startup_sessions: Arc::default(),
             session_roots,
         })
     }
@@ -318,6 +386,23 @@ impl CodexAgent {
             .get(session_id)
             .ok_or_else(|| Error::resource_not_found(None))?
             .clone())
+    }
+
+    fn register_memory_startup_session(
+        &self,
+        session_id: SessionId,
+        thread_id: ThreadId,
+        thread: Arc<CodexThread>,
+    ) {
+        self.memory_startup_sessions.lock().unwrap().insert(
+            session_id,
+            Arc::new(CodexMemoryStartupSession {
+                thread_manager: self.thread_manager.clone(),
+                auth_manager: self.auth_manager.clone(),
+                thread_id,
+                thread,
+            }),
+        );
     }
 
     async fn check_auth(&self) -> Result<(), Error> {
@@ -569,13 +654,14 @@ impl CodexAgent {
 
         let NewThread {
             thread_id,
-            thread,
+            thread: codex_thread,
             session_configured: _,
         } = Box::pin(self.thread_manager.start_thread(config.clone()))
             .await
             .map_err(|_e| Error::internal_error())?;
 
         let session_id = Self::session_id_from_thread_id(thread_id);
+        let memory_thread = codex_thread.clone();
         // Record the session root for filesystem sandboxing.
         self.session_roots
             .lock()
@@ -583,7 +669,7 @@ impl CodexAgent {
             .insert(session_id.clone(), config.cwd.to_path_buf());
         let thread = Arc::new(Thread::new(
             session_id.clone(),
-            thread,
+            codex_thread,
             self.auth_manager.clone(),
             Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
@@ -591,6 +677,7 @@ impl CodexAgent {
             cx,
         ));
         let load = thread.load().await?;
+        self.register_memory_startup_session(session_id.clone(), thread_id, memory_thread);
 
         self.sessions
             .lock()
@@ -683,8 +770,8 @@ impl CodexAgent {
         let config = self.build_session_config(&cwd, mcp_servers)?;
 
         let NewThread {
-            thread_id: _,
-            thread,
+            thread_id,
+            thread: codex_thread,
             session_configured: _,
         } = Box::pin(self.thread_manager.resume_thread_from_rollout(
             config.clone(),
@@ -697,19 +784,21 @@ impl CodexAgent {
 
         let thread = Arc::new(Thread::new(
             session_id.clone(),
-            thread,
+            codex_thread.clone(),
             self.auth_manager.clone(),
             Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
             config.clone(),
             cx,
         ));
+        let memory_thread = codex_thread;
 
         if replay_history {
             thread.replay_history(rollout_items).await?;
         }
 
         let load = thread.load().await?;
+        self.register_memory_startup_session(session_id.clone(), thread_id, memory_thread);
 
         self.session_roots
             .lock()
@@ -729,11 +818,7 @@ impl CodexAgent {
         self.check_auth().await?;
 
         let ListSessionsRequest { cwd, cursor, .. } = request;
-        let allowed_sources = [
-            SessionSource::Cli,
-            SessionSource::VSCode,
-            SessionSource::Unknown,
-        ];
+        let allowed_sources = listable_session_sources();
         let cwd_filter = cwd.clone();
 
         let page = self
@@ -743,7 +828,7 @@ impl CodexAgent {
                 cursor,
                 sort_key: StoreThreadSortKey::UpdatedAt,
                 sort_direction: StoreSortDirection::Desc,
-                allowed_sources: allowed_sources.to_vec(),
+                allowed_sources: allowed_sources.clone(),
                 model_providers: None,
                 cwd_filters: cwd.map(|cwd| vec![cwd]),
                 archived: false,
@@ -789,6 +874,10 @@ impl CodexAgent {
             )
             .await;
         self.sessions.lock().unwrap().remove(&request.session_id);
+        self.memory_startup_sessions
+            .lock()
+            .unwrap()
+            .remove(&request.session_id);
         self.session_roots
             .lock()
             .unwrap()
@@ -802,8 +891,17 @@ impl CodexAgent {
         self.check_auth().await?;
 
         // Get the session state
-        let thread = self.get_thread(&request.session_id)?;
-        let stop_reason = thread.prompt(request).await?;
+        let session_id = request.session_id.clone();
+        let thread = self.get_thread(&session_id)?;
+        let stop_reason_rx = thread.start_prompt(request).await?;
+        start_memory_startup_session(
+            &self.memory_startup_sessions,
+            &session_id,
+            self.thread_manager.session_source(),
+        );
+        let stop_reason = stop_reason_rx
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))??;
 
         Ok(PromptResponse::new(stop_reason))
     }
@@ -946,7 +1044,107 @@ fn stored_session_title(name: Option<&str>, preview: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
     use super::*;
+    use codex_config::TomlValue;
+    use codex_extension_api::{ExtensionData, PromptSlot, ThreadStartInput};
+
+    #[test]
+    fn built_in_extension_registry_installs_memories_extension_contributors() {
+        let registry = built_in_extension_registry();
+
+        assert_eq!(registry.thread_lifecycle_contributors().len(), 1);
+        assert_eq!(registry.config_contributors().len(), 1);
+        assert_eq!(registry.context_contributors().len(), 1);
+        assert_eq!(registry.tool_contributors().len(), 1);
+    }
+
+    #[test]
+    fn acp_sessions_use_mcp_source_and_remain_listable() {
+        assert_eq!(acp_session_source(), SessionSource::Mcp);
+        assert!(listable_session_sources().contains(&SessionSource::Mcp));
+    }
+
+    #[test]
+    fn start_memory_startup_session_uses_session_source_once_for_known_session() {
+        let session_id = SessionId::new("session");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            session_id.clone(),
+            Arc::new(RecordingMemoryStartupSession {
+                calls: calls.clone(),
+            }) as Arc<dyn MemoryStartupSession>,
+        );
+
+        let sessions = Mutex::new(sessions);
+
+        assert!(start_memory_startup_session(
+            &sessions,
+            &session_id,
+            acp_session_source(),
+        ));
+        assert!(!start_memory_startup_session(
+            &sessions,
+            &session_id,
+            acp_session_source(),
+        ));
+        assert_eq!(*calls.lock().unwrap(), vec![SessionSource::Mcp]);
+    }
+
+    #[tokio::test]
+    async fn memory_summary_reaches_prompt_context_after_thread_start() -> anyhow::Result<()> {
+        let temp_home = TestCodexHome::new()?;
+        let memories_dir = temp_home.path.join("memories");
+        std::fs::create_dir_all(&memories_dir)?;
+        std::fs::write(
+            memories_dir.join("memory_summary.md"),
+            "Remember ACP memory wiring reaches model context.",
+        )?;
+
+        let config = Config::load_default_with_cli_overrides_for_codex_home(
+            temp_home.path.clone(),
+            vec![("features.memories".to_string(), TomlValue::Boolean(true))],
+        )
+        .await?;
+        let registry = built_in_extension_registry();
+        let session_store = ExtensionData::new("session");
+        let thread_store = ExtensionData::new("thread");
+
+        for contributor in registry.thread_lifecycle_contributors() {
+            contributor
+                .on_thread_start(ThreadStartInput {
+                    config: &config,
+                    session_source: &acp_session_source(),
+                    persistent_thread_state_available: true,
+                    session_store: &session_store,
+                    thread_store: &thread_store,
+                })
+                .await;
+        }
+
+        let mut fragments = Vec::new();
+        for contributor in registry.context_contributors() {
+            fragments.extend(contributor.contribute(&session_store, &thread_store).await);
+        }
+
+        assert!(
+            fragments.iter().any(|fragment| {
+                fragment.slot() == PromptSlot::DeveloperPolicy
+                    && fragment
+                        .text()
+                        .contains("Remember ACP memory wiring reaches model context.")
+                    && fragment.text().contains("memory_summary.md")
+            }),
+            "memory summary should be contributed to the developer prompt after thread start"
+        );
+
+        Ok(())
+    }
 
     #[test]
     fn stored_session_title_prefers_thread_name() {
@@ -966,5 +1164,35 @@ mod tests {
             stored_session_title(Some("  "), "preview"),
             Some("preview".to_string())
         );
+    }
+
+    struct RecordingMemoryStartupSession {
+        calls: Arc<Mutex<Vec<SessionSource>>>,
+    }
+
+    impl MemoryStartupSession for RecordingMemoryStartupSession {
+        fn start(&self, source: SessionSource) {
+            self.calls.lock().unwrap().push(source);
+        }
+    }
+
+    struct TestCodexHome {
+        path: PathBuf,
+    }
+
+    impl TestCodexHome {
+        fn new() -> anyhow::Result<Self> {
+            let path = std::env::temp_dir()
+                .join("codex-acp-memory-e2e")
+                .join(uuid::Uuid::new_v4().to_string());
+            std::fs::create_dir_all(&path)?;
+            Ok(Self { path })
+        }
+    }
+
+    impl Drop for TestCodexHome {
+        fn drop(&mut self) {
+            drop(std::fs::remove_dir_all(&self.path));
+        }
     }
 }

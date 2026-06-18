@@ -370,7 +370,10 @@ impl Thread {
             .map_err(|e| Error::internal_error().data(e.to_string()))?
     }
 
-    pub async fn prompt(&self, request: PromptRequest) -> Result<StopReason, Error> {
+    pub async fn start_prompt(
+        &self,
+        request: PromptRequest,
+    ) -> Result<oneshot::Receiver<Result<StopReason, Error>>, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ThreadMessage::Prompt {
@@ -380,8 +383,6 @@ impl Thread {
         drop(self.message_tx.send(message));
 
         response_rx
-            .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))??
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?
     }
