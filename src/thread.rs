@@ -4118,6 +4118,10 @@ mod tests {
 
     use super::*;
 
+    mod api_command_tests {
+        include!("thread/api_command_tests.rs");
+    }
+
     #[tokio::test]
     async fn test_prompt() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, _handle) = setup().await?;
@@ -4682,9 +4686,12 @@ mod tests {
     impl ModelsManagerImpl for StubModelsManager {
         fn get_model(
             &self,
-            _model_id: &Option<String>,
+            model_id: &Option<String>,
         ) -> Pin<Box<dyn Future<Output = String> + Send + '_>> {
-            Box::pin(async { all_model_presets()[0].to_owned().id })
+            let model_id = model_id.clone();
+            Box::pin(
+                async move { model_id.unwrap_or_else(|| all_model_presets()[0].to_owned().id) },
+            )
         }
 
         fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
@@ -5020,6 +5027,7 @@ mod tests {
                     | Op::ResolveElicitation { .. }
                     | Op::RequestPermissionsResponse { .. }
                     | Op::PatchApproval { .. }
+                    | Op::ThreadSettings { .. }
                     | Op::Interrupt => {}
                     Op::Shutdown => {
                         if let Some(active_prompt_id) = self.active_prompt_id.lock().unwrap().take()

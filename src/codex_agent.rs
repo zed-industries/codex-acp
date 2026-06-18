@@ -34,7 +34,9 @@ use codex_thread_store::{
 };
 use std::{
     collections::HashMap,
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 use tracing::{debug, info};
@@ -123,187 +125,7 @@ impl CodexAgent {
         self: Arc<Self>,
         transport: impl ConnectTo<Agent> + 'static,
     ) -> acp::Result<()> {
-        let agent = self;
-        Agent
-            .builder()
-            .name("codex-acp")
-            .on_receive_request(
-                {
-                    let agent = agent.clone();
-                    async move |request: InitializeRequest, responder, _cx| {
-                        responder.respond_with_result(agent.initialize(request).await)
-                    }
-                },
-                acp::on_receive_request!(),
-            )
-            .on_receive_request(
-                {
-                    let agent = agent.clone();
-                    async move |request: AuthenticateRequest,
-                                responder,
-                                cx: ConnectionTo<Client>| {
-                        let agent = agent.clone();
-                        cx.spawn(async move {
-                            responder.respond_with_result(agent.authenticate(request).await)
-                        })?;
-                        Ok(())
-                    }
-                },
-                acp::on_receive_request!(),
-            )
-            .on_receive_request(
-                {
-                    let agent = agent.clone();
-                    async move |request: LogoutRequest, responder, cx: ConnectionTo<Client>| {
-                        let agent = agent.clone();
-                        cx.spawn(async move {
-                            responder.respond_with_result(agent.logout(request).await)
-                        })?;
-                        Ok(())
-                    }
-                },
-                acp::on_receive_request!(),
-            )
-            .on_receive_request(
-                {
-                    let agent = agent.clone();
-                    async move |request: NewSessionRequest, responder, cx: ConnectionTo<Client>| {
-                        let agent = agent.clone();
-                        let session_cx = cx.clone();
-                        cx.spawn(async move {
-                            responder
-                                .respond_with_result(agent.new_session(request, session_cx).await)
-                        })?;
-                        Ok(())
-                    }
-                },
-                acp::on_receive_request!(),
-            )
-            .on_receive_request(
-                {
-                    let agent = agent.clone();
-                    async move |request: LoadSessionRequest, responder, cx: ConnectionTo<Client>| {
-                        let agent = agent.clone();
-                        let session_cx = cx.clone();
-                        cx.spawn(async move {
-                            responder
-                                .respond_with_result(agent.load_session(request, session_cx).await)
-                        })?;
-                        Ok(())
-                    }
-                },
-                acp::on_receive_request!(),
-            )
-            .on_receive_request(
-                {
-                    let agent = agent.clone();
-                    async move |request: ResumeSessionRequest,
-                                responder,
-                                cx: ConnectionTo<Client>| {
-                        let agent = agent.clone();
-                        let session_cx = cx.clone();
-                        cx.spawn(async move {
-                            responder.respond_with_result(
-                                agent.resume_session(request, session_cx).await,
-                            )
-                        })?;
-                        Ok(())
-                    }
-                },
-                acp::on_receive_request!(),
-            )
-            .on_receive_request(
-                {
-                    let agent = agent.clone();
-                    async move |request: ListSessionsRequest,
-                                responder,
-                                cx: ConnectionTo<Client>| {
-                        let agent = agent.clone();
-                        cx.spawn(async move {
-                            responder.respond_with_result(agent.list_sessions(request).await)
-                        })?;
-                        Ok(())
-                    }
-                },
-                acp::on_receive_request!(),
-            )
-            .on_receive_request(
-                {
-                    let agent = agent.clone();
-                    async move |request: CloseSessionRequest,
-                                responder,
-                                cx: ConnectionTo<Client>| {
-                        let agent = agent.clone();
-                        cx.spawn(async move {
-                            responder.respond_with_result(agent.close_session(request).await)
-                        })?;
-                        Ok(())
-                    }
-                },
-                acp::on_receive_request!(),
-            )
-            .on_receive_request(
-                {
-                    let agent = agent.clone();
-                    async move |request: PromptRequest, responder, cx: ConnectionTo<Client>| {
-                        let agent = agent.clone();
-                        cx.spawn(async move {
-                            responder.respond_with_result(agent.prompt(request).await)
-                        })?;
-                        Ok(())
-                    }
-                },
-                acp::on_receive_request!(),
-            )
-            .on_receive_notification(
-                {
-                    let agent = agent.clone();
-                    async move |notification: CancelNotification, cx: ConnectionTo<Client>| {
-                        let agent = agent.clone();
-                        cx.spawn(async move {
-                            if let Err(e) = agent.cancel(notification).await {
-                                tracing::error!("Error handling cancel: {:?}", e);
-                            }
-                            Ok(())
-                        })?;
-                        Ok(())
-                    }
-                },
-                acp::on_receive_notification!(),
-            )
-            .on_receive_request(
-                {
-                    let agent = agent.clone();
-                    async move |request: SetSessionModeRequest,
-                                responder,
-                                cx: ConnectionTo<Client>| {
-                        let agent = agent.clone();
-                        cx.spawn(async move {
-                            responder.respond_with_result(agent.set_session_mode(request).await)
-                        })?;
-                        Ok(())
-                    }
-                },
-                acp::on_receive_request!(),
-            )
-            .on_receive_request(
-                {
-                    let agent = agent.clone();
-                    async move |request: SetSessionConfigOptionRequest,
-                                responder,
-                                cx: ConnectionTo<Client>| {
-                        let agent = agent.clone();
-                        cx.spawn(async move {
-                            responder
-                                .respond_with_result(agent.set_session_config_option(request).await)
-                        })?;
-                        Ok(())
-                    }
-                },
-                acp::on_receive_request!(),
-            )
-            .connect_to(transport)
-            .await
+        serve_agent_api(self, transport).await
     }
 
     fn session_id_from_thread_id(thread_id: ThreadId) -> SessionId {
@@ -434,6 +256,311 @@ impl CodexAgent {
 
         Ok(config)
     }
+}
+
+type AgentApiFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'a>>;
+
+trait AgentApi: Send + Sync + 'static {
+    fn initialize(&self, request: InitializeRequest) -> AgentApiFuture<'_, InitializeResponse>;
+
+    fn authenticate(
+        &self,
+        request: AuthenticateRequest,
+    ) -> AgentApiFuture<'_, AuthenticateResponse>;
+
+    fn logout(&self, request: LogoutRequest) -> AgentApiFuture<'_, LogoutResponse>;
+
+    fn new_session(
+        &self,
+        request: NewSessionRequest,
+        cx: ConnectionTo<Client>,
+    ) -> AgentApiFuture<'_, NewSessionResponse>;
+
+    fn load_session(
+        &self,
+        request: LoadSessionRequest,
+        cx: ConnectionTo<Client>,
+    ) -> AgentApiFuture<'_, LoadSessionResponse>;
+
+    fn resume_session(
+        &self,
+        request: ResumeSessionRequest,
+        cx: ConnectionTo<Client>,
+    ) -> AgentApiFuture<'_, ResumeSessionResponse>;
+
+    fn list_sessions(
+        &self,
+        request: ListSessionsRequest,
+    ) -> AgentApiFuture<'_, ListSessionsResponse>;
+
+    fn close_session(
+        &self,
+        request: CloseSessionRequest,
+    ) -> AgentApiFuture<'_, CloseSessionResponse>;
+
+    fn prompt(&self, request: PromptRequest) -> AgentApiFuture<'_, PromptResponse>;
+
+    fn cancel(&self, notification: CancelNotification) -> AgentApiFuture<'_, ()>;
+
+    fn set_session_mode(
+        &self,
+        request: SetSessionModeRequest,
+    ) -> AgentApiFuture<'_, SetSessionModeResponse>;
+
+    fn set_session_config_option(
+        &self,
+        request: SetSessionConfigOptionRequest,
+    ) -> AgentApiFuture<'_, SetSessionConfigOptionResponse>;
+}
+
+impl AgentApi for CodexAgent {
+    fn initialize(&self, request: InitializeRequest) -> AgentApiFuture<'_, InitializeResponse> {
+        Box::pin(CodexAgent::initialize(self, request))
+    }
+
+    fn authenticate(
+        &self,
+        request: AuthenticateRequest,
+    ) -> AgentApiFuture<'_, AuthenticateResponse> {
+        Box::pin(CodexAgent::authenticate(self, request))
+    }
+
+    fn logout(&self, request: LogoutRequest) -> AgentApiFuture<'_, LogoutResponse> {
+        Box::pin(CodexAgent::logout(self, request))
+    }
+
+    fn new_session(
+        &self,
+        request: NewSessionRequest,
+        cx: ConnectionTo<Client>,
+    ) -> AgentApiFuture<'_, NewSessionResponse> {
+        Box::pin(CodexAgent::new_session(self, request, cx))
+    }
+
+    fn load_session(
+        &self,
+        request: LoadSessionRequest,
+        cx: ConnectionTo<Client>,
+    ) -> AgentApiFuture<'_, LoadSessionResponse> {
+        Box::pin(CodexAgent::load_session(self, request, cx))
+    }
+
+    fn resume_session(
+        &self,
+        request: ResumeSessionRequest,
+        cx: ConnectionTo<Client>,
+    ) -> AgentApiFuture<'_, ResumeSessionResponse> {
+        Box::pin(CodexAgent::resume_session(self, request, cx))
+    }
+
+    fn list_sessions(
+        &self,
+        request: ListSessionsRequest,
+    ) -> AgentApiFuture<'_, ListSessionsResponse> {
+        Box::pin(CodexAgent::list_sessions(self, request))
+    }
+
+    fn close_session(
+        &self,
+        request: CloseSessionRequest,
+    ) -> AgentApiFuture<'_, CloseSessionResponse> {
+        Box::pin(CodexAgent::close_session(self, request))
+    }
+
+    fn prompt(&self, request: PromptRequest) -> AgentApiFuture<'_, PromptResponse> {
+        Box::pin(CodexAgent::prompt(self, request))
+    }
+
+    fn cancel(&self, notification: CancelNotification) -> AgentApiFuture<'_, ()> {
+        Box::pin(CodexAgent::cancel(self, notification))
+    }
+
+    fn set_session_mode(
+        &self,
+        request: SetSessionModeRequest,
+    ) -> AgentApiFuture<'_, SetSessionModeResponse> {
+        Box::pin(CodexAgent::set_session_mode(self, request))
+    }
+
+    fn set_session_config_option(
+        &self,
+        request: SetSessionConfigOptionRequest,
+    ) -> AgentApiFuture<'_, SetSessionConfigOptionResponse> {
+        Box::pin(CodexAgent::set_session_config_option(self, request))
+    }
+}
+
+async fn serve_agent_api<A: AgentApi>(
+    agent: Arc<A>,
+    transport: impl ConnectTo<Agent> + 'static,
+) -> acp::Result<()> {
+    Agent
+        .builder()
+        .name("codex-acp")
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |request: InitializeRequest, responder, _cx| {
+                    responder.respond_with_result(agent.initialize(request).await)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |request: AuthenticateRequest, responder, cx: ConnectionTo<Client>| {
+                    let agent = agent.clone();
+                    cx.spawn(async move {
+                        responder.respond_with_result(agent.authenticate(request).await)
+                    })?;
+                    Ok(())
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |request: LogoutRequest, responder, cx: ConnectionTo<Client>| {
+                    let agent = agent.clone();
+                    cx.spawn(
+                        async move { responder.respond_with_result(agent.logout(request).await) },
+                    )?;
+                    Ok(())
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |request: NewSessionRequest, responder, cx: ConnectionTo<Client>| {
+                    let agent = agent.clone();
+                    let session_cx = cx.clone();
+                    cx.spawn(async move {
+                        responder.respond_with_result(agent.new_session(request, session_cx).await)
+                    })?;
+                    Ok(())
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |request: LoadSessionRequest, responder, cx: ConnectionTo<Client>| {
+                    let agent = agent.clone();
+                    let session_cx = cx.clone();
+                    cx.spawn(async move {
+                        responder.respond_with_result(agent.load_session(request, session_cx).await)
+                    })?;
+                    Ok(())
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |request: ResumeSessionRequest, responder, cx: ConnectionTo<Client>| {
+                    let agent = agent.clone();
+                    let session_cx = cx.clone();
+                    cx.spawn(async move {
+                        responder
+                            .respond_with_result(agent.resume_session(request, session_cx).await)
+                    })?;
+                    Ok(())
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |request: ListSessionsRequest, responder, cx: ConnectionTo<Client>| {
+                    let agent = agent.clone();
+                    cx.spawn(async move {
+                        responder.respond_with_result(agent.list_sessions(request).await)
+                    })?;
+                    Ok(())
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |request: CloseSessionRequest, responder, cx: ConnectionTo<Client>| {
+                    let agent = agent.clone();
+                    cx.spawn(async move {
+                        responder.respond_with_result(agent.close_session(request).await)
+                    })?;
+                    Ok(())
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |request: PromptRequest, responder, cx: ConnectionTo<Client>| {
+                    let agent = agent.clone();
+                    cx.spawn(
+                        async move { responder.respond_with_result(agent.prompt(request).await) },
+                    )?;
+                    Ok(())
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_notification(
+            {
+                let agent = agent.clone();
+                async move |notification: CancelNotification, cx: ConnectionTo<Client>| {
+                    let agent = agent.clone();
+                    cx.spawn(async move {
+                        if let Err(e) = agent.cancel(notification).await {
+                            tracing::error!("Error handling cancel: {:?}", e);
+                        }
+                        Ok(())
+                    })?;
+                    Ok(())
+                }
+            },
+            acp::on_receive_notification!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |request: SetSessionModeRequest, responder, cx: ConnectionTo<Client>| {
+                    let agent = agent.clone();
+                    cx.spawn(async move {
+                        responder.respond_with_result(agent.set_session_mode(request).await)
+                    })?;
+                    Ok(())
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |request: SetSessionConfigOptionRequest,
+                            responder,
+                            cx: ConnectionTo<Client>| {
+                    let agent = agent.clone();
+                    cx.spawn(async move {
+                        responder
+                            .respond_with_result(agent.set_session_config_option(request).await)
+                    })?;
+                    Ok(())
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .connect_to(transport)
+        .await
 }
 
 impl CodexAgent {
@@ -947,6 +1074,10 @@ fn stored_session_title(name: Option<&str>, preview: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod api_command_tests {
+        include!("codex_agent/api_command_tests.rs");
+    }
 
     #[test]
     fn stored_session_title_prefers_thread_name() {
