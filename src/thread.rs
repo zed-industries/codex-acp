@@ -2069,9 +2069,9 @@ impl PromptState {
             exit_code,
             stdout: _,
             stderr: _,
-            aggregated_output: _,
+            aggregated_output,
             duration: _,
-            formatted_output: _,
+            formatted_output,
             process_id: _,
             completed_at_ms: _,
             status,
@@ -2093,20 +2093,25 @@ impl PromptState {
 
             // For the non-terminal fallback path the per-chunk delta handler now
             // accumulates silently (see exec_command_output_delta). Emit the full
-            // buffer here, exactly once, as a single content block. Skip the emission
-            // entirely when the command produced no output, so we don't surface an
-            // empty fenced code block to the client.
-            if !supports_terminal && !active_command.output.is_empty() {
+            // buffer here, exactly once, as a single content block. Some commands can
+            // reach this point without deltas even though the end event carries output,
+            // so fall back to the final formatted/aggregated output before deciding
+            // there is nothing to display.
+            let output = if active_command.output.is_empty() {
+                [&formatted_output, &aggregated_output]
+                    .into_iter()
+                    .find(|output| !output.is_empty())
+                    .map(String::as_str)
+                    .unwrap_or_default()
+            } else {
+                active_command.output.as_str()
+            };
+
+            if !supports_terminal && !output.is_empty() {
                 let content = match active_command.file_extension.as_deref() {
-                    Some("md") => active_command.output.clone(),
-                    Some(ext) => format!(
-                        "```{ext}\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                    None => format!(
-                        "```sh\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
+                    Some("md") => output.to_owned(),
+                    Some(ext) => format!("```{ext}\n{}\n```\n", output.trim_end_matches('\n')),
+                    None => format!("```sh\n{}\n```\n", output.trim_end_matches('\n')),
                 };
                 fields = fields.content(vec![content.into()]);
             }
@@ -5175,6 +5180,25 @@ mod tests {
             completed_updates.len(),
             2,
             "expected 2 completed ToolCallUpdate notifications, got {completed_updates:?}"
+        );
+
+        let completed_content: std::collections::HashSet<_> = completed_updates
+            .iter()
+            .filter_map(|update| {
+                let content = update.fields.content.as_ref()?.first()?;
+                match content {
+                    ToolCallContent::Content(Content {
+                        content: ContentBlock::Text(TextContent { text, .. }),
+                        ..
+                    }) => Some(text.as_str()),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert!(
+            completed_content.contains("```sh\na\n```\n")
+                && completed_content.contains("```sh\nb\n```\n"),
+            "completed updates should include end-event output, got {completed_updates:?}"
         );
 
         // The completed updates should reference the same tool_call_ids as the begins.
