@@ -4,7 +4,7 @@ use acp::schema::{
     ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Implementation,
     InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
-    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
+    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, Meta, NewSessionRequest,
     NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
     ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
     SessionId, SessionInfo, SessionListCapabilities, SessionResumeCapabilities,
@@ -36,6 +36,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
@@ -349,8 +350,14 @@ impl CodexAgent {
                 // Not supported in codex
                 McpServer::Sse(..) => {}
                 McpServer::Http(McpServerHttp {
-                    name, url, headers, ..
+                    name,
+                    url,
+                    headers,
+                    meta,
+                    ..
                 }) => {
+                    let tool_timeout_sec = mcp_tool_timeout_sec(meta.as_ref());
+
                     // Codex does not allow whitespace in MCP server names; replace with underscores.
                     let name = name.replace(|c: char| c.is_whitespace(), "_");
                     new_mcp_servers.insert(
@@ -369,7 +376,7 @@ impl CodexAgent {
                             required: false,
                             enabled: true,
                             startup_timeout_sec: None,
-                            tool_timeout_sec: None,
+                            tool_timeout_sec,
                             disabled_tools: None,
                             enabled_tools: None,
                             disabled_reason: None,
@@ -388,8 +395,11 @@ impl CodexAgent {
                     command,
                     args,
                     env,
+                    meta,
                     ..
                 }) => {
+                    let tool_timeout_sec = mcp_tool_timeout_sec(meta.as_ref());
+
                     // Codex does not allow whitespace in MCP server names; replace with underscores.
                     let name = name.replace(|c: char| c.is_whitespace(), "_");
                     new_mcp_servers.insert(
@@ -409,7 +419,7 @@ impl CodexAgent {
                             required: false,
                             enabled: true,
                             startup_timeout_sec: None,
-                            tool_timeout_sec: None,
+                            tool_timeout_sec,
                             disabled_tools: None,
                             enabled_tools: None,
                             disabled_reason: None,
@@ -906,6 +916,28 @@ impl TryFrom<AuthMethodId> for CodexAuthMethod {
     }
 }
 
+fn mcp_tool_timeout_sec(meta: Option<&Meta>) -> Option<Duration> {
+    meta.and_then(|meta| {
+        meta.get("tool_timeout_sec")
+            .or_else(|| meta.get("toolTimeoutSec"))
+            .and_then(json_value_as_duration)
+    })
+}
+
+fn json_value_as_duration(value: &serde_json::Value) -> Option<Duration> {
+    let seconds = match value {
+        serde_json::Value::Number(number) => number.as_f64(),
+        serde_json::Value::String(value) => value.parse().ok(),
+        _ => None,
+    }?;
+
+    seconds
+        .is_finite()
+        .then_some(seconds)
+        .filter(|seconds| *seconds >= 0.0)
+        .map(Duration::from_secs_f64)
+}
+
 fn truncate_graphemes(text: &str, max_graphemes: usize) -> String {
     let mut graphemes = text.grapheme_indices(true);
 
@@ -947,6 +979,37 @@ fn stored_session_title(name: Option<&str>, preview: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn mcp_tool_timeout_sec_reads_snake_case_meta() {
+        let mut meta = Meta::new();
+        meta.insert("tool_timeout_sec".to_string(), json!(2.5));
+
+        assert_eq!(
+            mcp_tool_timeout_sec(Some(&meta)),
+            Some(Duration::from_millis(2500))
+        );
+    }
+
+    #[test]
+    fn mcp_tool_timeout_sec_reads_camel_case_string_meta() {
+        let mut meta = Meta::new();
+        meta.insert("toolTimeoutSec".to_string(), json!("45"));
+
+        assert_eq!(
+            mcp_tool_timeout_sec(Some(&meta)),
+            Some(Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn mcp_tool_timeout_sec_ignores_invalid_meta() {
+        let mut meta = Meta::new();
+        meta.insert("tool_timeout_sec".to_string(), json!(-1));
+
+        assert_eq!(mcp_tool_timeout_sec(Some(&meta)), None);
+    }
 
     #[test]
     fn stored_session_title_prefers_thread_name() {
