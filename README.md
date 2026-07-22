@@ -1,7 +1,7 @@
 # ACP adapter for Codex
 
 > [!IMPORTANT]
-> Development is moving to [agentclientprotocol/codex-acp](https://github.com/agentclientprotocol/codex-acp).
+> Development has moved to [agentclientprotocol/codex-acp](https://github.com/agentclientprotocol/codex-acp).
 > The new adapter is built on the new Codex App Server, and we are pooling implementation
 > and maintenance work across teams there. Use `@agentclientprotocol/codex-acp`
 > for new installs.
